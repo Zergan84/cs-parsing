@@ -1,0 +1,686 @@
+[
+  {
+    "username": ".-yuki",
+    "name": ".. y.",
+    "reason": "Blacklist match: 'FEMALE GUESTS ONLY'",
+    "rejected_at": "2026-11-03T13:38:08.682581"
+  },
+  {
+    "username": "lucyatkins1",
+    "name": "Lucy A.",
+    "reason": "Blacklist match: 'DO NOT SEND ME HOME REQUESTS'",
+    "rejected_at": "2026-11-03T13:38:08.682594"
+  },
+  {
+    "username": "omshanti",
+    "name": "Chihiro K.",
+    "reason": "Blacklist match: 'NOT HOSTING'",
+    "rejected_at": "2026-11-03T13:38:08.682603"
+  },
+  {
+    "username": "thisiskana",
+    "name": "Kana K.",
+    "reason": "Blacklist match: 'traveling through'",
+    "rejected_at": "2026-11-03T13:38:08.682613"
+  },
+  {
+    "username": "wade24",
+    "name": "Wade P.",
+    "reason": "Blacklist match: 'Traveling through'",
+    "rejected_at": "2026-11-03T13:38:08.682625"
+  },
+  {
+    "username": "rinochan",
+    "name": "Rino Y.",
+    "reason": "Blacklist match: 'travelling europe'",
+    "rejected_at": "2026-11-03T13:38:08.682640"
+  },
+  {
+    "username": "Aiyami",
+    "name": "Aiyami I.",
+    "reason": "Blacklist match: 'exploring South Korea'",
+    "rejected_at": "2026-11-03T13:38:08.682644"
+  },
+  {
+    "username": "jbmills",
+    "name": "Jb M.",
+    "reason": "Guard blacklist: traveling in",
+    "timestamp": "2026-11-03T17:39:50.571437"
+  },
+  {
+    "username": "erimonster",
+    "name": "Eri O.",
+    "reason": "Guard blacklist: not hosting",
+    "timestamp": "2026-11-03T17:39:50.571445"
+  },
+  {
+    "username": "asumi-osada",
+    "name": "ASUMI O.",
+    "reason": "Guard blacklist: only host women",
+    "timestamp": "2026-11-03T17:39:50.571447"
+  },
+  {
+    "username": "yuri-suzuki-6",
+    "name": "Yuri S.",
+    "reason": "Guard blacklist: traveling around",
+    "timestamp": "2026-11-03T17:39:50.571450"
+  },
+  {
+    "username": "takuro71914828",
+    "name": "Takuro S.",
+    "reason": "Guard blacklist: live with my family",
+    "timestamp": "2026-11-03T17:39:50.571451"
+  },
+  {
+    "username": "shutojapanese",
+    "name": "Shuto F.",
+    "reason": "Guard blacklist: traveling around",
+    "timestamp": "2026-11-03T17:39:50.571453"
+  },
+  {
+    "username": "janosloroute",
+    "name": "Jan K.",
+    "reason": "Guard blacklist: travelling in",
+    "timestamp": "2026-11-03T17:39:50.571455"
+  },
+  {
+    "username": "sakimi-goto",
+    "name": "Sakimi G.",
+    "reason": "Guard blacklist: can",
+    "timestamp": "2026-11-03T17:39:50.571457"
+  },
+  {
+    "username": "kenepiii",
+    "name": "Kenta O.",
+    "reason": "Guard blacklist: traveling around",
+    "timestamp": "2026-11-03T17:39:50.571459"
+  },
+  {
+    "username": "CHIBIROCK",
+    "name": "Kaori M.",
+    "reason": "Guard blacklist: living in Okinawa for a while now",
+    "timestamp": "2026-11-03T17:39:50.571461"
+  },
+  {
+    "username": "bartosz8947130",
+    "name": "Bartosz D.",
+    "reason": "Guard blacklist: unable to host",
+    "timestamp": "2026-11-03T17:39:50.571463"
+  },
+  {
+    "username": "jxcham",
+    "name": "JX C.",
+    "reason": "Guard blacklist: Currently traveling",
+    "timestamp": "2026-11-03T17:39:50.571465"
+  },
+  {
+    "username": "konosuk57348473",
+    "name": "Konosuke K.",
+    "reason": "Guard blacklist: traveling around",
+    "timestamp": "2026-11-03T17:39:50.571468"
+  },
+  {
+    "username": "kyoka929",
+    "name": "Kyoka M.",
+    "reason": "Guard blacklist: not hosting",
+    "timestamp": "2026-11-03T17:39:50.571470"
+  },
+  {
+    "username": "miu-fujiwara",
+    "name": "MIU F.",
+    "reason": "Guard blacklist: traveling around",
+    "timestamp": "2026-11-03T17:39:50.571471"
+  },
+  {
+    "username": "kantatanta",
+    "name": "Kanta F.",
+    "reason": "Guard blacklist: unable to host",
+    "timestamp": "2026-11-03T17:39:50.571473"
+  },
+  {
+    "username": "yoshino-yayama",
+    "name": "Yoshino Y.",
+    "reason": "Guard blacklist: CAN",
+    "timestamp": "2026-11-03T17:39:50.571474"
+  },
+  {
+    "username": "misa-nakano",
+    "name": "Misa N.",
+    "reason": "Guard blacklist: traveling abroad",
+    "timestamp": "2026-11-03T17:39:50.571476"
+  },
+  {
+    "username": "haruhitrip",
+    "name": "YAMAGUCHI H.",
+    "reason": "Guard blacklist: currently on the road ",
+    "timestamp": "2026-11-03T17:39:50.571478"
+  },
+  {
+    "username": "yuki0205",
+    "name": "Yuki M.",
+    "reason": "Guard blacklist: traveling in",
+    "timestamp": "2026-11-03T17:39:50.571479"
+  },
+  {
+    "username": "wawaskatepatio2",
+    "name": "wawa S.",
+    "reason": "Guard blacklist: only female",
+    "timestamp": "2026-11-03T17:39:50.571481"
+  },
+  {
+    "username": "ban",
+    "name": "yoshie I.",
+    "reason": "Guard blacklist: travelling around",
+    "timestamp": "2026-11-03T17:39:50.571483"
+  },
+  {
+    "username": "gomiura",
+    "name": "Go M.",
+    "reason": "Guard blacklist: traveling around",
+    "timestamp": "2026-11-03T17:39:50.571484"
+  },
+  {
+    "username": "hinajaved",
+    "name": "Hina S.",
+    "reason": "Guard blacklist: just hang",
+    "timestamp": "2026-11-03T17:39:50.571486"
+  },
+  {
+    "username": "aiueo",
+    "name": "KOKO Y.",
+    "reason": "Guard blacklist: traveling world",
+    "timestamp": "2026-11-03T17:39:50.571487"
+  },
+  {
+    "username": "megu-tsuchimura",
+    "name": "Megu T.",
+    "reason": "Guard blacklist: traveling abroad",
+    "timestamp": "2026-11-03T17:39:50.571489"
+  },
+  {
+    "username": "kamami-motegi",
+    "name": "YUSUKE T.",
+    "reason": "Guard blacklist: traveling around",
+    "timestamp": "2026-11-03T17:39:50.571490"
+  },
+  {
+    "username": "yukiyukiyuki",
+    "name": "yukiyukiyuki",
+    "reason": "Already sent",
+    "timestamp": "2026-11-03T17:39:50.571493"
+  },
+  {
+    "username": "lukapekic",
+    "name": "lukapekic",
+    "reason": "Already sent",
+    "timestamp": "2026-11-03T17:39:50.571495"
+  },
+  {
+    "username": "NUVA",
+    "name": "NUVA",
+    "reason": "Already sent",
+    "timestamp": "2026-11-03T17:39:50.571496"
+  },
+  {
+    "username": "tomo-shirakawa",
+    "name": "tomo-shirakawa",
+    "reason": "Already sent",
+    "timestamp": "2026-11-03T17:39:50.571497"
+  },
+  {
+    "username": "OJOSAYA",
+    "name": "OJOSAYA",
+    "reason": "Already sent",
+    "timestamp": "2026-11-03T17:39:50.571498"
+  },
+  {
+    "username": "CINTIAMH",
+    "name": "CINTIAMH",
+    "reason": "Already sent",
+    "timestamp": "2026-11-03T17:39:50.571500"
+  },
+  {
+    "username": "eduardojosa7",
+    "name": "eduardojosa7",
+    "reason": "Already sent",
+    "timestamp": "2026-11-03T17:39:50.571501"
+  },
+  {
+    "username": "rie-ando",
+    "name": "rie-ando",
+    "reason": "Already sent",
+    "timestamp": "2026-11-03T17:39:50.571502"
+  },
+  {
+    "username": "thegirlwhowalks",
+    "name": "thegirlwhowalks",
+    "reason": "Already sent",
+    "timestamp": "2026-11-03T17:39:50.571503"
+  },
+  {
+    "username": "KEI.OZAKI",
+    "name": "KEI.OZAKI",
+    "reason": "Already sent",
+    "timestamp": "2026-11-03T17:39:50.571504"
+  },
+  {
+    "username": "yosuke-sato-3",
+    "name": "yosuke-sato-3",
+    "reason": "Already sent",
+    "timestamp": "2026-11-03T17:39:50.571505"
+  },
+  {
+    "username": "urara",
+    "name": "urara",
+    "reason": "Already sent",
+    "timestamp": "2026-11-03T17:39:50.571506"
+  },
+  {
+    "username": "robyncharisse",
+    "name": "robyncharisse",
+    "reason": "Already sent",
+    "timestamp": "2026-11-03T17:39:50.571508"
+  },
+  {
+    "username": "MOHNBLUME_YURI",
+    "name": "MOHNBLUME_YURI",
+    "reason": "Already sent",
+    "timestamp": "2026-11-03T17:39:50.571509"
+  },
+  {
+    "username": "mikinhaa",
+    "name": "mikinhaa",
+    "reason": "Already sent",
+    "timestamp": "2026-11-03T17:39:50.571510"
+  },
+  {
+    "username": "b_like_rita",
+    "name": "b_like_rita",
+    "reason": "Already sent",
+    "timestamp": "2026-11-03T17:39:50.571511"
+  },
+  {
+    "username": "mio-matsumoto",
+    "name": "mio-matsumoto",
+    "reason": "Already sent",
+    "timestamp": "2026-11-03T17:39:50.571512"
+  },
+  {
+    "username": "sakisabure427",
+    "name": "Saki K.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "Hi! I’m Saki. I like to travel to different countries and connect with people. I’m so curious about new culture, happy to new way of thinking too. Now I work as business analyst in IT company. I live with my boyfriend.",
+    "timestamp": "2026-11-04T18:16:19.562018"
+  },
+  {
+    "username": "ayumu",
+    "name": "Ayu m.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "My wife and I live in Asakusa, Tokyo, one of the most popular areas for travelers. We’d be happy to show you around the area and introduce you to some of our favorite places. We’re friendly, open-minded, and polite, and we hope you’ll feel relaxed and comfortable in our home. Please check out the me",
+    "timestamp": "2026-11-04T18:16:19.562781"
+  },
+  {
+    "username": "hiroakimorita",
+    "name": "Hiroaki Morita",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "CURRENT MISSION I want my friends around the world and visitors to Japan to experience Tokyo — and Japan — on a deeper level. Whenever I have the opportunity to take a break, I travel across Japan, especially to its UNESCO World Heritage sites. I have visited most of the major World Heritage locatio",
+    "timestamp": "2026-11-04T18:16:19.563293"
+  },
+  {
+    "username": "cory-evans-klock",
+    "name": "Cory E.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "I am a 35 year old, vegetarian, identical twin, American, third culture kid who loves to host travelers and learn more about the world and the wonderful people that cohabit it. I am a high school science teacher and I am extremely passionate about education. I recently moved to Japan from the US and",
+    "timestamp": "2026-11-04T18:16:19.563634"
+  },
+  {
+    "username": "jlaraque",
+    "name": "Jose A.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "Living in Tokyo but originally from Spain. I enjoy meeting people from different cultures and sharing experiences. I’m an easy-going and open-minded person who loves exploring the city’s vibrant life and hidden gems.",
+    "timestamp": "2026-11-04T18:16:19.563956"
+  },
+  {
+    "username": "takuyatakuya",
+    "name": "Takuya T.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "#About hosting place in Tokyo Location: Between Tabata and Komagome station of Yamanote Line, a circular heavy rail line in Tokyo that connects major city centres. Also possible to use Metro line from Komagome station (N14). Very convenient place! Offer: Just a space for staying without bed,(Need yo",
+    "timestamp": "2026-11-04T18:16:19.564292"
+  },
+  {
+    "username": "shinobu-tamura",
+    "name": "Shinobu T.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "★ I would like to start to accept a guest now. -------------------------------------------------------------- I would like to talk with everybody in the world and would like to introduce my friends to you. If you come here, you would have a happy time, sometimes talking and some walking around a nic",
+    "timestamp": "2026-11-04T18:16:19.564687"
+  },
+  {
+    "username": "kumi",
+    "name": "Kumi T.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "Welcome to my page! Please read well before you send a request. ------------------------------------------------------------------------------- 2025 updated Thailand, Laos for volunteer work for children Searching for my daughter's scholarship 2025 August We appreciated it for your heart warming kin",
+    "timestamp": "2026-11-04T18:16:19.565029"
+  },
+  {
+    "username": "MORINO.MICHIHARU",
+    "name": "Michiharu M.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "CURRENT MISSION expanding my horizon :) ATTENTION Please read my profile before you send me a message or request. I don't respond the template message, and if you don't mention specifically about me or why you want to stay with me, I consider that request is a template message. My place is small, so",
+    "timestamp": "2026-11-04T18:16:19.565316"
+  },
+  {
+    "username": "gloria-xu-2",
+    "name": "Gloria X.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "There is so much, but I don’t know where to start. I'm living in Tokyo currently. I’d like to meet new people share different ideas. I don’t check this app so often if I don’t reply, you can message me here ins: gloria.xyz6",
+    "timestamp": "2026-11-04T18:16:19.565870"
+  },
+  {
+    "username": "shinmuramatsu",
+    "name": "Shin M.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "CURRENT MISSION Unstoppable! ABOUT ME I'm Japanese, a shy and boring, yeah typical Japanese. I would like to help foreigners who are learning Japanese and have difficulties with this. I would like to be a Japanese teacher for foreigners, it's my current mission! And I really have to make my dream co",
+    "timestamp": "2026-11-04T18:16:19.566190"
+  },
+  {
+    "username": "TABIBITO80",
+    "name": "Hiroshi K.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "CURRENT MISSION Cycling around India. ABOUT ME I dropped out of high school at the age of 16, because I didn't want to let them EDUCATE me in the way they did. It was the first ever step I took to set myself truely free. Since then I've been working and travelling. I decided to escape from my home c",
+    "timestamp": "2026-11-04T18:16:19.566517"
+  },
+  {
+    "username": "akihide-takano",
+    "name": "Akihide T.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "Working and living in Tokyo, Japan. Now accepting guests. I love traveling, hiking, camping and skiing. I am a big lover of hiking and skiing. Winter and Summer, I always seek a mountain where I can climb, even when I'm in foreing countries. I really like talking and drinking with people. I’m seriou",
+    "timestamp": "2026-11-04T18:16:19.566909"
+  },
+  {
+    "username": "61495454",
+    "name": "彩 毛.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "⚠️ I'm here to make new friends in CS, not for dating. I work at Yokohama which is located next to Tokyo now as a system engineer few yrs ago. I have lived in East of Tokyo at all time. If you visit Tokyo, ask me anything, and you can check my photo albums! I have been to more than 20 countries and ",
+    "timestamp": "2026-11-04T18:16:19.567246"
+  },
+  {
+    "username": "mikikomizoguchi",
+    "name": "Mikiko M.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "My name is Mikiko .I’m 21 years old university student in Japan :) I just started this app and I don’t have references so here’s my ig account. It’s a private mode but you can follow and check (you can unfollow anytime ! I do a private mode for a safety) IG : miglam__09",
+    "timestamp": "2026-11-04T18:16:19.567563"
+  },
+  {
+    "username": "leila-Terada",
+    "name": "Leïla T.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "I’m French, and I traveled alone in Japan by bicycle. Now, I’m traveling with my husband, Atsuki, who is from Japan, and we’re making the journey from Japan to France.",
+    "timestamp": "2026-11-04T18:16:19.567902"
+  },
+  {
+    "username": "riko-ko",
+    "name": "Riko K.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "Hi! I speak Spanish and English....Of course Japanese...🙂 Easy going, into food, curious to cultual diversity, chilled out, sometimes calm to enjoy my moods, sometimes active, these are all I am. Countries I have visited so far: Colombia, Mexico, Cuba, Dominican Republic, USA, Greece, Germany, Spain",
+    "timestamp": "2026-11-04T18:16:19.568241"
+  },
+  {
+    "username": "maxencegrlt",
+    "name": "Maxence G.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "2 French brothers in Japan for two weeks ! We are open to meet others travelers and locals to spend quality time ! And maybe for a first Japanese karaoke 👀🇫🇷",
+    "timestamp": "2026-11-04T18:16:19.568592"
+  },
+  {
+    "username": "alyssa-sato-2",
+    "name": "Alyssa S.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "British/Japanese female who was born in UK and grew up in Japan. I love drawing, walking around the place, driving, music, movies (especially Asian horror!) etcetera… My favorite artist is Gustave Doré. As I grew up in a monoethnic country, I was always interested in exploring and experiencing cultu",
+    "timestamp": "2026-11-04T18:16:19.568948"
+  },
+  {
+    "username": "takuyayama",
+    "name": "Yama T.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "CURRENT MISSION travel around the world ABOUT ME I run a cafe and guesthouse at Beppu and Yufuin. i love to meet people, that is why i join CS. PHILOSOPHY once-in-a-lifetime-meeting Treasure every meeting, for it will never recur",
+    "timestamp": "2026-11-04T18:16:19.569272"
+  },
+  {
+    "username": "tomostockholmeagle",
+    "name": "Tomo A.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "Hi, there. I'm a 28-year-old Japanese born and raised in Tokyo. I love meeting new people and discovering new worlds. Japanese/English/(a bit of) Spanish",
+    "timestamp": "2026-11-04T18:16:19.569598"
+  },
+  {
+    "username": "odaisuke",
+    "name": "odaisuke d.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "I really love to go to foreign country to find other culture and food something like that. I've been to over 10 countries which is the US, Canada, East south Asia, Europe etc when I was single. After married, I can't go to foreign country a lot due to kids, work. To keep continue to touch foreign ai",
+    "timestamp": "2026-11-04T18:16:19.569952"
+  },
+  {
+    "username": "koharuot",
+    "name": "紅春 加.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "I’m not using this platform as a dating app so don’t offer me accommodation if you’re looking for something from me Hi! I'm Koharu, 21yrs, Tokyo-based, student at ICU (small liberal arts uni outside the city). Studying development and education, work weekends at a lululemon in Shibuya. Right now I'm",
+    "timestamp": "2026-11-04T18:16:19.570293"
+  },
+  {
+    "username": "hide-sakamaki",
+    "name": "Hide S.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "CURRENT MISSION would love to meet up with people from all over the world ABOUT ME Love travel, beach, music,football(soccer),language,party..etc",
+    "timestamp": "2026-11-04T18:16:19.570653"
+  },
+  {
+    "username": "jade-f",
+    "name": "Jade F.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "I'm a Travel YouTuber and instagrammer. You can find me at: jade furuta In Japan, I work as a private tour guide My great friend and hardcore couch-surfer \"Ronnel James Salino\" who wrote me a review a little bit too early ( when we met) , has just written me an updated one , hehehe , so there you go",
+    "timestamp": "2026-11-04T18:16:19.571002"
+  },
+  {
+    "username": "eri",
+    "name": "ERI O.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "I’m Eri from Japan 🇯🇵 I’m 24 years old. I like to listen to music, feel nature and take a walk. And I like to try new things. I think there are many things to get. I wanna experience anything. ※ I have works, so sometime I can’t move with you and go out so much. But I’d love to meet people while sta",
+    "timestamp": "2026-11-04T18:16:19.571351"
+  },
+  {
+    "username": "hanakito",
+    "name": "HANAKO S.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "CURRENT MISSION connecting to the world ABOUT ME hello Im a girl from Japan and I grew up in Tokyo. I love traveling,also meeting up cool people in the world. these are my fav places in the world. NYC-the coolest city in the world which I would love to live sometimes in my life. kichijoji-\"my neibor",
+    "timestamp": "2026-11-04T18:16:19.571724"
+  },
+  {
+    "username": "kalani-poomaihealani",
+    "name": "Kalani P.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "If you’d like to make a request, be sure you are a verified member or send me a copy of your passport and I kindly ask that you do so at least two weeks in advance to ensure I can accommodate your plans. I have a deep appreciation for cultures from all over the world, and my home reflects that. In J",
+    "timestamp": "2026-11-04T18:16:19.572099"
+  },
+  {
+    "username": "mimitokyo",
+    "name": "MIMI in TOKYO ..",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "CURRENT MISSION People connection over the sea ABOUT ME I'd like to have a good communication with people all over the world",
+    "timestamp": "2026-11-04T18:16:19.572468"
+  },
+  {
+    "username": "NATSUMI00",
+    "name": "Natsumi K.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "I am Japanese. I love Japan Please ask me Japan",
+    "timestamp": "2026-11-04T18:16:19.572843"
+  },
+  {
+    "username": "ny",
+    "name": "Neori Y.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "The “where are you from?” question is so difficult to answer😅 So here it goes: I’m Japanese and US citizenship-wise, grew up moving back and forth and lived in each country for exactly half of my life. Graduated college in the Chicago and currently work as a sustainability consultant in Tokyo! Befor",
+    "timestamp": "2026-11-04T18:16:19.573232"
+  },
+  {
+    "username": "akariaucklandjaguar",
+    "name": "Akari O.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "I'm Akari from Japan. I was traveling by bicycle from Parith to Berlin🫶🏻 Basically, I'm using warmshower but right now they are doing maintenance so I'm using couchsurfin! Plase help me to accomodate🇯🇵🚲 And after bicycle travel, I will travel around Europe by bus 🚌 I'm a kind of open mind person and",
+    "timestamp": "2026-11-04T18:16:19.573600"
+  },
+  {
+    "username": "felipegaher",
+    "name": "Felipe G.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "Hey, I'm Felipe, I live in Tokyo. Working in medtech. Yorishiku ne!",
+    "timestamp": "2026-11-04T18:16:19.573985"
+  },
+  {
+    "username": "vick-ab",
+    "name": "Vick A.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "Work keeps me in the world of tech, but travel is what really resets my mind. I like meeting people who see the world with curiosity — the kind of conversations that start with a cup of tea and end hours later without anyone noticing. When I travel, I try to blend in with the local rhythm: explore o",
+    "timestamp": "2026-11-04T18:16:19.574391"
+  },
+  {
+    "username": "hitomi-sato-8",
+    "name": "Hitomi a.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "I’m pretty introverted, but loving to meet new people 🌼🤍",
+    "timestamp": "2026-11-04T18:16:19.574783"
+  },
+  {
+    "username": "aimakino",
+    "name": "Ai M.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "Japanese, born and raised in the uk! Moved to japan last year and currently based in tokyo :) Currently living a pretty cool life - boxing, traveling, meeting new people, everyday learning and exploring and getting to know myself and the world around me a little better. Always finding myself on rand",
+    "timestamp": "2026-11-04T18:16:19.575250"
+  },
+  {
+    "username": "frankie",
+    "name": "Franca E.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "I‘m Frankie, 28 years old from Germany. I‘m an introvert but still enjoy meeting new people while traveling because I find it really important to have cultural exchange and it is always worth it for me in the end. I like photography, jogging, sports in general and writing. Looking forward to meet yo",
+    "timestamp": "2026-11-04T18:16:19.576066"
+  },
+  {
+    "username": "shima0505",
+    "name": "Saki S.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "I’m from Tokyo, Japan. I love traveling, nature, and meeting people from different countries! I’ve been traveling solo for almost 10 years! Feel free to message me anytime :)",
+    "timestamp": "2026-11-04T18:16:19.576581"
+  },
+  {
+    "username": "sophiapei",
+    "name": "Sophia C.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "喜歡大自然，喜歡研究藥草，喜歡旅遊、攝影",
+    "timestamp": "2026-11-04T18:16:19.577232"
+  },
+  {
+    "username": "cgjose",
+    "name": "Jose E.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "CURRENT MISSION \"The world is a book and he who doesn’t travel only reads one page.” (Augustine) ABOUT ME I love meeting new people, traveling and learning about other cultures. Come visit! My occupations include engineering, design and music composition.",
+    "timestamp": "2026-11-04T18:16:19.577717"
+  },
+  {
+    "username": "fukak",
+    "name": "Fuka K.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "I'm a travel lover who academically studied tourism. My first solo trip was to Tasmania and I was 17 at the time. At the age of 19, I took half a year off (ended up short due to the Covid-19 pandemic) from university to travel around the world. You can find my reviews of previous account in a photo ",
+    "timestamp": "2026-11-04T18:16:19.578338"
+  },
+  {
+    "username": "maux",
+    "name": "Mau X.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "Mexican artist based in Japan. I paint and teach art, and also work in hospitality. I enjoy good food, wine, galleries, and conversations that go beyond small talk. Exploring new places and meeting people are some of my favourite ways to find inspiration. Happy to exchange stories over coffee or a g",
+    "timestamp": "2026-11-04T18:16:19.578832"
+  },
+  {
+    "username": "iamesagan",
+    "name": "Mai N.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "I’m Mai from Tokyo. Call me Mai 😊 I was born and grew up in a suburban area of Tokyo; Hachioji. Now I live in central Tokyo area 😆 I speak English fluently. I work in a creative agency and work as a private tour guide occasionally. I’d love people coming to Japan to love my country the way I do (or ",
+    "timestamp": "2026-11-04T18:16:19.579470"
+  },
+  {
+    "username": "fuka-konno",
+    "name": "FUKA K.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "I live in Japan. I love traveling and talking with foueigners. I'm a teacher of primary school.",
+    "timestamp": "2026-11-04T18:16:19.579993"
+  },
+  {
+    "username": "alextravel",
+    "name": "Alex S.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "I was absent from CS for a while, but started using it again in May 2024. CURRENT MISSION Experience the most vibrant cities in the world and meet amazing people ABOUT ME I am working at Waseda University in Tokyo. Before that I lived in Vienna, Zurich and in Genova (Italy), and I already hosted qui",
+    "timestamp": "2026-11-04T18:16:19.580616"
+  },
+  {
+    "username": "haruichinose",
+    "name": "Haru I.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "Hi! I'm an 18-year-old student from Japan, currently living in Tokyo. I love traveling, meeting new people, and experiencing different cultures. I've traveled to South Korea, Thailand, and many places across Japan. I've been involved in student communities and events in Japan. Looking forward to mee",
+    "timestamp": "2026-11-04T18:16:19.581158"
+  },
+  {
+    "username": "Link-Harsh",
+    "name": "Harshal A.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "Hi [今日は ] , ## Mostly I am available on weekends or weekday evenings only. Few words about me are enough when ultimately we all are set on our individual destinations... To keep it short : I'm Sagittarius (♐), Curious, amusing, open minded, expat staying in Japan who is passionate about everything w",
+    "timestamp": "2026-11-04T18:16:19.581809"
+  },
+  {
+    "username": "shunsuke-matsumoto",
+    "name": "Shunsuke M.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "Hi.I’m Shun.I’m living in Tokyo on my own🗼🇯🇵 I’m working as a firefighter &amp; paramedic. I often go to Hawaii.so I do speak English little. But I want to improve my English more.That’s why I’m here. I have a car and motorcycle. If you want to go somewhere please ask me. Maybe I can give you a ride",
+    "timestamp": "2026-11-04T18:16:19.582364"
+  },
+  {
+    "username": "TOKYOBROTHERHOOD",
+    "name": "Naotomo U.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "CURRENT MISSION My mission is to live life like there's no tomorrow! Try to do something fun, different, or something that I enjoy everyday. Also looking for new projects so I can travel ;) ABOUT ME Hope all is well!! I am very easy going, love to meet new people. I have visited 55 countries so far,",
+    "timestamp": "2026-11-04T18:16:19.583316"
+  },
+  {
+    "username": "tao-huang-8",
+    "name": "Tao H.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "13 References75 FriendsLives in Kita-ku My name is Tao. I’m a Chinese live in Tokyo, Japan. Recently Active Not for me Exercises Regularly Fluent in English Interested in Traveling Interested in Movies Interested in Languages",
+    "timestamp": "2026-11-05T20:52:54.120029"
+  },
+  {
+    "username": "kenyaosakacrossing",
+    "name": "Kenya I.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "56 References70 FriendsLives in Tokyo Ciao, I'm Kenya base in Tokyo/Kyoto/Osaka ⚠️I'll be Tokyo for a business trip until Nov 19th. If you need a place to stay, I can host you on the night of the 18th only, at The Prince Park Tower Tokyo I’m a government licensed guide in Japan and run a travel agen",
+    "timestamp": "2026-11-05T20:52:54.120844"
+  },
+  {
+    "username": "decdec",
+    "name": "Dec Dec T.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "Requested 61 References243 FriendsLives in Tokyo NOTE: My apologies everyone, my inbox is full of unread messages and I am trying to attend to your questions as much as I can. Please bear with me! If you have urgent matters to ask or report, please reach out Couchsurfing support for proper communica",
+    "timestamp": "2026-11-05T20:52:54.121412"
+  },
+  {
+    "username": "YAMA-MAMAN",
+    "name": "Ikuko Y.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "83 References32 FriendsLives in Tokyo CURRENT MISSION Talk with the people in the world. ABOUT ME I was working for Food Ingredient trading company near Akihabara (Akiba) before and now I m working in Ikebukuro as an office worker. I am very openmind person. I have two children already grew. PHILOSO",
+    "timestamp": "2026-11-05T20:52:54.122162"
+  },
+  {
+    "username": "elkordy",
+    "name": "Ahmed H.",
+    "reason": "Already sent (sending_history/queue)",
+    "about_snippet": "92 References45 FriendsLives in Tokyo Kind , sincere , honest , yet imperfect Recently Active Fluent in English Interested in Movies Interested in Books & Literature Interested in Festivals Fluent in Arabic (Egypt) Aquarius",
+    "timestamp": "2026-11-05T20:52:54.122682"
+  }
+]

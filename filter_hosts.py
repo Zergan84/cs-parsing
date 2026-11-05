@@ -29,6 +29,9 @@ import pandas as pd
 
 from gender_classifier import classify_host
 from social_extractor import extract_instagram
+from data_cleaner import sanitize_host_name, sanitize_host_clean_name, sanitize_host_location
+from database import get_sent_usernames
+from hosting_guard import HostingAvailabilityGuard
 
 if sys.platform == "win32":
     try:
@@ -42,15 +45,46 @@ OUTPUT_DIR = BASE_DIR / "output"
 USER_DATA_DIR = BASE_DIR / "user_data"
 AUTH_STATE_FILE = USER_DATA_DIR / "auth_state.json"
 
-# Стоп-слова и негативные паттерны недоступности хостов
+# Стоп-слова и негативные паттерны недоступности хостов (Hosting Availability Guard)
 STOP_PATTERNS = [
-    (r"not\s+accepting\s+guests?", "not accepting guests"),
+    (r"\bdo\s+not\s+send\s+(?:me\s+)?(?:home\s+|stay\s+)?requests?\b", "do not send stay requests"),
+    (r"\bnot\s+hosting\b", "not hosting"),
+    (r"\bno\s+hosting\b", "no hosting"),
+    (r"\bhosting\s+not\s+available\b", "hosting not available"),
+    (r"\bnot\s+available\s+hosting\b", "not available hosting"),
+    (r"(?:cannot|can't|cant|unable\s+to|won't\s+be\s+able\s+to|impossible\s+to)\s+host", "cannot host"),
+    (r"\bnot\s+able\s+to\s+host\b", "not able to host"),
+    (r"\bnot\s+accepting\s+guests?\b", "not accepting guests"),
     (r"\bnot\s+accepting\b", "not accepting"),
-    (r"(?:cannot|can't|cant|unable\s+to|won't\s+be\s+able\s+to)\s+host", "cannot host"),
-    (r"not\s+available\s+hosting", "not available hosting"),
+    (r"\bcan['’]?t\s+take\s+guests\b", "can't take guests"),
+    (r"\bcannot\s+accept\s+guests\b", "cannot accept guests"),
+    (r"\bstop(?:ped)?\s+hosting\b", "stopped hosting"),
+    (r"\bpause(?:d)?\s+hosting\b", "paused hosting"),
+    (r"\bnot\s+offering\s+(?:a\s+)?couch\b", "not offering couch"),
+    (r"\bno\s+space\s+to\s+(?:welcome|host)\b", "no space to host"),
+    (r"\bnot\s+hosting\s+(?:people|guests|anyone)\b", "not hosting people"),
+    (r"\bdo\s+not\s+host\b", "do not host"),
+    (r"\bdon['’]?t\s+host\b", "don't host"),
+
+    # Ограничения только для гостей-девушек
+    (r"\bfemale\s+guests?\s+only\b", "female guests only"),
+    (r"\bonly\s+female\b", "only female"),
+    (r"\bwomen\s+only\b", "women only"),
+    (r"\bonly\s+women\b", "only women"),
+    (r"\bgirls?\s+only\b", "girls only"),
+    (r"\bonly\s+girls?\b", "only girls"),
+    (r"\bhost(?:ing)?\s+(?:only\s+)?female(?:\s+travelers?)?\s+only\b", "female only"),
+    (r"\bhost(?:ing)?\s+female\s+travelers?\b", "female travelers only"),
+    (r"\bfemale\s+(?:travelers?|couchsurfers?|guests?)\s+only\b", "female guests only"),
+    (r"\bonly\s+(?:host|accept)\s+(?:female|women|girls?)\b", "only host female"),
+
+    # Путешествия / отсутствие в городе
+    (r"\btrave[l]+ing\s+(?:through|in|around|europe|asia|south\s+korea|america|world|abroad)\b", "traveling abroad"),
+    (r"\bwho\s+is\s+trave[l]+ing\b", "who is traveling"),
+    (r"\bexploring\s+(?:south\s+korea|europe|asia|vietnam|thailand|world|[a-z\s]+for\s+next)\b", "exploring abroad"),
     (r"not\s+in\s+japan", "not in japan"),
     (r"currently\s+not\s+in\s+japan", "currently not in japan"),
-    (r"currently\s+(?:in|on)\s+(?!tokyo|japan|my\s+apartment|home\b)[a-z\s]+", "currently outside tokyo/japan"),
+    (r"currently\s+(?:in|on|exploring|traveling\s+in|traveling\s+through)\s+(?!tokyo|japan|my\s+apartment|home\b)[a-z\s]+", "currently outside tokyo/japan"),
     (r"working\s+holiday", "working holiday"),
     (r"trave[l]+ing\s+around\s+the\s+world", "traveling around the world"),
     (r"\bindefinite\b", "indefinite travel"),
@@ -62,6 +96,14 @@ STOP_PATTERNS = [
     (r"don't\s+offer\s+accommodation", "no accommodation"),
     (r"do\s+not\s+offer\s+accommodation", "no accommodation"),
     (r"living\s+in\s+(?!tokyo|japan)[a-z\s]+\s+now", "living outside tokyo/japan"),
+
+    # Проживание с родителями / семьей / нет места
+    (r"(?:live|living|staying)\s+(?:with|at)\s+(?:my\s+)?(?:parents|family)(?:\s+house)?", "living with parents/family"),
+    (r"parents['’]?\s+house", "parents house"),
+    (r"with\s+my\s+family\s+and\s+(?:can['’]?t\s+host|no\s+space)", "family no space"),
+    (r"no\s+space\s+to\s+(?:host|welcome)", "no space to host"),
+    (r"not\s+enough\s+space", "not enough space"),
+    (r"don['’]?t\s+have\s+(?:a\s+)?(?:place|room|space|bed|couch)", "no space"),
 ]
 
 # Паттерны поиска кодовых слов / секретных фраз
@@ -159,6 +201,7 @@ class HostFilter:
         enrich_home: bool = False,
         headless: bool = True,
         max_enrich_hosts: int = 50,
+        hide_sent: bool = True,
     ):
         self.input_file = Path(input_file)
         self.output_json = Path(output_json)
@@ -168,6 +211,8 @@ class HostFilter:
         self.enrich_home = enrich_home
         self.headless = headless
         self.max_enrich_hosts = max_enrich_hosts
+        self.hide_sent = hide_sent
+        self.hosting_guard = HostingAvailabilityGuard()
 
     def check_stop_triggers(self, text: str) -> List[str]:
         """Возвращает список сработавших стоп-паттернов."""
@@ -282,23 +327,37 @@ class HostFilter:
 
         print(f"[*] Всего загружено сырых анкет: {len(raw_hosts)}")
 
+        # Загрузка отправленных запросов для жесткого исключения
+        sent_usernames = get_sent_usernames() if self.hide_sent else set()
+        if sent_usernames:
+            print(f"[*] Загружено отправленных адресатов для фильтрации: {len(sent_usernames)}")
+
         valid_hosts = []
         excluded_count = 0
 
         for h in raw_hosts:
-            username = h.get("username", "")
+            username = str(h.get("username", "")).strip()
+            host_id = str(h.get("id", "")).strip()
             name = h.get("name", "")
             about_me = h.get("about_me", "")
+
+            # 0. Исключение ранее отправленных хостов
+            if self.hide_sent and ((username and username.lower() in sent_usernames) or (host_id and host_id.lower() in sent_usernames)):
+                print(f"[FILTER] Пропуск хоста {username}: запрос уже был отправлен ранее")
+                self.hosting_guard.record_rejected(h, "Already sent (sending_history/queue)")
+                excluded_count += 1
+                continue
 
             # 1. Проверка стоп-триггеров в about_me
             triggers = self.check_stop_triggers(about_me)
             if triggers:
                 excluded_count += 1
-                # print(f"[-] Отсеян {username} ({name}): триггеры {triggers}")
+                self.hosting_guard.record_rejected(h, f"Stop triggers: {', '.join(triggers)}")
                 continue
 
             # 2. Определение пола и типа размещения
-            clean_name = re.sub(r"[\s\.,_-]+[A-Za-z]\.?$", "", name).strip()
+            name = sanitize_host_name(name)
+            clean_name = sanitize_host_clean_name(name)
             est_gender, host_type = classify_host(name, about_me, username)
 
             # 3. Фильтрация по полу
@@ -317,6 +376,7 @@ class HostFilter:
             rules = extract_house_rules(about_me)
             has_secret, secret_hint = detect_secret_code(about_me)
             insta_url, insta_handle = extract_instagram(about_me)
+            clean_loc = sanitize_host_location(h.get("location"), "Tokyo")
 
             curated_item = {
                 "id": username,
@@ -327,7 +387,7 @@ class HostFilter:
                 "name": name,
                 "estimated_gender": est_gender,
                 "host_type": host_type,
-                "location": h.get("location", "Tokyo"),
+                "location": clean_loc,
                 "instagram_handle": insta_handle,
                 "instagram_url": insta_url,
                 "references_count": h.get("references_count", 0),
@@ -399,6 +459,8 @@ def main():
     parser.add_argument("--no-couples", dest="allow_couples", action="store_false", help="Исключать пары")
     parser.add_argument("--enrich-home", action="store_true", help="Обогатить данными My Home через Playwright")
     parser.add_argument("--headless", action="store_true", default=True, help="Headless режим для Playwright")
+    parser.add_argument("--hide-sent", action="store_true", default=True, help="Исключать тех, кому уже отправлен запрос")
+    parser.add_argument("--no-hide-sent", dest="hide_sent", action="store_false", help="Не исключать отправленных")
     parser.add_argument("--limit", type=int, default=50, help="Лимит хостов для live-обогащения")
 
     args = parser.parse_args()
@@ -412,6 +474,7 @@ def main():
         enrich_home=args.enrich_home,
         headless=args.headless,
         max_enrich_hosts=args.limit,
+        hide_sent=args.hide_sent,
     )
     filter_module.run()
 

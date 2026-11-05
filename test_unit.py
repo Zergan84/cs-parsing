@@ -13,6 +13,7 @@ from filter_hosts import (
 )
 from social_extractor import extract_instagram
 from message_generator import generate_stay_request, format_date_range
+from hosting_guard import HostingAvailabilityGuard, check_host_can_overnight
 
 
 class TestGenderClassifier(unittest.TestCase):
@@ -74,7 +75,7 @@ class TestSocialExtractor(unittest.TestCase):
 class TestMessageGenerator(unittest.TestCase):
     def test_date_range_formatting(self):
         formatted = format_date_range("2026-11-11", "2026-11-14")
-        self.assertIn("Nov 11th – 14th, 2026", formatted)
+        self.assertIn("Nov 11–14", formatted)
 
     def test_stay_request_structure(self):
         host = {
@@ -87,12 +88,10 @@ class TestMessageGenerator(unittest.TestCase):
         }
         msg = generate_stay_request(host, "2026-11-11", "2026-11-14")
         self.assertIn("Hi Koji!", msg)
-        self.assertIn("Nov 11th – 14th, 2026", msg)
-        self.assertIn("Club Med Tomamu", msg)
-        self.assertIn("ski instructor", msg)
-        self.assertIn("10 years", msg)
-        self.assertIn("private room", msg.lower())
-        self.assertIn("tokyo_ramen", msg)
+        self.assertIn("Nov 11–14", msg)
+        self.assertIn("Tomamu", msg)
+        self.assertIn("coach skiing", msg)
+        self.assertIn("Andrey", msg)
 
 
 class TestFilterAndExtraction(unittest.TestCase):
@@ -143,6 +142,199 @@ class TestFilterAndExtraction(unittest.TestCase):
         rules = extract_house_rules("No smoking inside. Late nights okay. Please respect quiet hours.")
         self.assertIn("No smoking", rules)
         self.assertIn("Late nights okay", rules)
+
+
+class TestHostingAvailabilityGuard(unittest.TestCase):
+    def setUp(self):
+        self.guard = HostingAvailabilityGuard()
+
+    def test_moeko_hosting_guard(self):
+        """Проверка отсева анкеты Моэко (живет с родителями, невозможно принять гостей)."""
+        moeko_text = (
+            "Hosting Not Available — My name is Moeko. I am a Japanese teacher to foreigners. "
+            "Now I live my parents house, so impossible to host you. But we can have coffee and chat, or explore city."
+        )
+        matched_text, pattern = self.guard.check_regex_blacklist(moeko_text)
+        self.assertTrue(bool(matched_text))
+        self.assertIn("hosting not available", matched_text.lower())
+
+        # Проверка через общий интерфейс
+        host = {
+            "username": "moekookuya",
+            "name": "Moeko",
+            "about_me_clean": moeko_text,
+        }
+        can_host, full_reason = check_host_can_overnight(host, use_llm=False)
+        self.assertFalse(can_host)
+        self.assertIn("Blacklist match", full_reason)
+
+
+class TestDynamicTripAndDateSync(unittest.TestCase):
+    def setUp(self):
+        from auto_sender import AutoSender
+        self.sender = AutoSender(dry_run=True, headless=True)
+
+    def test_city_and_dates_extraction(self):
+        # 1. Токио с явными датами
+        tokyo_candidate = {
+            "username": "tokyo_host_1",
+            "target_city": "Tokyo",
+            "arrival_date": "2026-11-16",
+            "departure_date": "2026-11-19"
+        }
+        arr, dep, city = self.sender.get_host_dates_and_city(tokyo_candidate)
+        self.assertEqual(city, "Tokyo")
+        self.assertEqual(arr, "2026-11-16")
+        self.assertEqual(dep, "2026-11-19")
+
+        # 2. Киото со составным location и check_in / check_out
+        kyoto_candidate = {
+            "username": "kyoto_host_1",
+            "location": "Kyoto, Kansai, Japan",
+            "check_in": "2026-11-19",
+            "check_out": "2026-11-22"
+        }
+        arr, dep, city = self.sender.get_host_dates_and_city(kyoto_candidate)
+        self.assertEqual(city, "Kyoto")
+        self.assertEqual(arr, "2026-11-19")
+        self.assertEqual(dep, "2026-11-22")
+
+        # 3. Саппоро
+        sapporo_candidate = {
+            "username": "sapporo_host_1",
+            "location": "Sapporo, Hokkaido, Japan",
+            "arrival_date": "2026-11-22",
+            "departure_date": "2026-11-25"
+        }
+        arr, dep, city = self.sender.get_host_dates_and_city(sapporo_candidate)
+        self.assertEqual(city, "Sapporo")
+        self.assertEqual(arr, "2026-11-22")
+        self.assertEqual(dep, "2026-11-25")
+
+        # 4. Район Токио (Минато) корректно мапится на Токио
+        minato_candidate = {
+            "username": "minato_host_1",
+            "location": "Minato, Tokyo, Japan"
+        }
+        arr, dep, city = self.sender.get_host_dates_and_city(minato_candidate)
+        self.assertEqual(city, "Tokyo")
+
+
+class TestInboxResponderPromptAndClassification(unittest.TestCase):
+    """Тесты классификации и генерации ответов Inbox AI Responder."""
+
+    def test_classification_differentiation(self):
+        from llm_agent import classify_host_response
+
+        # Kumi: операция/больница
+        kumi_msg = "unfortunately i will be at the hospital for surgery, and i will come back after Nov.22"
+        res_kumi = classify_host_response(kumi_msg)
+        self.assertEqual(res_kumi["category"], "POLITE DECLINE WITH REASON")
+
+        # Sho: чай/пиво
+        sho_msg = "I don't have much time, but if I do find some, let's grab some tea or a beer."
+        res_sho = classify_host_response(sho_msg)
+        self.assertEqual(res_sho["category"], "WELCOMING / MEETUP OFFER")
+
+        # Kengo: Кагуразака вечер
+        kengo_msg = "My favorite spots are Kagurazaka... I’d be happy to see you in the evening then if we can!"
+        res_kengo = classify_host_response(kengo_msg)
+        self.assertEqual(res_kengo["category"], "WELCOMING / MEETUP OFFER")
+
+        # Riko: кафе-бар и музей
+        riko_msg = "no space in my house... but let's have a drink in a café-bar run by a friend. I highly recommend this museum."
+        res_riko = classify_host_response(riko_msg)
+        self.assertEqual(res_riko["category"], "WELCOMING / MEETUP OFFER")
+
+        # Fuka: отказ и отсутствие времени
+        fuka_msg = "Unfortunately, I'm unable to host you nor hang out with you during the time of your stay."
+        res_fuka = classify_host_response(fuka_msg)
+        self.assertEqual(res_fuka["category"], "COLD DECLINE")
+
+        # Stani: занят и нет времени
+        stani_msg = "Unfortunately, I won’t be able to host you. Recently I’ve been very busy and won’t have time."
+        res_stani = classify_host_response(stani_msg)
+        self.assertEqual(res_stani["category"], "COLD DECLINE")
+
+    def test_kumi_no_skiing_talk(self):
+        from llm_agent import generate_inbox_reply
+        kumi_msg = "unfortunately i will be at the hospital for surgery"
+        reply = generate_inbox_reply("Kumi", kumi_msg, category="POLITE DECLINE WITH REASON")
+        self.assertNotIn("ski", reply.lower())
+        self.assertNotIn("snow", reply.lower())
+        self.assertNotIn("tomamu", reply.lower())
+        self.assertTrue("recovery" in reply.lower() or "surgery" in reply.lower() or "smooth" in reply.lower())
+
+
+class TestFirstRequestNoBannedTemplatesAndDynamicDates(unittest.TestCase):
+    """Тестирует генерацию первых сообщений без шаблонных фраз и с динамическими датами."""
+
+    def test_rule_based_fallback_dynamic_and_no_banned_phrases(self):
+        from message_generator import generate_stay_request
+
+        # 1. Киото с датами 16-19 ноября
+        kyoto_host = {
+            "name": "Kenji",
+            "clean_name": "Kenji",
+            "city": "Kyoto",
+            "location": "Kyoto, Japan",
+            "check_in": "2026-11-16",
+            "check_out": "2026-11-19",
+            "about_me_clean": "Love playing vinyl records, jazz music and brewing coffee."
+        }
+        msg = generate_stay_request(kyoto_host)
+        
+        # Проверяем динамический город и даты
+        self.assertIn("Kyoto", msg)
+        self.assertIn("Nov 16–19", msg)
+        self.assertNotIn("Tokyo", msg)
+        self.assertNotIn("Nov 18–20", msg)
+
+        # Проверяем отсутствие забаненных шаблонных фраз
+        self.assertNotIn("won't crowd your space", msg.lower())
+        self.assertNotIn("crowd your routine", msg.lower())
+        self.assertNotIn("sharing travel stories in the evening", msg.lower())
+        self.assertNotIn("love your passion for", msg.lower())
+        self.assertNotIn("excited about your", msg.lower())
+
+        # Проверяем упоминание Takkyubin и лёгкого багажа
+        self.assertIn("Takkyubin", msg)
+        self.assertIn("daypack", msg)
+
+    def test_qc_validator_rejects_banned_phrases(self):
+        from llm_agent import validate_message_qc
+
+        banned_sample = "Hey Kenji! I love your passion for vinyl. I'm passing through Tokyo Nov 18-20. I'll be out in town exploring during the daytime, so I won't crowd your space or routine. Cheers, Andrey"
+        ok, issues = validate_message_qc(banned_sample)
+        self.assertFalse(ok)
+        self.assertTrue(any("banned" in i.lower() or "crowd your space" in i.lower() or "love your passion" in i.lower() or "too short" in i.lower() for i in issues))
+
+    def test_qc_validator_expanded_depth_and_word_range(self):
+        from llm_agent import validate_message_qc, clean_generated_message
+
+        raw_expanded = (
+            "Hi Yuka,\n\n"
+            "36 countries is a wonderful milestone! Traveling that extensively really shifts how you see the world — "
+            "what’s been the one place that surprised you the most so far?\n\n"
+            "I’ve been fortunate to explore around 55 countries myself, and those wild contrasts — between buzzing megalopolises "
+            "like NYC and the quiet serenity of Nepal — made me truly value how Couchsurfing connects kindred spirits. "
+            "I’m Andrey, a ski coach passing through Tokyo Nov 16–19 before heading north to Hokkaido for the winter season at Club Med Tomamu.\n\n"
+            "I travel ultra-light with just a small daypack since my winter gear is shipped ahead. I’d love to cross paths, "
+            "support your favorite neighborhood spots, and trade travel memories over tea or a drink if our schedules align!\n\n"
+            "Warmly,\n"
+            "Andrey"
+        )
+        cleaned = clean_generated_message(raw_expanded, date_str="Nov 16–19", city="Tokyo")
+        words = len(cleaned.split())
+        self.assertTrue(75 <= words <= 130, f"Expected 75-130 words, got {words}")
+        ok, issues = validate_message_qc(cleaned)
+        self.assertTrue(ok, f"Validation failed with issues: {issues}")
+
+        # Проверка отбраковки бана "Hope you have a great season!"
+        with_season = cleaned + " Hope you have a great season!"
+        ok_season, issues_season = validate_message_qc(with_season)
+        self.assertFalse(ok_season)
+        self.assertTrue(any("hope you have a great season" in i.lower() for i in issues_season))
 
 
 if __name__ == "__main__":
