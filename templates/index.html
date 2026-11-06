@@ -4213,6 +4213,41 @@
     let selectedHostCity = null; // Город для отображения хостов (из выбранного трипа)
     let tripsData = []; // Список загруженных трипов (для поиска города по URL)
 
+    // =========================================================================
+    // Persistent cache (localStorage) — хосты сохраняются между перезагрузками страницы
+    // =========================================================================
+    const LS_HOSTS_KEY = 'cs_hosts_data';
+
+    function saveHostsToLocalStorage() {
+        try {
+            localStorage.setItem(LS_HOSTS_KEY, JSON.stringify(hostsData));
+        } catch (e) {
+            console.warn('Не удалось сохранить хосты в localStorage:', e);
+        }
+    }
+
+    function restoreHostsFromLocalStorage() {
+        try {
+            const raw = localStorage.getItem(LS_HOSTS_KEY);
+            if (!raw) return false;
+            const parsed = JSON.parse(raw);
+            if (!Array.isArray(parsed)) return false;
+            hostsData = parsed;
+            return true;
+        } catch (e) {
+            console.warn('Не удалось восстановить хосты из localStorage:', e);
+            return false;
+        }
+    }
+
+    function clearHostsLocalStorage() {
+        try {
+            localStorage.removeItem(LS_HOSTS_KEY);
+        } catch (e) {
+            console.warn('Не удалось очистить localStorage хостов:', e);
+        }
+    }
+
     let activeAnchors = [
       "Mountain Trekking", "Cinema Nights", "Tech Meetups", 
       "Tea Ceremonies", "Street Photography", "Morning Yoga", 
@@ -4542,6 +4577,9 @@
         if (!res.ok) throw new Error("Failed to fetch hosts");
         const data = await res.json();
         hostsData = Array.isArray(data) ? data : [];
+
+        // Сохраняем в localStorage, чтобы хосты не исчезали при обновлении страницы
+        saveHostsToLocalStorage();
 
         // Отслеживаем новые хосты (пришли с флагом _new от live-скрапинга)
         data.forEach(h => {
@@ -5042,6 +5080,9 @@
         } else {
           alert(data.message || "Все данные поиска удалены");
           // Clear the hosts table
+          hostsData = [];
+          newHosts.clear();
+          clearHostsLocalStorage();
           const tbody = document.getElementById('hosts-table-body');
           if (tbody) tbody.innerHTML = '';
           const mobileContainer = document.getElementById('mobile-host-cards');
@@ -7344,6 +7385,13 @@
       toggleJitterFields();
       checkGlobalStatus();
       checkLlmStatus();
+
+      // Восстанавливаем хосты из localStorage сразу (чтобы не пусто было при обновлении страницы)
+      if (restoreHostsFromLocalStorage()) {
+        renderHostsTable();
+      }
+
+      // Затем загружаем свежие данные с сервера
       loadHosts();
       loadQueue();
       loadAutopilot();
