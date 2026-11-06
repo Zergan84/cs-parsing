@@ -1193,6 +1193,51 @@ async def queue_all_hosts_endpoint(payload: Optional[QueueAllPayload] = None):
     return {"status": "ok", "added_count": count, "stats": stats}
 
 
+class QueueDeletePayload(BaseModel):
+    usernames: Optional[List[str]] = None
+
+
+@app.delete("/api/queue/delete/{username}")
+async def delete_queue_item(username: str):
+    """Удаляет одну карточку хоста из очереди отправки по username."""
+    removed = queue_manager.set_status_for_selected([username], "deleted")
+    # Also remove from JSON queue file
+    queue = queue_manager.load_queue(exclude_sent=False)
+    queue = [x for x in queue if str(x.get("username", "")).strip().lower() != username.strip().lower()]
+    queue_manager.save_queue(queue)
+    return {"status": "ok", "removed": removed, "username": username}
+
+
+@app.delete("/api/queue/delete_all")
+async def delete_all_queue_items(payload: Optional[QueueDeletePayload] = None):
+    """Удаляет все карточки из очереди отправки (или только выбранные username)."""
+    usernames = payload.usernames if payload and payload.usernames else None
+
+    with db_session() as conn:
+        cur = conn.cursor()
+        if usernames:
+            placeholders = ",".join("?" for _ in usernames)
+            cur.execute(
+                f"DELETE FROM sending_queue WHERE host_id IN (SELECT id FROM hosts WHERE username IN ({placeholders}))",
+                usernames,
+            )
+            removed = cur.rowcount
+        else:
+            cur.execute("DELETE FROM sending_queue")
+            removed = cur.rowcount
+
+    # Also rewrite JSON queue file
+    queue = queue_manager.load_queue(exclude_sent=False)
+    if usernames:
+        u_set = set(u.strip().lower() for u in usernames if u.strip())
+        queue = [x for x in queue if str(x.get("username", "")).strip().lower() not in u_set]
+    else:
+        queue = []
+    queue_manager.save_queue(queue)
+
+    return {"status": "ok", "removed": removed}
+
+
 @app.get("/api/download/csv")
 async def download_csv(curated: bool = False):
     slug = "tokyo"

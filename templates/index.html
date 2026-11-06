@@ -3721,6 +3721,14 @@
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>
               <span>Refresh</span>
             </button>
+            <button type="button" class="btn btn-ghost btn-sm" id="btn-queue-delete-selected" onclick="deleteSelectedQueueItems()" title="Удалить выбранные карточки из очереди" disabled>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+              <span>Delete</span>
+            </button>
+            <button type="button" class="btn btn-danger btn-sm" id="btn-queue-delete-all" onclick="deleteAllQueueItems()" title="Удалить все карточки из очереди">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+              <span>Delete All</span>
+            </button>
             <button type="button" class="btn btn-secondary btn-sm" id="btn-regenerate-selected" disabled onclick="regenerateSelectedCards()" title="Regenerate only selected draft messages">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
               <span>⟳ Regenerate Selected (<span id="selected-count">0</span>)</span>
@@ -4438,8 +4446,10 @@
           body: JSON.stringify({ usernames: usernames, city: selectedHostCity || undefined })
         });
         const data = await res.json();
+        const added = data.added_count || 0;
+        const alreadyQueued = usernames.length - added;
 
-        // Mark all as queued
+        // Mark all as queued (UI-wise)
         usernames.forEach(u => queuedUsernames.add(u.toLowerCase()));
 
         // Instant DOM update: replace all [ + Queue ] with [ ✓ Queued ]
@@ -4454,15 +4464,24 @@
         // Update queue count badge in header
         const navBadge = document.getElementById('nav-queue-count');
         if (navBadge) {
-          const added = data.added_count || usernames.length;
           const curr = parseInt(navBadge.textContent, 10) || 0;
           navBadge.textContent = curr + added;
         }
 
-        if (btnText) btnText.textContent = `✓ All Queued (${usernames.length})`;
-        if (btn) {
-          btn.disabled = true;
-          btn.style.opacity = '0.7';
+        if (added > 0) {
+          if (btnText) btnText.textContent = `✓ Добавлено ${added} из ${usernames.length}`;
+          if (btn) {
+            btn.disabled = true;
+            btn.style.opacity = '0.7';
+          }
+          showToast(`Добавлено в очередь: ${added} новых, ${alreadyQueued} уже были в очереди`);
+        } else {
+          if (btnText) btnText.textContent = `⚡ Queue All (${usernames.length}) — все уже в очереди`;
+          if (btn) {
+            btn.disabled = true;
+            btn.style.opacity = '0.7';
+          }
+          showToast(`Все ${usernames.length} хостов уже находятся в очереди`, "info");
         }
 
         loadQueue();
@@ -5177,6 +5196,51 @@
       }
     }
 
+    async function deleteSelectedQueueItems() {
+      const usernames = Array.from(selectedQueueIds);
+      if (usernames.length === 0) {
+        showToast("Нет выбранных карточек для удаления", "warning");
+        return;
+      }
+      if (!confirm(`Удалить ${usernames.length} выбранных карточек из очереди?`)) return;
+
+      try {
+        const res = await fetch(`/api/queue/delete_all`, {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ usernames })
+        });
+        if (!res.ok) throw new Error("Failed to delete selected");
+        const data = await res.json();
+        selectedQueueIds.clear();
+        await loadQueue();
+        showToast(`Удалено ${data.removed} карточек из очереди`);
+      } catch (e) {
+        console.error("Delete selected error:", e);
+        showToast("Error deleting selected: " + e.message, "error");
+      }
+    }
+
+    async function deleteAllQueueItems() {
+      if (!confirm("Удалить ВСЕ карточки из очереди отправки? Это действие необратимо.")) return;
+
+      try {
+        const res = await fetch(`/api/queue/delete_all`, {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ usernames: null })
+        });
+        if (!res.ok) throw new Error("Failed to delete all");
+        const data = await res.json();
+        selectedQueueIds.clear();
+        await loadQueue();
+        showToast(`Удалено ${data.removed} карточек из очереди`);
+      } catch (e) {
+        console.error("Delete all error:", e);
+        showToast("Error deleting all: " + e.message, "error");
+      }
+    }
+
     function updateQueueMetrics(stats) {
       let approved = queueData.filter(q => ['approved', 'queued'].includes((q.status || '').toLowerCase())).length;
       let drafts = queueData.filter(q => (q.status || '').toLowerCase() === 'draft').length;
@@ -5758,6 +5822,15 @@
       if (countSpan) countSpan.textContent = count;
       if (btn) {
         btn.disabled = count === 0 || (activeRegenIds && activeRegenIds.size > 0);
+      }
+      updateDeleteSelectedButton();
+    }
+
+    function updateDeleteSelectedButton() {
+      const btn = document.getElementById('btn-queue-delete-selected');
+      const count = document.querySelectorAll('.queue-card-select:checked').length;
+      if (btn) {
+        btn.disabled = count === 0;
       }
     }
 
