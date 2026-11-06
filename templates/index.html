@@ -4555,7 +4555,7 @@
         const rating = host.references_count ? Math.min(99, Math.max(75, 70 + Math.floor(host.references_count * 0.4))) : 90;
         const responseRate = host.response_rate_pct ? Math.round(host.response_rate_pct) : 90;
         const isQueued = queuedUsernames.has(username.toLowerCase());
-        const profileUrl = host.profile_url || `https://www.couchsurfing.com/people/${encodeURIComponent(username)}`;
+        const profileUrl = host.profile_url || `https://www.couchsurfing.com/c/users/${encodeURIComponent(username)}`;
 
         // Dynamic tags based on bio keywords
         const tags = generateHostTags(host);
@@ -5485,7 +5485,7 @@
           ? item.compatibility_points[0].title 
           : "Shared curiosity for meaningful travel stories";
 
-        const profileUrl = item.profile_url || `https://www.couchsurfing.com/people/${encodeURIComponent(username)}`;
+        const profileUrl = item.profile_url || `https://www.couchsurfing.com/c/users/${encodeURIComponent(username)}`;
         const stayReqUrl = item.stay_request_url || (profileUrl + '/stay-request');
 
         const uLower = (username || '').toLowerCase();
@@ -6560,7 +6560,7 @@
               <div class="ap-row-item candidate-card table-row ${isSending ? 'is-sending-pulse' : ''}" id="ready-row-${escapeHtml(c.username)}" data-ready-username="${escapeHtml(uKey)}">
                 <div class="ap-row-left" style="display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1 1 auto; overflow: hidden;">
                   <span style="font-weight: 600; color: var(--amber-400); font-family: var(--font-mono); font-size: 11px; flex-shrink: 0;">#${i + 1}</span>
-                  <a href="https://www.couchsurfing.com/people/${encodeURIComponent(c.username)}" target="_blank" rel="noopener noreferrer" style="text-decoration: none; display: flex; align-items: center; gap: 6px; min-width: 0; flex: 1 1 auto; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;">
+                  <a href="https://www.couchsurfing.com/c/users/${encodeURIComponent(c.username)}" target="_blank" rel="noopener noreferrer" style="text-decoration: none; display: flex; align-items: center; gap: 6px; min-width: 0; flex: 1 1 auto; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;">
                     <span class="truncate" style="font-weight: 600; color: var(--ink-50); font-size: 13px; max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(c.name)}</span>
                     <span style="color: var(--ink-400); font-size: 12px; max-width: 100px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" class="truncate">@${escapeHtml(c.username)}</span>
                   </a>
@@ -6590,7 +6590,7 @@
               <div class="ap-row-item candidate-card table-row ${isFresh ? 'slide-in-highlight' : ''}" id="sent-row-${escapeHtml(s.username)}">
                 <div class="ap-row-left" style="display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1 1 auto; overflow: hidden;">
                   <span style="font-weight: 600; color: var(--emerald-400); font-family: var(--font-mono); font-size: 11px; flex-shrink: 0;">#${i + 1}</span>
-                  <a href="https://www.couchsurfing.com/people/${encodeURIComponent(s.username)}" target="_blank" rel="noopener noreferrer" style="text-decoration: none; display: flex; align-items: center; gap: 6px; min-width: 0; flex: 1 1 auto; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;">
+                  <a href="https://www.couchsurfing.com/c/users/${encodeURIComponent(s.username)}" target="_blank" rel="noopener noreferrer" style="text-decoration: none; display: flex; align-items: center; gap: 6px; min-width: 0; flex: 1 1 auto; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;">
                     <span class="truncate" style="font-weight: 600; color: var(--ink-50); font-size: 13px; max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(s.name)}</span>
                     <span style="color: var(--ink-400); font-size: 12px; max-width: 100px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" class="truncate">@${escapeHtml(s.username)}</span>
                   </a>
@@ -6933,11 +6933,11 @@
       const uLink = document.getElementById('inbox-detail-username-link');
       if (uLink) {
         uLink.textContent = '@' + username;
-        uLink.href = `https://www.couchsurfing.com/people/${username}`;
+        uLink.href = `https://www.couchsurfing.com/c/users/${username}`;
       }
       const pLink = document.getElementById('inbox-detail-profile-link');
       if (pLink) {
-        pLink.href = `https://www.couchsurfing.com/people/${username}`;
+        pLink.href = `https://www.couchsurfing.com/c/users/${username}`;
       }
       document.getElementById('inbox-detail-location').textContent = conv.location || 'Tokyo, Japan';
       document.getElementById('inbox-detail-time').textContent = formatTimeAgo(conv.last_message_timestamp);

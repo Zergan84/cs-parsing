@@ -2084,7 +2084,7 @@ html_content = r'''<!DOCTYPE html>
         const rating = host.references_count ? Math.min(99, Math.max(75, 70 + Math.floor(host.references_count * 0.4))) : 90;
         const responseRate = host.response_rate_pct ? Math.round(host.response_rate_pct) : 90;
         const isQueued = queuedUsernames.has(username.toLowerCase());
-        const profileUrl = host.profile_url || `https://www.couchsurfing.com/people/${encodeURIComponent(username)}`;
+        const profileUrl = host.profile_url || `https://www.couchsurfing.com/c/users/${encodeURIComponent(username)}`;
 
         // Dynamic tags based on bio keywords
         const tags = generateHostTags(host);
@@ -2359,7 +2359,7 @@ html_content = r'''<!DOCTYPE html>
           fact = item.compatibility_points[0].title || fact;
         }
 
-        const profileUrl = item.profile_url || `https://www.couchsurfing.com/people/${encodeURIComponent(username)}`;
+        const profileUrl = item.profile_url || `https://www.couchsurfing.com/c/users/${encodeURIComponent(username)}`;
         const stayReqUrl = item.stay_request_url || (profileUrl + '/stay-request');
 
         return `
