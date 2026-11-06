@@ -1000,10 +1000,11 @@ async def get_results(curated: bool = False, hide_sent: bool = True, city: Optio
             json_path = OUTPUT_DIR / f"hosts_{slug}.json"
 
     # Если идет сбор — читаем также live-файл для отображения в реальном времени
+    # Если основного файла нет вообще — читаем live-файл в любом случае
     live_hosts = []
     is_scraping = process_mgr.is_running
-    if is_scraping:
-        live_path = OUTPUT_DIR / f"hosts_{slug}_live.json"
+    live_path = OUTPUT_DIR / f"hosts_{slug}_live.json"
+    if is_scraping or not json_path.exists():
         if live_path.exists():
             try:
                 with open(live_path, "r", encoding="utf-8") as f:

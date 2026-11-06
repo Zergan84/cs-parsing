@@ -4217,6 +4217,7 @@
     // Persistent cache (localStorage) — хосты сохраняются между перезагрузками страницы
     // =========================================================================
     const LS_HOSTS_KEY = 'cs_hosts_data';
+    const LS_CITY_KEY = 'cs_selected_city';
 
     function saveHostsToLocalStorage() {
         try {
@@ -4245,6 +4246,24 @@
             localStorage.removeItem(LS_HOSTS_KEY);
         } catch (e) {
             console.warn('Не удалось очистить localStorage хостов:', e);
+        }
+    }
+
+    function saveSelectedCity(city) {
+        try {
+            localStorage.setItem(LS_CITY_KEY, city || '');
+        } catch (e) {
+            console.warn('Не удалось сохранить город в localStorage:', e);
+        }
+    }
+
+    function restoreSelectedCity() {
+        try {
+            const raw = localStorage.getItem(LS_CITY_KEY);
+            if (!raw) return null;
+            return raw || null;
+        } catch (e) {
+            return null;
         }
     }
 
@@ -4576,10 +4595,14 @@
         const res = await fetch(`/api/hosts?curated=true&hide_sent=true${cityParam}`);
         if (!res.ok) throw new Error("Failed to fetch hosts");
         const data = await res.json();
-        hostsData = Array.isArray(data) ? data : [];
-
-        // Сохраняем в localStorage, чтобы хосты не исчезали при обновлении страницы
-        saveHostsToLocalStorage();
+        
+        // Если API вернул данные, используем их. Если пусто — оставляем existing hostsData (из localStorage).
+        if (data && data.length > 0) {
+          hostsData = Array.isArray(data) ? data : [];
+          // Сохраняем в localStorage только когда есть реальные данные от сервера
+          saveHostsToLocalStorage();
+        }
+        // Если API вернул пустой массив — не перезаписываем hostsData, оставляем как есть (из localStorage)
 
         // Отслеживаем новые хосты (пришли с флагом _new от live-скрапинга)
         data.forEach(h => {
@@ -5125,6 +5148,7 @@
       // 3) Запоминаем город, чтобы после парсинга показать его хостов
       if (tripCity && tripCity !== 'Неизвестно') {
         selectedHostCity = tripCity;
+        saveSelectedCity(tripCity);
         const subLoc = document.getElementById('subbar-location');
         if (subLoc) subLoc.textContent = tripCity;
         console.log(`[UI] Выбран трип: ${tripCity} | ${tripArrival} – ${tripDeparture} | ${tripUrl}`);
@@ -7389,6 +7413,14 @@
       toggleJitterFields();
       checkGlobalStatus();
       checkLlmStatus();
+
+      // Восстанавливаем выбранный город из localStorage
+      const restoredCity = restoreSelectedCity();
+      if (restoredCity) {
+        selectedHostCity = restoredCity;
+        const subLoc = document.getElementById('subbar-location');
+        if (subLoc) subLoc.textContent = restoredCity;
+      }
 
       // Восстанавливаем хосты из localStorage сразу (чтобы не пусто было при обновлении страницы)
       if (restoreHostsFromLocalStorage()) {
