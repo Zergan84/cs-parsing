@@ -4680,6 +4680,7 @@
         const genderTone = gender.toLowerCase().includes('couple') ? 'badge-amber' : 'badge-neutral';
 
         // 1) Mobile card representation (<= 768px iPhone Safari)
+        const isNew = newHosts.has(username);
         const hostShade = isNew ? ' ' + (newHosts.get(username) || 'host-new-dark') : '';
         const mobileNewClass = isNew ? ' host-new' + hostShade : '';
         mobileCardsHtml += `
@@ -4734,7 +4735,6 @@
         `;
 
         // 2) Desktop table row representation
-        const isNew = newHosts.has(username);
         const newShade = isNew ? ' ' + newHosts.get(username) : '';
         return `
           <tr data-username="${escapeHtml(username)}" class="host-new${newShade}">
