@@ -1429,6 +1429,72 @@ async def regenerate_single_request(payload: RegenerateItem):
         return JSONResponse(status_code=500, content={"error": f"LLM generation failed: {str(e)}"})
 
 
+class FixNamePayload(BaseModel):
+    username: str
+    name: str
+
+
+@app.post("/api/requests/fix-name")
+async def fix_host_name(payload: FixNamePayload):
+    """Исправляет имя хоста в очереди и пересоздает сообщение с исправленным именем."""
+    username = (payload.username or "").strip()
+    new_name = (payload.name or "").strip()
+    if not username:
+        return JSONResponse(status_code=400, content={"error": "username is required"})
+    if not new_name:
+        return JSONResponse(status_code=400, content={"error": "name is required"})
+
+    try:
+        # 1. Находим хост в очереди
+        queue = queue_manager.load_queue(exclude_sent=False)
+        target_item = None
+        for item in queue:
+            if str(item.get("username", "")).strip().lower() == username.lower():
+                target_item = item
+                break
+
+        if not target_item:
+            return JSONResponse(status_code=404, content={"error": f"Host '{username}' not found in queue"})
+
+        # 2. Обновляем имя через data_cleaner
+        from data_cleaner import sanitize_host_name, sanitize_host_clean_name
+        target_item["name"] = sanitize_host_name(new_name)
+        target_item["clean_name"] = sanitize_host_clean_name(new_name)
+
+        # 3. Сохраняем обновленную очередь
+        queue_manager.save_queue(queue)
+
+        # 4. Пересоздаем сообщение с исправленным именем
+        updated = await asyncio.to_thread(
+            queue_manager.regenerate_item,
+            username=username,
+            check_in=target_item.get("check_in"),
+            check_out=target_item.get("check_out"),
+            guest_context=target_item.get("guest_context"),
+        )
+
+        if not updated:
+            return JSONResponse(status_code=500, content={"error": "Failed to regenerate message with fixed name"})
+
+        msg = updated.get("generated_message", "")
+        words = updated.get("word_count", len(msg.split()))
+        qc_passed = updated.get("qc_passed", True)
+
+        return {
+            "status": "ok",
+            "username": username,
+            "name": new_name,
+            "generated_message": msg,
+            "word_count": words,
+            "qc_passed": qc_passed,
+            "item": updated,
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"error": f"Failed to fix name: {str(e)}"})
+
+
 batch_regen_state: Dict[str, Any] = {
     "is_running": False,
     "total": 0,

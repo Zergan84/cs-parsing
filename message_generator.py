@@ -35,6 +35,59 @@ def format_date_range(check_in: str, check_out: str) -> str:
     return format_conversational_dates(check_in, check_out)
 
 
+def extract_greeting_name(host: Dict[str, Any]) -> str:
+    """
+    Извлекает чистое человеческое имя для приветствия из данных хоста.
+    
+    Приоритет: clean_name > name > username
+    Очищает от технических приставок, цифр, дефисов, подчёркиваний.
+    Например:
+      - "satoko-okts" -> "Satoko"
+      - "lin-lin-84" -> "Lin"
+      - "Bobur_ns" -> "Bobur"
+      - "Alice J." -> "Alice"
+    """
+    raw = host.get("clean_name") or host.get("name") or host.get("username") or "there"
+    if not raw:
+        return "there"
+
+    # Базовая очистка через data_cleaner (убирает фамильные инициалы, References и т.д.)
+    try:
+        from data_cleaner import sanitize_host_clean_name
+        name = sanitize_host_clean_name(raw)
+    except Exception:
+        name = str(raw)
+
+    name = str(name).strip()
+    if not name:
+        return "there"
+
+    # Берем только первое слово (до пробела)
+    parts = name.split()
+    first_part = parts[0] if parts else name
+
+    # Разбиваем по всем не-буквенным символам (дефис, подчёркивание, цифра, точка и т.д.)
+    # и берем первый буквенный фрагмент
+    letter_parts = re.split(r'[^a-zA-Zа-яА-ЯёЁ]+', first_part)
+    letter_parts = [p for p in letter_parts if p]
+
+    if letter_parts:
+        first_name = letter_parts[0]
+    elif len(parts) > 1:
+        # Пробуем следующее слово
+        return extract_greeting_name({**host, "clean_name": parts[1]})
+    else:
+        return "there"
+
+    # Капитализируем: первая буква заглавная, остальные строчные
+    if len(first_name) > 1:
+        first_name = first_name[0].upper() + first_name[1:].lower()
+    else:
+        first_name = first_name.upper()
+
+    return first_name
+
+
 def generate_stay_request(
     host: Dict[str, Any],
     check_in: str = "2026-11-18",
@@ -45,13 +98,7 @@ def generate_stay_request(
     Генерирует строго персонализированный текст запроса (45-65 слов).
     Динамически учитывает город и даты хоста.
     """
-    clean_name = host.get("clean_name") or host.get("name") or "there"
-    # Убираем кракозябры и фамильные инициалы
-    clean_name = str(clean_name).replace("\ufffd", "").strip()
-    first_name = re.sub(r"\s+[A-Za-z]\.?$", "", clean_name).strip() or "there"
-    first_name = first_name.split()[0] if first_name else "there"
-    if first_name.isupper() and len(first_name) > 1:
-        first_name = first_name.capitalize()
+    first_name = extract_greeting_name(host)
 
     # Динамический город
     raw_loc = host.get("location")

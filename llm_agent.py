@@ -368,15 +368,8 @@ class CouchsurfingLLM:
         guest_context: Optional[str] = None,
         image_insights: Optional[str] = None,
     ) -> Tuple[str, str, str]:
-        name = host.get("clean_name") or host.get("name") or "there"
-        # Убираем кракозябры и непечатаемые символы
-        name = str(name).replace("\ufffd", "").strip()
-        first_name = re.sub(r"\s+[A-Za-z]\.?$", "", name.strip()).strip()
-        first_name = re.sub(r"[\.\s]+$", "", first_name).strip() or "there"
-        first_name = first_name.split()[0] if first_name else "there"
-        # Приводим к Capitalize, если имя было полностью КАПСОМ (например, YOSHIKO -> Yoshiko)
-        if first_name.isupper() and len(first_name) > 1:
-            first_name = first_name.capitalize()
+        from message_generator import extract_greeting_name
+        first_name = extract_greeting_name(host)
 
         raw_loc = host.get("location")
         if isinstance(raw_loc, dict):

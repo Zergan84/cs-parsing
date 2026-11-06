@@ -5599,6 +5599,10 @@
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
                   <span>Regenerate</span>
                 </button>
+                <button type="button" class="btn btn-ghost btn-sm" id="btn-fixname-${escapeHtml(username)}" onclick="openFixNameModal('${escapeJs(username)}', '${escapeJs(name)}')" title="Исправить имя для приветствия">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25Z"/><path d="M2.06 20l2.89-2.89a5 5 0 0 1 7.07 0l17.81 17.81a5 5 0 0 1 0 7.07l-2.89 2.89a5 5 0 0 1-7.07 0l-17.81-17.81a5 5 0 0 1 0-7.07Z"/></svg>
+                  <span>✏️ Имя</span>
+                </button>
                 <button type="button" class="btn btn-ghost btn-sm" id="btn-copy-${escapeHtml(username)}" onclick="copyMessage(this, '${escapeJs(username)}')">
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
                   <span>Copy</span>
@@ -7408,6 +7412,135 @@
         setInterval(loadInbox, 6000),
       ];
     });
+
+    // Fix Name Modal HTML
+    const fixNameModalHtml = `
+    <div id="fixNameModal" class="modal" style="display:none; visibility:hidden; position:fixed; top:0; left:0; width:100%; height:100%; background: rgba(0,0,0,0.6); z-index: 10000; display: flex; align-items: center; justify-content: center;">
+      <div style="background: var(--ink-900); border: 1px solid var(--ink-700); border-radius: 8px; padding: 24px; width: 400px; max-width: 90%; box-shadow: 0 20px 60px rgba(0,0,0,0.5);">
+        <div style="font-weight: 600; font-size: 16px; color: var(--ink-100); margin-bottom: 16px; display: flex; align-items: center; gap: 8px;">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25Z"/><path d="M2.06 20l2.89-2.89a5 5 0 0 1 7.07 0l17.81 17.81a5 5 0 0 1 0 7.07l-2.89 2.89a5 5 0 0 1-7.07 0l-17.81-17.81a5 5 0 0 1 0-7.07Z"/></svg>
+          Исправить имя хоста
+        </div>
+        <p style="font-size: 12px; color: var(--ink-400); margin-bottom: 16px;" id="fixNameHint">Введите имя для приветствия.</p>
+        <input type="text" id="fixNameInput" class="form-input" style="margin-bottom: 16px;" placeholder="например: Satoko" autocomplete="off">
+        <div style="display: flex; gap: 8px; justify-content: flex-end;">
+          <button type="button" onclick="closeFixNameModal()" class="btn btn-ghost btn-sm" style="padding: 6px 16px;">Отмена</button>
+          <button type="button" id="fixNameSaveBtn" onclick="saveFixName()" class="btn btn-primary btn-sm" style="padding: 6px 16px;">Сохранить и пересоздать</button>
+        </div>
+      </div>
+    </div>
+    `;
+    // Insert modal into body if not already present
+    if (!document.getElementById('fixNameModal')) {
+      const container = document.createElement('div');
+      container.innerHTML = fixNameModalHtml;
+      document.body.appendChild(container.firstElementChild);
+    }
+
+    // Close modal on Escape key
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') closeFixNameModal();
+    });
+
+    // =========================================================================
+    // Fix Name / Edit Greeting Modal
+    // =========================================================================
+    let fixNameTargetUsername = null;
+
+    function openFixNameModal(username, currentName) {
+      fixNameTargetUsername = username;
+      const modal = document.getElementById('fixNameModal');
+      const input = document.getElementById('fixNameInput');
+      const hint = document.getElementById('fixNameHint');
+      if (!modal || !input) return;
+      input.value = currentName || '';
+      hint.textContent = currentName ? `Текущее имя: "${currentName}". Введите исправленное имя для приветствия (например, "Satoko").` : 'Введите имя хоста.';
+      modal.style.display = 'flex';
+      modal.style.visibility = 'visible';
+      input.focus();
+    }
+
+    function closeFixNameModal() {
+      const modal = document.getElementById('fixNameModal');
+      if (modal) {
+        modal.style.display = 'none';
+        modal.style.visibility = 'hidden';
+      }
+      fixNameTargetUsername = null;
+    }
+
+    async function saveFixName() {
+      const input = document.getElementById('fixNameInput');
+      if (!input || !fixNameTargetUsername) return;
+      const newName = input.value.trim();
+      if (!newName) {
+        alert("Пожалуйста, введите имя.");
+        return;
+      }
+
+      const btn = document.getElementById('fixNameSaveBtn');
+      const originalHtml = btn ? btn.innerHTML : '';
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<span style="display:inline-block;width:14px;height:14px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin 0.6s linear infinite;margin-right:4px;"></span><span>Сохраняю...</span>';
+      }
+
+      try {
+        const res = await fetch('/api/requests/fix-name', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: fixNameTargetUsername,
+            name: newName,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) {
+          throw new Error(data.error || 'Failed to update name');
+        }
+
+        // Regenerate message with fixed name
+        const textarea = document.getElementById('textarea-' + fixNameTargetUsername);
+        if (textarea) {
+          textarea.style.opacity = '0.5';
+        }
+
+        const regenRes = await fetch('/api/requests/regenerate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: fixNameTargetUsername }),
+        });
+        const regenData = await regenRes.json();
+        const newMsg = regenData.generated_message || (regenData.item && regenData.item.generated_message) || '';
+
+        if (newMsg && textarea) {
+          textarea.value = newMsg;
+          textarea.style.opacity = '1';
+          // Update in-memory queueData
+          const item = queueData.find(q => (q.username || '').toLowerCase() === fixNameTargetUsername.toLowerCase());
+          if (item) {
+            item.generated_message = newMsg;
+            item.message = newMsg;
+          }
+          onMessageEdited(fixNameTargetUsername, newMsg);
+        }
+
+        showToast(`Имя исправлено на "${newName}" и сообщение пересоздано.`);
+        closeFixNameModal();
+      } catch (e) {
+        alert("Ошибка: " + e.message);
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = originalHtml;
+        }
+        if (textarea) textarea.style.opacity = '1';
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = originalHtml;
+        }
+      }
+    }
   </script>
 
   <!-- Fixed Native Bottom Tab Bar (iPhone Safari Viewport <= 768px) -->
