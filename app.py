@@ -986,50 +986,71 @@ async def get_results(curated: bool = False, hide_sent: bool = True, city: Optio
     explicit_city = bool(city and city.strip())
     if explicit_city:
         slug = re.sub(r"\W+", "_", city.strip().lower())
-        if curated:
-            json_path = OUTPUT_DIR / f"hosts_{slug}_curated.json"
-            if not json_path.exists():
-                json_path = OUTPUT_DIR / f"hosts_{slug}.json"
-        else:
-            json_path = OUTPUT_DIR / f"hosts_{slug}.json"
     else:
         slug = "tokyo"
-        if curated:
-            json_path = OUTPUT_DIR / f"hosts_{slug}_curated.json"
-            if not json_path.exists():
-                json_path = OUTPUT_DIR / "hosts_tokyo_curated.json"
-        else:
+
+    # Определяем основной файл с хостами
+    if curated:
+        json_path = OUTPUT_DIR / f"hosts_{slug}_curated.json"
+        if not json_path.exists():
             json_path = OUTPUT_DIR / f"hosts_{slug}.json"
-            if not json_path.exists():
-                json_path = OUTPUT_DIR / "hosts_tokyo.json"
+    else:
+        json_path = OUTPUT_DIR / f"hosts_{slug}.json"
+        if not json_path.exists() and explicit_city:
+            json_path = OUTPUT_DIR / f"hosts_{slug}.json"
 
-    if not json_path.exists():
+    # Если идет сбор — читаем также live-файл для отображения в реальном времени
+    live_hosts = []
+    is_scraping = process_mgr.is_running
+    if is_scraping:
+        live_path = OUTPUT_DIR / f"hosts_{slug}_live.json"
+        if live_path.exists():
+            try:
+                with open(live_path, "r", encoding="utf-8") as f:
+                    live_hosts = json.load(f)
+            except Exception:
+                live_hosts = []
+
+    if not json_path.exists() and not live_hosts:
         return []
 
-    try:
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+    # Читаем основной файл
+    data = []
+    if json_path.exists():
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            logger.error(f"Ошибка чтения основного файла хостов: {e}")
+            data = []
 
-        # Жесткое исключение отправленных адресатов (SQLite + JSON logs + Queue)
-        if hide_sent:
-            from database import get_sent_usernames
-            sent_set = get_sent_usernames()
-            if sent_set:
-                data = [
-                    x for x in data
-                    if str(x.get("username", "")).strip().lower() not in sent_set
-                    and str(x.get("id", "")).strip().lower() not in sent_set
-                ]
+    # Объединяем с live-хостами (живые добавляются в начало, помечаются как новые)
+    existing_usernames = {str(x.get("username", "")).strip().lower() for x in data}
+    for h in reversed(live_hosts):  # обратный порядок, чтобы новые были сверху
+        u = str(h.get("username", "")).strip().lower()
+        if u and u not in existing_usernames:
+            h["_new"] = True
+            h["_is_live"] = True
+            data.insert(0, h)
+            existing_usernames.add(u)
 
-        for x in data:
-            x["name"] = sanitize_host_name(x.get("name"))
-            x["clean_name"] = sanitize_host_clean_name(x.get("clean_name") or x.get("name"))
-            x["location"] = sanitize_host_location(x.get("location"))
+    # Жесткое исключение отправленных адресатов (SQLite + JSON logs + Queue)
+    if hide_sent:
+        from database import get_sent_usernames
+        sent_set = get_sent_usernames()
+        if sent_set:
+            data = [
+                x for x in data
+                if str(x.get("username", "")).strip().lower() not in sent_set
+                and str(x.get("id", "")).strip().lower() not in sent_set
+            ]
 
-        return data
-    except Exception as e:
-        logger.error(f"Ошибка получения списка хостов: {e}")
-        return []
+    for x in data:
+        x["name"] = sanitize_host_name(x.get("name"))
+        x["clean_name"] = sanitize_host_clean_name(x.get("clean_name") or x.get("name"))
+        x["location"] = sanitize_host_location(x.get("location"))
+
+    return data
 
 
 class AddToQueuePayload(BaseModel):

@@ -1120,6 +1120,8 @@ class CouchsurfingScraper:
                 # Дополнительно извлекаем из DOM
                 self._extract_cards_from_page(page)
                 print(f"[*] Шаг #{page_idx}/{self.max_scroll_pages} | Найдено хостов (API + DOM): {len(self.collected_hosts)}")
+                # Сохраняем live-промежуток для отображения в UI в реальном времени
+                self._save_live_hosts()
 
                 if page_idx == self.max_scroll_pages:
                     break
@@ -1146,6 +1148,18 @@ class CouchsurfingScraper:
             browser.close()
 
         return self._filter_and_save()
+
+    def _save_live_hosts(self) -> None:
+        """Сохраняет текущих собранных хостов в live-файл для отображения в UI в реальном времени."""
+        try:
+            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            all_hosts = list(self.collected_hosts.values())
+            slug_city = re.sub(r"\W+", "_", self.city.lower())
+            live_path = OUTPUT_DIR / f"hosts_{slug_city}_live.json"
+            with open(live_path, "w", encoding="utf-8") as f:
+                json.dump(all_hosts, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[!] Не удалось сохранить live-хосты: {e}")
 
     def _filter_and_save(self) -> List[Dict[str, Any]]:
         """Фильтрация и экспорт в CSV и JSON."""

@@ -1524,6 +1524,17 @@
       box-shadow: 0 0 0 1px var(--amber-500) inset;
     }
 
+    /* Мигание новых хостов, добавленных в реальном времени во время скрапинга */
+    .host-new {
+      animation: hostNewPulse 1.5s infinite alternate;
+      background: rgba(245, 158, 11, 0.15) !important;
+      border-left: 3px solid var(--amber-500) !important;
+    }
+    @keyframes hostNewPulse {
+      0% { background: rgba(245, 158, 11, 0.08); }
+      100% { background: rgba(245, 158, 11, 0.25); }
+    }
+
     /* City filter pills next to Queue All */
     .city-filter-pills {
       display: flex;
@@ -4176,6 +4187,7 @@
     // State Variables
     let currentTab = 'search';
     let hostsData = [];
+    let newHosts = new Set(); // Новые хосты, добавленные в реальном времени во время скрапинга (мигают в таблице)
     let queueData = [];
     let queuedUsernames = new Set();
     let selectedQueueIds = new Set();
@@ -4249,6 +4261,10 @@
         if (wasScrapingRunning && !isScrapingRunning) {
           // Парсинг завершился — подтягиваем хосты выбранного трипа
           console.log('[UI] Scraper finished — reloading hosts for', selectedHostCity || 'default city');
+          loadHosts();
+        }
+        // Если идет сбор — опрашиваем хосты в реальном времени для отображения новых
+        if (isScrapingRunning && currentTab === 'search') {
           loadHosts();
         }
         wasScrapingRunning = isScrapingRunning;
@@ -4518,6 +4534,19 @@
         if (!res.ok) throw new Error("Failed to fetch hosts");
         const data = await res.json();
         hostsData = Array.isArray(data) ? data : [];
+
+        // Отслеживаем новые хосты (пришли с флагом _new от live-скрапинга)
+        data.forEach(h => {
+          if (h._new && h.username) {
+            newHosts.add(h.username);
+            // Убираем флаг мигания через 5 секунд
+            setTimeout(() => {
+              newHosts.delete(h.username);
+              h._new = false;
+            }, 5000);
+          }
+        });
+
         updateSortIndicators();
         renderHostsTable();
       } catch (e) {
@@ -4616,8 +4645,9 @@
         `;
 
         // 2) Desktop table row representation
+        const isNew = newHosts.has(username) || host._new;
         return `
-          <tr data-username="${escapeHtml(username)}">
+          <tr data-username="${escapeHtml(username)}" class="${isNew ? 'host-new' : ''}">
             <!-- 1. HOST -->
             <td>
               <div class="host-cell">
