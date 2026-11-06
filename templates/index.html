@@ -358,12 +358,13 @@
       display: flex !important;
     }
 
-    /* Unified scrollbar style — applied to all scrollable sections */
+    /* Unified scrollbar style — applied to all scrollable sections including Search */
     #tab-queue,
     #tab-autopilot,
     #tab-inbox,
     #tab-context,
-    #tab-logs {
+    #tab-logs,
+    #tab-search {
       overflow-y: auto !important;
       overflow-x: hidden !important;
       scrollbar-gutter: stable !important;
@@ -374,7 +375,8 @@
     #tab-autopilot::-webkit-scrollbar,
     #tab-inbox::-webkit-scrollbar,
     #tab-context::-webkit-scrollbar,
-    #tab-logs::-webkit-scrollbar {
+    #tab-logs::-webkit-scrollbar,
+    #tab-search::-webkit-scrollbar {
       width: 10px !important;
       display: block !important;
     }
@@ -382,7 +384,8 @@
     #tab-autopilot::-webkit-scrollbar-track,
     #tab-inbox::-webkit-scrollbar-track,
     #tab-context::-webkit-scrollbar-track,
-    #tab-logs::-webkit-scrollbar-track {
+    #tab-logs::-webkit-scrollbar-track,
+    #tab-search::-webkit-scrollbar-track {
       background: var(--ink-900) !important;
       border-left: 1px solid var(--ink-800) !important;
       border-radius: 4px;
@@ -391,7 +394,8 @@
     #tab-autopilot::-webkit-scrollbar-thumb,
     #tab-inbox::-webkit-scrollbar-thumb,
     #tab-context::-webkit-scrollbar-thumb,
-    #tab-logs::-webkit-scrollbar-thumb {
+    #tab-logs::-webkit-scrollbar-thumb,
+    #tab-search::-webkit-scrollbar-thumb {
       background: var(--ink-600) !important;
       border-radius: 6px !important;
       border: 2px solid var(--ink-900) !important;
@@ -400,12 +404,9 @@
     #tab-autopilot::-webkit-scrollbar-thumb:hover,
     #tab-inbox::-webkit-scrollbar-thumb:hover,
     #tab-context::-webkit-scrollbar-thumb:hover,
-    #tab-logs::-webkit-scrollbar-thumb:hover {
+    #tab-logs::-webkit-scrollbar-thumb:hover,
+    #tab-search::-webkit-scrollbar-thumb:hover {
       background: var(--amber-500) !important;
-    }
-
-    #tab-search {
-      overflow: hidden !important;
     }
 
     /* Standard Button Styles */
@@ -1525,14 +1526,20 @@
     }
 
     /* Мигание новых хостов, добавленных в реальном времени во время скрапинга */
+    /* Чередующиеся оттенки коричневого для визуального разделения соседних строк */
     .host-new {
-      animation: hostNewPulse 1.5s infinite alternate;
-      background: rgba(245, 158, 11, 0.15) !important;
+      animation: hostNewPulse 2s infinite alternate;
       border-left: 3px solid var(--amber-500) !important;
     }
+    .host-new.host-new-dark {
+      background: rgba(139, 69, 19, 0.14) !important;
+    }
+    .host-new.host-new-light {
+      background: rgba(210, 105, 30, 0.09) !important;
+    }
     @keyframes hostNewPulse {
-      0% { background: rgba(245, 158, 11, 0.08); }
-      100% { background: rgba(245, 158, 11, 0.25); }
+      0% { opacity: 1; }
+      100% { opacity: 0.6; }
     }
 
     /* City filter pills next to Queue All */
@@ -4187,7 +4194,8 @@
     // State Variables
     let currentTab = 'search';
     let hostsData = [];
-    let newHosts = new Set(); // Новые хосты, добавленные в реальном времени во время скрапинга (мигают в таблице)
+    let newHosts = new Map(); // username -> shadeClass ('host-new-dark' | 'host-new-light')
+    let newHostToggle = 0; // Чередование темный/светлый коричневый для соседних строк
     let queueData = [];
     let queuedUsernames = new Set();
     let selectedQueueIds = new Set();
@@ -4538,7 +4546,10 @@
         // Отслеживаем новые хосты (пришли с флагом _new от live-скрапинга)
         data.forEach(h => {
           if (h._new && h.username) {
-            newHosts.add(h.username);
+            // Чередуем темный и светлый оттенки коричневого
+            const shadeClass = (newHostToggle % 2 === 0) ? 'host-new-dark' : 'host-new-light';
+            newHostToggle++;
+            newHosts.set(h.username, shadeClass);
             // Убираем флаг мигания через 5 секунд
             setTimeout(() => {
               newHosts.delete(h.username);
@@ -4593,8 +4604,9 @@
         const genderTone = gender.toLowerCase().includes('couple') ? 'badge-amber' : 'badge-neutral';
 
         // 1) Mobile card representation (<= 768px iPhone Safari)
+        const mobileNewClass = isNew ? ' host-new' + newShade : '';
         mobileCardsHtml += `
-          <div class="mobile-host-card" data-username="${escapeHtml(username)}">
+          <div class="mobile-host-card${mobileNewClass}" data-username="${escapeHtml(username)}">
             <div class="m-card-header">
               <div class="m-card-user">
                 <a href="${escapeHtml(profileUrl)}" target="_blank" rel="noopener noreferrer" style="text-decoration: none;">
@@ -4645,9 +4657,10 @@
         `;
 
         // 2) Desktop table row representation
-        const isNew = newHosts.has(username) || host._new;
+        const isNew = newHosts.has(username);
+        const newShade = isNew ? ' ' + newHosts.get(username) : '';
         return `
-          <tr data-username="${escapeHtml(username)}" class="${isNew ? 'host-new' : ''}">
+          <tr data-username="${escapeHtml(username)}" class="host-new${newShade}">
             <!-- 1. HOST -->
             <td>
               <div class="host-cell">
