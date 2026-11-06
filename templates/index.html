@@ -4614,19 +4614,21 @@
         // Если API вернул пустой массив — НЕ перезаписываем hostsData, оставляем как есть (из localStorage)
 
         // Отслеживаем новые хосты (пришли с флагом _new от live-скрапинга)
-        data.forEach(h => {
-          if (h._new && h.username) {
-            // Чередуем темный и светлый оттенки коричневого
-            const shadeClass = (newHostToggle % 2 === 0) ? 'host-new-dark' : 'host-new-light';
-            newHostToggle++;
-            newHosts.set(h.username, shadeClass);
-            // Убираем флаг мигания через 5 секунд
-            setTimeout(() => {
-              newHosts.delete(h.username);
-              h._new = false;
-            }, 5000);
-          }
-        });
+        if (Array.isArray(data)) {
+          data.forEach(h => {
+            if (h._new && h.username) {
+              // Чередуем темный и светлый оттенки коричневого
+              const shadeClass = (newHostToggle % 2 === 0) ? 'host-new-dark' : 'host-new-light';
+              newHostToggle++;
+              newHosts.set(h.username, shadeClass);
+              // Убираем флаг мигания через 5 секунд
+              setTimeout(() => {
+                newHosts.delete(h.username);
+                h._new = false;
+              }, 5000);
+            }
+          });
+        }
 
         updateSortIndicators();
         renderHostsTable();
