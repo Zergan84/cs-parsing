@@ -4211,6 +4211,7 @@
     let isEmergencyStopped = false;
     let isScrapingRunning = false;
     let wasScrapingRunning = false;
+    let isLoadingHosts = false; // Защита от параллельных вызовов loadHosts
     let autopilotData = {};
     let currentSort = { column: 'rating', order: 'desc' };
     let cityFilter = 'all';
@@ -4577,6 +4578,10 @@
     }
 
     async function loadHosts() {
+      // Предотвращаем параллельные вызовы loadHosts
+      if (isLoadingHosts) return;
+      isLoadingHosts = true;
+
       try {
         // Ensure queue is loaded first so queuedUsernames is fully populated
         if (queueData.length === 0) {
@@ -4606,7 +4611,7 @@
           // Сохраняем в localStorage только когда есть реальные данные от сервера
           saveHostsToLocalStorage();
         }
-        // Если API вернул пустой массив — не перезаписываем hostsData, оставляем как есть (из localStorage)
+        // Если API вернул пустой массив — НЕ перезаписываем hostsData, оставляем как есть (из localStorage)
 
         // Отслеживаем новые хосты (пришли с флагом _new от live-скрапинга)
         data.forEach(h => {
@@ -4627,6 +4632,10 @@
         renderHostsTable();
       } catch (e) {
         console.error("Load hosts error:", e);
+        // При ошибке API НЕ очищаем hostsData — оставляем данные из localStorage
+        renderHostsTable();
+      } finally {
+        isLoadingHosts = false;
       }
     }
 
@@ -4794,7 +4803,8 @@
 
       const queueAllText = document.getElementById('btn-queue-all-text');
       if (queueAllText) {
-        queueAllText.textContent = `⚡ Queue All (${list.length})`;
+        // Queue All показывает ВСЕХ хостов, а не отфильтрованных
+        queueAllText.textContent = `⚡ Queue All (${hostsData.length})`;
       }
     }
 
@@ -7493,10 +7503,9 @@
     // Initialization
     window.addEventListener('DOMContentLoaded', () => {
       toggleJitterFields();
-      checkGlobalStatus();
       checkLlmStatus();
 
-      // Восстанавливаем выбранный город из localStorage
+      // Восстанавливаем выбранный город из localStorage ПЕРВЫМ делом (до любого API-вызова)
       const restoredCity = restoreSelectedCity();
       if (restoredCity) {
         selectedHostCity = restoredCity;
@@ -7511,6 +7520,7 @@
 
       // Затем загружаем свежие данные с сервера
       loadHosts();
+      checkGlobalStatus();
       loadQueue();
       loadAutopilot();
       loadInbox();
