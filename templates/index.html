@@ -3752,6 +3752,10 @@
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
               <span>⟳ Regenerate Selected (<span id="selected-count">0</span>)</span>
             </button>
+            <button type="button" class="btn btn-secondary btn-sm" id="btn-set-names-selected" disabled onclick="setNamesSelectedCards()" title="Исправить только имена хостов для выбранных карточек">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25Z"/><path d="M2.06 20l2.89-2.89a5 5 0 0 1 7.07 0l17.81 17.81a5 5 0 0 1 0 7.07l-2.89 2.89a5 5 0 0 1-7.07 0l-17.81-17.81a5 5 0 0 1 0-7.07Z"/></svg>
+              <span>✏️ Set Names (<span id="selected-count-names">0</span>)</span>
+            </button>
             <button type="button" class="btn btn-secondary btn-sm" onclick="regenerateAllDrafts()" title="Regenerate all draft messages">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
               <span>Regenerate All Drafts</span>
@@ -4665,7 +4669,8 @@
         const genderTone = gender.toLowerCase().includes('couple') ? 'badge-amber' : 'badge-neutral';
 
         // 1) Mobile card representation (<= 768px iPhone Safari)
-        const mobileNewClass = isNew ? ' host-new' + newShade : '';
+        const hostShade = isNew ? ' ' + (newHosts.get(username) || 'host-new-dark') : '';
+        const mobileNewClass = isNew ? ' host-new' + hostShade : '';
         mobileCardsHtml += `
           <div class="mobile-host-card${mobileNewClass}" data-username="${escapeHtml(username)}">
             <div class="m-card-header">
@@ -5982,6 +5987,13 @@
       if (btn) {
         btn.disabled = count === 0 || (activeRegenIds && activeRegenIds.size > 0);
       }
+      // Set Names button state
+      const setNamesBtn = document.getElementById('btn-set-names-selected');
+      const setNamesCountSpan = document.getElementById('selected-count-names');
+      if (setNamesCountSpan) setNamesCountSpan.textContent = count;
+      if (setNamesBtn) {
+        setNamesBtn.disabled = count === 0 || (activeRegenIds && activeRegenIds.size > 0);
+      }
       updateDeleteSelectedButton();
     }
 
@@ -6027,6 +6039,76 @@
         startRegenPolling();
       } catch (e) {
         showToast("Error starting regeneration: " + e.message, "error");
+        targetUsernames.forEach(u => {
+          activeRegenIds.delete(u);
+          activeRegenIds.delete(u.toLowerCase());
+          const overlay = document.getElementById(`regen-overlay-${u}`) || document.querySelector(`.message-card[data-username="${u.toLowerCase()}"] .card-regen-overlay`);
+          if (overlay) overlay.style.display = 'none';
+        });
+        updateRegenerateSelectedButton();
+      }
+    }
+
+    async function setNamesSelectedCards() {
+      const checkedBoxes = Array.from(document.querySelectorAll('.queue-card-select:checked'));
+      const targetUsernames = Array.from(new Set(checkedBoxes.map(cb => cb.getAttribute('data-id')).filter(Boolean)));
+      if (targetUsernames.length === 0) {
+        showToast("No cards selected for name fix", "error");
+        return;
+      }
+
+      const btn = document.getElementById('btn-set-names-selected');
+      if (btn) btn.disabled = true;
+
+      // Mark cards as active
+      targetUsernames.forEach(u => {
+        activeRegenIds.add(u);
+        activeRegenIds.add(u.toLowerCase());
+        const overlay = document.getElementById(`regen-overlay-${u}`) || document.querySelector(`.message-card[data-username="${u.toLowerCase()}"] .card-regen-overlay`);
+        if (overlay) overlay.style.display = 'flex';
+      });
+
+      try {
+        const res = await fetch('/api/requests/fix-names-batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ usernames: targetUsernames }),
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) {
+          throw new Error(data.error || 'Failed to fix names');
+        }
+
+        showToast(`Имена исправлены для ${data.processed || targetUsernames.length} карточек`);
+
+        // Update in-memory queueData with new names and messages
+        const resultsMap = {};
+        (data.results || []).forEach(r => { resultsMap[r.username] = r; });
+
+        targetUsernames.forEach(u => {
+          const result = resultsMap[u];
+          const item = queueData.find(q => (q.username || '').toLowerCase() === u.toLowerCase());
+          if (item && result) {
+            item.name = result.name;
+            item.clean_name = result.name;
+            if (result.generated_message) {
+              item.generated_message = result.generated_message;
+              item.message = result.generated_message;
+            }
+          }
+          // Remove from active regen
+          activeRegenIds.delete(u);
+          activeRegenIds.delete(u.toLowerCase());
+          const overlay = document.getElementById(`regen-overlay-${u}`) || document.querySelector(`.message-card[data-username="${u.toLowerCase()}"] .card-regen-overlay`);
+          if (overlay) overlay.style.display = 'none';
+        });
+
+        // Re-render queue cards to reflect new names
+        renderQueueCards();
+        updateRegenerateSelectedButton();
+
+      } catch (e) {
+        showToast("Error fixing names: " + e.message, "error");
         targetUsernames.forEach(u => {
           activeRegenIds.delete(u);
           activeRegenIds.delete(u.toLowerCase());

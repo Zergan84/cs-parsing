@@ -1496,6 +1496,73 @@ async def fix_host_name(payload: FixNamePayload):
         return JSONResponse(status_code=500, content={"error": f"Failed to fix name: {str(e)}"})
 
 
+class FixNamesBatchPayload(BaseModel):
+    usernames: List[str] = []
+
+
+@app.post("/api/requests/fix-names-batch")
+async def fix_names_batch(payload: FixNamesBatchPayload):
+    """Перегенерирует только имена хостов для выбранных карточек и пересоздает сообщения."""
+    usernames = [str(u).strip() for u in (payload.usernames or []) if str(u).strip()]
+    if not usernames:
+        return JSONResponse(status_code=400, content={"error": "usernames is required"})
+
+    try:
+        from message_generator import extract_greeting_name
+        from data_cleaner import sanitize_host_name, sanitize_host_clean_name
+
+        results = []
+        queue = queue_manager.load_queue(exclude_sent=False)
+
+        for username in usernames:
+            target_item = None
+            for item in queue:
+                if str(item.get("username", "")).strip().lower() == username.lower():
+                    target_item = item
+                    break
+
+            if not target_item:
+                results.append({"username": username, "error": "not found in queue"})
+                continue
+
+            # Извлекаем правильное имя
+            greeting_name = extract_greeting_name(target_item)
+            target_item["name"] = sanitize_host_name(greeting_name)
+            target_item["clean_name"] = sanitize_host_clean_name(greeting_name)
+
+            # Пересоздаем сообщение с исправленным именем
+            updated = await asyncio.to_thread(
+                queue_manager.regenerate_item,
+                username=username,
+                check_in=target_item.get("check_in"),
+                check_out=target_item.get("check_out"),
+                guest_context=target_item.get("guest_context"),
+            )
+
+            if updated:
+                results.append({
+                    "username": username,
+                    "name": greeting_name,
+                    "generated_message": updated.get("generated_message", ""),
+                    "word_count": updated.get("word_count", 0),
+                    "qc_passed": updated.get("qc_passed", True),
+                })
+            else:
+                results.append({"username": username, "error": "regeneration failed"})
+
+        queue_manager.save_queue(queue)
+
+        return {
+            "status": "ok",
+            "processed": len(results),
+            "results": results,
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"error": f"Failed to fix names: {str(e)}"})
+
+
 batch_regen_state: Dict[str, Any] = {
     "is_running": False,
     "total": 0,
