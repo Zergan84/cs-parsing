@@ -554,7 +554,7 @@
       display: flex;
       flex-direction: column;
       gap: 20px;
-      overflow-y: auto;
+      overflow: visible;
     }
 
     .sidebar-section-title {
@@ -3539,27 +3539,11 @@
             <!-- Trip Cards Container -->
             <div class="form-group" style="margin-bottom: 0;">
               <label class="form-label">Мои предстоящие трипы (кликните для парсинга хостов)</label>
-              <div id="trips-list" style="display: flex; flex-direction: column; gap: 8px; max-height: 400px; overflow-y: auto; padding: 10px; background: var(--ink-900); border: 1px solid var(--ink-700); border-radius: 8px;">
+              <div id="trips-list" style="display: flex; flex-direction: column; gap: 8px; padding: 10px; background: var(--ink-900); border: 1px solid var(--ink-700); border-radius: 8px;">
                 <div style="text-align: center; color: var(--ink-400); font-size: 12px; padding: 20px;">
                   Нажмите "Загрузить трипы" чтобы увидеть карточки поездок
                 </div>
               </div>
-            </div>
-
-            <!-- Trip Dates (заполняются кликом по карточке трипа) -->
-            <div class="form-group">
-              <label class="form-label">Trip Dates</label>
-              <div style="display: flex; flex-direction: column; gap: 8px;">
-                <label style="font-size: 11px; color: var(--ink-400); display: flex; flex-direction: column; gap: 4px;">
-                  Check-in
-                  <input type="date" class="form-input" id="search-checkin">
-                </label>
-                <label style="font-size: 11px; color: var(--ink-400); display: flex; flex-direction: column; gap: 4px;">
-                  Check-out
-                  <input type="date" class="form-input" id="search-checkout">
-                </label>
-              </div>
-              <div id="selected-trip-label" style="font-size: 11px; color: var(--amber-400); margin-top: 6px;"></div>
             </div>
 
             <div class="form-group">
@@ -4794,27 +4778,17 @@
     }
 
     function applySearchPreset(city, inDate, outDate, el) {
-      const cityInput = document.getElementById('search-city');
-      const inInput = document.getElementById('search-checkin');
-      const outInput = document.getElementById('search-checkout');
-      if (cityInput) cityInput.value = city;
-      if (inInput) inInput.value = inDate;
-      if (outInput) outInput.value = outDate;
-
       document.querySelectorAll('.preset-pill-badge').forEach(b => b.classList.remove('active'));
       if (el) el.classList.add('active');
     }
 
     async function startScraping() {
-      const city = document.getElementById('search-city').value || "Tokyo";
       const gender = document.getElementById('search-gender').value || "Any";
       const steps = parseInt(document.getElementById('search-steps').value, 10) || 500;
       const noCouples = document.getElementById('filter-no-couples').checked;
       const noLgbtq = document.getElementById('filter-no-lgbtq').checked;
       const headless = document.getElementById('filter-headless').checked;
-      const arrivalDate = document.getElementById('search-checkin')?.value || "2026-11-16";
-      const departureDate = document.getElementById('search-checkout')?.value || "2026-11-19";
-
+      const city = selectedHostCity || "Tokyo";
       try {
         const res = await fetch('/api/start_scraper', {
           method: 'POST',
@@ -4825,9 +4799,7 @@
             pages: steps,
             headless: headless,
             no_couples: noCouples,
-            no_lgbtq: noLgbtq,
-            arrival_date: arrivalDate,
-            departure_date: departureDate
+            no_lgbtq: noLgbtq
           })
         });
         const data = await res.json();
@@ -4974,18 +4946,6 @@
       const noCouples = document.getElementById('filter-no-couples').checked;
       const noLgbtq = document.getElementById('filter-no-lgbtq').checked;
       const headless = document.getElementById('filter-headless').checked;
-
-      // 1) Заполняем поля дат в левой панели реальными датами трипа
-      const inInput = document.getElementById('search-checkin');
-      const outInput = document.getElementById('search-checkout');
-      if (inInput) inInput.value = tripArrival || '';
-      if (outInput) outInput.value = tripDeparture || '';
-
-      const label = document.getElementById('selected-trip-label');
-      if (label) {
-        const shownDates = datesText || [tripArrival, tripDeparture].filter(Boolean).join(' – ');
-        label.textContent = tripCity ? `Выбран: ${tripCity}${shownDates ? ' · ' + shownDates : ''}` : '';
-      }
 
       // 2) Подсвечиваем выбранную карточку
       document.querySelectorAll('.trip-card-btn').forEach(b => b.classList.remove('selected'));
