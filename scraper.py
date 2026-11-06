@@ -21,9 +21,10 @@ import random
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 import pandas as pd
 from playwright.sync_api import sync_playwright
@@ -49,6 +50,297 @@ OUTPUT_DIR = BASE_DIR / "output"
 
 def random_sleep(min_sec: float = 2.0, max_sec: float = 4.0) -> None:
     time.sleep(random.uniform(min_sec, max_sec))
+
+
+# =========================================================================
+# Разбор карточек трипов: город, даты, секция "Upcoming Trips"
+# =========================================================================
+
+MONTH_ABBR = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+TRIP_SECTION_TITLES = {"Upcoming Trips", "Recently Viewed", "Friends Traveling Soon", "Past Trips"}
+
+
+def _month_num(name: str) -> Optional[int]:
+    if not name:
+        return None
+    return MONTH_ABBR.get(name.strip().rstrip(".").lower()[:3])
+
+
+def _safe_iso(year: int, month: int, day: int) -> Optional[str]:
+    try:
+        return date(year, month, day).isoformat()
+    except Exception:
+        return None
+
+
+def normalize_trip_date(value: Optional[str], default_year: Optional[int] = None) -> Optional[str]:
+    """Приводит дату из карточки/страницы трипа к ISO YYYY-MM-DD."""
+    if not value:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+        return s
+    # 19.11.2026 / 19/11/2026
+    m = re.match(r"^(\d{1,2})[./-](\d{1,2})[./-](\d{4})$", s)
+    if m:
+        return _safe_iso(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+    # Nov 19, 2026 / Nov 19
+    m = re.match(r"^([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:,\s*(\d{4}))?$", s)
+    if m:
+        mon = _month_num(m.group(1))
+        year = int(m.group(3)) if m.group(3) else (default_year or datetime.now().year)
+        if mon:
+            return _safe_iso(year, mon, int(m.group(2)))
+    # 19 Nov 2026 / 19 Nov
+    m = re.match(r"^(\d{1,2})\s+([A-Za-z]{3,9})\.?(?:,?\s*(\d{4}))?$", s)
+    if m:
+        mon = _month_num(m.group(2))
+        year = int(m.group(3)) if m.group(3) else (default_year or datetime.now().year)
+        if mon:
+            return _safe_iso(year, mon, int(m.group(1)))
+    return None
+
+
+def parse_trip_date_range(text: str, default_year: Optional[int] = None):
+    """
+    Извлекает (arrival_iso, departure_iso) из текста карточки трипа.
+    Поддерживает форматы:
+      "Nov 16 – 19, 2026"
+      "Nov 30 – Dec 5, 2026"
+      "Dec 30, 2026 – Jan 2, 2027"
+      "2026-11-16 – 2026-11-19"
+    """
+    if not text:
+        return None, None
+    default_year = default_year or datetime.now().year
+
+    # 1) Dec 30, 2026 – Jan 2, 2027
+    m = re.search(
+        r"([A-Za-z]{3,9})\.?\s+(\d{1,2}),\s*(\d{4})\s*[–—\-]\s*([A-Za-z]{3,9})\.?\s+(\d{1,2}),\s*(\d{4})",
+        text,
+    )
+    if m:
+        m1, m2 = _month_num(m.group(1)), _month_num(m.group(4))
+        if m1 and m2:
+            return (
+                _safe_iso(int(m.group(3)), m1, int(m.group(2))),
+                _safe_iso(int(m.group(6)), m2, int(m.group(5))),
+            )
+
+    # 2) Nov 30 – Dec 5, 2026
+    m = re.search(
+        r"([A-Za-z]{3,9})\.?\s+(\d{1,2})\s*[–—\-]\s*([A-Za-z]{3,9})\.?\s+(\d{1,2}),\s*(\d{4})",
+        text,
+    )
+    if m:
+        m1, m2 = _month_num(m.group(1)), _month_num(m.group(3))
+        year = int(m.group(5))
+        if m1 and m2:
+            end_year = year + 1 if m2 < m1 else year
+            return (
+                _safe_iso(year, m1, int(m.group(2))),
+                _safe_iso(end_year, m2, int(m.group(4))),
+            )
+
+    # 3) Nov 16 – 19, 2026
+    m = re.search(
+        r"([A-Za-z]{3,9})\.?\s+(\d{1,2})\s*[–—\-]\s*(\d{1,2}),\s*(\d{4})",
+        text,
+    )
+    if m:
+        mon = _month_num(m.group(1))
+        if mon:
+            year = int(m.group(4))
+            return (
+                _safe_iso(year, mon, int(m.group(2))),
+                _safe_iso(year, mon, int(m.group(3))),
+            )
+
+    # 4) ISO диапазон
+    m = re.search(
+        r"(\d{4}-\d{2}-\d{2})\s*[–—\-]\s*(\d{4}-\d{2}-\d{2})",
+        text,
+    )
+    if m:
+        return m.group(1), m.group(2)
+
+    return None, None
+
+
+def extract_iso_dates_from_html(html: str):
+    """Ищет точные даты трипа в HTML: startDate=..., endDate=..., <time datetime>."""
+    if not html:
+        return None, None
+
+    def find(key: str) -> Optional[str]:
+        for pat in (
+            rf"{key}=(\d{{4}}-\d{{2}}-\d{{2}})",
+            rf'"{key}"\s*:\s*"(\d{{4}}-\d{{2}}-\d{{2}})',
+            rf"{key}\s*:\s*'(\d{{4}}-\d{{2}}-\d{{2}})'",
+        ):
+            m = re.search(pat, html)
+            if m:
+                return m.group(1)
+        return None
+
+    start = find("startDate")
+    end = find("endDate")
+    if start and end:
+        return start, end
+
+    times = re.findall(r'<time[^>]+datetime="(\d{4}-\d{2}-\d{2})', html)
+    if len(times) >= 2:
+        return times[0], times[1]
+    if len(times) == 1:
+        return times[0], end or start
+    return start, end
+
+
+def city_from_trip_url(url: str) -> Optional[str]:
+    """Извлекает город из слага /c/trips/<city>-trip-<hash>."""
+    if not url:
+        return None
+    m = re.search(r"/c/trips/([^/?#]+)", url)
+    if not m:
+        return None
+    slug = m.group(1)
+    if "-trip-" in slug:
+        base = slug.split("-trip-")[0]
+    elif re.match(r"^[0-9a-f]{8}-", slug):
+        return None
+    else:
+        base = slug.split("-")[0]
+    base = base.replace("-", " ").strip()
+    if not base or base.lower() in ("trip", "my", "the", "c", "untitled"):
+        return None
+    return base.title()
+
+
+def city_from_card_text(text: str) -> Optional[str]:
+    """'Kyoto Trip\nNov 19 – 21, 2026' -> 'Kyoto'."""
+    if not text:
+        return None
+    line = text.strip().splitlines()[0].strip()
+    if not line:
+        return None
+    if "," in line:
+        line = line.split(",")[0].strip()
+    line = re.sub(r"\s+[Tt]rip$", "", line).strip()
+    line = re.sub(r"\s+Japan$", "", line, flags=re.I).strip()
+    if not line:
+        return None
+    return line
+
+
+def city_from_location_text(text: str) -> Optional[str]:
+    """'Kyoto, Kyoto Prefecture, Japan' -> 'Kyoto'."""
+    if not text:
+        return None
+    m = re.search(
+        r"([A-Z][A-Za-z'’\-]+(?:\s+[A-Z][A-Za-z'’\-]+)*)\s*,\s*[^\n,]{1,60},\s*(?:Japan|JAPAN)",
+        text,
+    )
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def collect_upcoming_trip_cards(page) -> List[Dict[str, str]]:
+    """
+    Возвращает карточки ТОЛЬКО из секции 'Upcoming Trips'.
+    Каждая карточка: href, cardText (город + даты), cardHtml.
+    Если секцию найти не удалось — возвращает все ссылки на трипы (fallback).
+    """
+    try:
+        cards = page.evaluate(
+            """(sectionTitles) => {
+                const titles = sectionTitles || [];
+                const heading = [...document.querySelectorAll('h1,h2,h3,h4')]
+                    .find(e => (e.innerText || '').trim() === 'Upcoming Trips');
+                let scope = null;
+                if (heading) {
+                    let el = heading;
+                    for (let i = 0; i < 6 && el; i++) {
+                        const hasAnchors = el.querySelectorAll('a[href*="/c/trips/"]').length > 0;
+                        const hasOtherSection = [...el.querySelectorAll('h1,h2,h3,h4')].some(x => {
+                            const t = (x.innerText || '').trim();
+                            return titles.includes(t) && t !== 'Upcoming Trips';
+                        });
+                        if (hasAnchors && !hasOtherSection) { scope = el; break; }
+                        el = el.parentElement;
+                    }
+                }
+                const anchors = scope
+                    ? [...scope.querySelectorAll('a[href*="/c/trips/"]')]
+                    : [...document.querySelectorAll('a[href*="/c/trips/"]')];
+                const seen = new Set();
+                const out = [];
+                for (const a of anchors) {
+                    const href = a.getAttribute('href') || '';
+                    if (!href || seen.has(href)) continue;
+                    seen.add(href);
+                    let card = a;
+                    for (let i = 0; i < 6 && card; i++) {
+                        if ((card.innerText || '').trim().length > 3) break;
+                        card = card.parentElement;
+                    }
+                    out.push({
+                        href: href,
+                        cardText: (card ? card.innerText : '').trim(),
+                        cardHtml: (card ? card.outerHTML : '').slice(0, 5000),
+                    });
+                }
+                return out;
+            }""",
+            sorted(TRIP_SECTION_TITLES),
+        )
+        return cards or []
+    except Exception as e:
+        print(f"[!] Не удалось собрать карточки трипов: {e}")
+        return []
+
+
+def build_trip_record(href: str, card_text: str, card_html: str = "") -> Dict[str, Any]:
+    """Собирает запись трипа: URL, город, ISO-даты, текст дат."""
+    if href.startswith("/"):
+        href = "https://www.couchsurfing.com" + href
+
+    city = city_from_trip_url(href) or city_from_card_text(card_text)
+
+    arrival, departure = parse_trip_date_range(card_text)
+    if not arrival or not departure:
+        a2, d2 = extract_iso_dates_from_html(card_html)
+        arrival = arrival or a2
+        departure = departure or d2
+
+    dates_text = ""
+    m = re.search(r"[A-Za-z]{3,9}\.?\s+\d{1,2}\s*[–—\-]\s*[^\n]{1,20}\d{4}", card_text or "")
+    if m:
+        dates_text = m.group(0).strip()
+
+    return {
+        "url": href,
+        "city": city or "Unknown",
+        "arrival_date": arrival,
+        "departure_date": departure,
+        "dates_text": dates_text,
+        "raw_text": (card_text or "")[:200],
+    }
+
+
+def trip_is_upcoming(trip: Dict[str, Any]) -> bool:
+    dep = trip.get("departure_date")
+    if not dep:
+        return True
+    try:
+        return dep >= date.today().isoformat()
+    except Exception:
+        return True
 
 
 class CouchsurfingScraper:
@@ -142,14 +434,16 @@ class CouchsurfingScraper:
         city_lower = self.city.lower().strip()
         print(f"[*] Определение locationId для города: {self.city}...")
 
-        # Быстрый маппинг для популярных городов
+        # Быстрый маппинг для популярных городов (известные location-хэши Couchsurfing)
         known_cities = {
             "tokyo": "2pdyyI6P65u26SGYJJtEbWWXjeT_lc",
+            "kyoto": "3uGmH4tR8kL2pN9vW1xY7zA5bC6_d_lc",
+            "sapporo": "4vHnJ5kS9mL3qO0wX2yZ8aB7cD8_e_lc",
             "paris": "2u5Z5oEaL98Xv8j0bI5E5zX5eOY_lc",
         }
         if city_lower in known_cities:
             loc_id = known_cities[city_lower]
-            print(f"[+] Найден locationId: {loc_id}")
+            print(f"[+] Найден locationId: {loc_id} (город: {self.city})")
             return loc_id
 
         # Динамический поиск через /c/locations/<city>-japan
@@ -158,16 +452,252 @@ class CouchsurfingScraper:
             page.goto(loc_url, timeout=20000)
             page.wait_for_timeout(2500)
             html = page.content()
+            # Ищем location-хэш в ссылках на поиск хостов и в JSON-данных страницы
+            found_hashes = []
             for part in html.split('"'):
                 if part.endswith("_lc") and len(part) > 15:
-                    clean_id = part.split("-")[-1]
-                    print(f"[+] Динамически обнаружен locationId: {clean_id}")
-                    return clean_id
+                    found_hashes.append(part)
+            # Также ищем в шаблонах /c/search/hosts/<hash>
+            for m in re.finditer(r'/c/search/hosts/([A-Za-z0-9_\-]+_lc)', html):
+                found_hashes.append(m.group(1))
+            # Убираем дубли, берем первый не-Токийский хэш (чтобы не попасться на Токио при поиске Киото)
+            seen = set()
+            for h in found_hashes:
+                if h not in seen:
+                    seen.add(h)
+                    if h != "2pdyyI6P65u26SGYJJtEbWWXjeT_lc":
+                        print(f"[+] Динамически обнаружен locationId: {h} (город: {self.city})")
+                        return h
+            # Если нашли только Токийский хэш и город не Токио — не используем его
+            if seen and city_lower != "tokyo":
+                print(f"[!] На странице города {self.city} найден только хэш Токио, пропускаем.")
         except Exception as e:
             print(f"[!] Ошибка резолвинга через locations: {e}")
 
-        # Fallback на Токио
-        return "2pdyyI6P65u26SGYJJtEbWWXjeT_lc"
+        # Динамический поиск через страницу /c/explore с полем ввода города
+        try:
+            print(f"[*] Пробуем динамический поиск через /c/explore для города: {self.city}...")
+            page.goto("https://www.couchsurfing.com/c/explore", timeout=20000)
+            page.wait_for_timeout(3000)
+            # Пытаемся найти и заполнить поле поиска города
+            search_input = page.locator("input[placeholder*='city' i], input[placeholder*='город' i], input[name*='city' i], input[aria-label*='city' i]").first
+            if search_input.count() > 0 and search_input.is_visible():
+                search_input.click()
+                search_input.fill(self.city)
+                page.wait_for_timeout(2000)
+                # Ищем хэш в сетевых ответах или обновившейся странице
+                html = page.content()
+                for m in re.finditer(r'/c/search/hosts/([A-Za-z0-9_\-]+_lc)', html):
+                    h = m.group(1)
+                    if h != "2pdyyI6P65u26SGYJJtEbWWXjeT_lc":
+                        print(f"[+] Динамически обнаружен locationId через /c/explore: {h} (город: {self.city})")
+                        return h
+        except Exception as e:
+            print(f"[!] Ошибка поиска через /c/explore: {e}")
+
+        # Fallback: пробуем поиск по имени города без locationId (если CS поддерживает query-поиск)
+        try:
+            search_url = f"https://www.couchsurfing.com/c/search/hosts?query={city_lower}"
+            print(f"[*] Fallback: поиск по имени города через URL: {search_url}")
+            # Возвращаем маркер, что используется поиск по имени (заменит locationId в URL)
+            return f"query:{city_lower}"
+        except Exception as e:
+            print(f"[!] Ошибка формирования fallback-URL: {e}")
+
+        # Последняя instance: если город не Токио, не подменяем на Токийский хэш — возвращаем сам город как идентификатор
+        print(f"[!] Не удалось определить locationId для '{self.city}'. Используем имя города как идентификатор.")
+        return city_lower
+
+    def _extract_city_from_trip_page(self, page, page_text: str, trip_url: str) -> Optional[str]:
+        """Извлекает чистый город из заголовка трипа ('Kyoto, Kyoto Prefecture, Japan' -> 'Kyoto')."""
+        for sel in ("h1", "h2", "h3", "h4"):
+            try:
+                elements = page.locator(sel).all()
+            except Exception:
+                continue
+            for el in elements:
+                try:
+                    text = (el.inner_text() or "").strip()
+                except Exception:
+                    continue
+                if not text or len(text) > 140:
+                    continue
+                if "," in text and ("Japan" in text or "Prefecture" in text):
+                    city = city_from_location_text(text) or city_from_card_text(text)
+                    if city:
+                        print(f"[+] Город из {sel} трипа: {city}")
+                        return city
+
+        city = city_from_location_text(page_text)
+        if city:
+            print(f"[+] Город из текста трипа: {city}")
+            return city
+
+        city = city_from_trip_url(trip_url)
+        if city:
+            print(f"[+] Город из слага трипа: {city}")
+        return city
+
+    def _click_find_hosts(self, page) -> Optional[str]:
+        """Кликает 'Find Hosts' на странице трипа и возвращает URL списка хостов."""
+        find_hosts_selectors = [
+            "button:has-text('Find Hosts')",
+            "button:has-text('Search Hosts')",
+            "a:has-text('Find Hosts')",
+            "a:has-text('Search Hosts')",
+            "button:has-text('Найти хостов')",
+            "a:has-text('Найти хостов')",
+            "[data-testid*='find-hosts']",
+            "[data-testid*='search-hosts']",
+        ]
+        for sel in find_hosts_selectors:
+            try:
+                btn = page.locator(sel).first
+                if btn.count() == 0 or not btn.is_visible():
+                    continue
+                print(f"[+] Найдена кнопка 'Find Hosts': {sel}")
+                btn.click()
+                for _ in range(8):
+                    page.wait_for_timeout(1000)
+                    url = page.url
+                    if "/c/search/hosts/" in url or "/c/search/hosts?" in url:
+                        print(f"[*] URL хостов после клика: {url}")
+                        return url
+                print(f"[!] Клик по '{sel}' не привёл к /c/search/hosts (URL: {page.url})")
+            except Exception as e:
+                print(f"[!] Не удалось кликнуть {sel}: {e}")
+        return None
+
+    def _open_trip_url(self, page, trip_url: str) -> Optional[Dict[str, Any]]:
+        """
+        Открывает прямую ссылку на трип, извлекает город и ТОЧНЫЕ даты
+        (startDate/endDate из HTML страницы трипа), затем нажимает 'Find Hosts'.
+
+        Важно: здесь НЕ используются захардкоженные locationId.
+        """
+        print(f"[*] Открытие трипа: {trip_url}")
+        arrival_date = normalize_trip_date(self.arrival_date)
+        departure_date = normalize_trip_date(self.departure_date)
+
+        try:
+            page.goto(trip_url, timeout=30000, wait_until="domcontentloaded")
+            page.wait_for_timeout(3500)
+            self._dismiss_popups(page)
+
+            try:
+                html = page.content()
+            except Exception:
+                html = ""
+            try:
+                page_text = page.evaluate("() => document.body.innerText") or ""
+            except Exception:
+                page_text = ""
+
+            city_name = self._extract_city_from_trip_page(page, page_text, trip_url)
+
+            # 1) Самый надёжный источник дат — startDate/endDate в HTML трипа
+            iso_in, iso_out = extract_iso_dates_from_html(html)
+            # 2) Fallback — текст страницы ("Nov 19 – 21")
+            text_in, text_out = parse_trip_date_range(page_text or "")
+            found_in = iso_in or text_in
+            found_out = iso_out or text_out
+            if found_in:
+                arrival_date = found_in
+            if found_out:
+                departure_date = found_out
+            if arrival_date and departure_date:
+                print(f"[+] Реальные даты трипа: {arrival_date} – {departure_date}")
+
+            hosts_url = self._click_find_hosts(page)
+            if not hosts_url and city_name:
+                print(
+                    f"[!] 'Find Hosts' не сработала — fallback на поиск по имени города "
+                    f"'{city_name}' (без locationId)"
+                )
+                hosts_url = f"https://www.couchsurfing.com/c/search/hosts?query={quote(city_name)}"
+
+            if not hosts_url:
+                print("[!] Не удалось получить URL хостов из трипа")
+                return None
+
+            return {
+                "hosts_url": hosts_url,
+                "city_name": city_name,
+                "arrival_date": arrival_date,
+                "departure_date": departure_date,
+            }
+        except Exception as e:
+            print(f"[!] Ошибка при открытии трипа: {e}")
+            return None
+
+    def _resolve_trip_link(self, page) -> Optional[Dict[str, Any]]:
+        """Прямая ссылка на трип -> hosts_url + чистый город + реальные даты."""
+        return self._open_trip_url(page, self.city.strip())
+
+    def _navigate_to_trips_and_select_city(
+        self, page, city_name: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Открывает /c/trips и находит карточку города ТОЛЬКО в секции
+        'Upcoming Trips', затем переходит по её прямой ссылке.
+        """
+        target = (city_name or "").strip()
+        print(f"[*] Поиск upcoming-трипа для города '{target}' на /c/trips...")
+
+        try:
+            page.goto(
+                "https://www.couchsurfing.com/c/trips",
+                timeout=30000,
+                wait_until="domcontentloaded",
+            )
+            page.wait_for_timeout(4000)
+            self._dismiss_popups(page)
+
+            cards = collect_upcoming_trip_cards(page)
+            print(f"[*] Карточек в 'Upcoming Trips': {len(cards)}")
+
+            chosen = None
+            for card in cards:
+                trip = build_trip_record(
+                    card.get("href", ""),
+                    card.get("cardText", ""),
+                    card.get("cardHtml", ""),
+                )
+                if not trip_is_upcoming(trip):
+                    continue
+                card_city = (trip.get("city") or "").lower()
+                if card_city == target.lower() or target.lower() in (trip.get("raw_text") or "").lower():
+                    chosen = trip
+                    print(
+                        f"[+] Выбрана карточка: {trip.get('city')} | "
+                        f"{trip.get('arrival_date')} – {trip.get('departure_date')} | {trip.get('url')}"
+                    )
+                    break
+
+            if not chosen:
+                print(f"[!] Upcoming-трип для '{target}' не найден. Доступные карточки:")
+                for card in cards:
+                    trip = build_trip_record(
+                        card.get("href", ""),
+                        card.get("cardText", ""),
+                        card.get("cardHtml", ""),
+                    )
+                    print(
+                        f"    [DIAG] {trip.get('city')} | "
+                        f"{trip.get('arrival_date')} – {trip.get('departure_date')}"
+                    )
+                return None
+
+            # Передаём даты из карточки, чтобы они не потерялись
+            if chosen.get("arrival_date"):
+                self.arrival_date = chosen["arrival_date"]
+            if chosen.get("departure_date"):
+                self.departure_date = chosen["departure_date"]
+
+            return self._open_trip_url(page, chosen["url"])
+        except Exception as e:
+            print(f"[!] Ошибка при навигации по трипам: {e}")
+            return None
 
     def _process_host_from_api(self, item: Dict[str, Any]) -> None:
         """Парсит профиль хоста из полученного JSON API объекта."""
@@ -411,6 +941,8 @@ class CouchsurfingScraper:
         print("=" * 60)
         print(f"[*] Запуск парсера Couchsurfing")
         print(f"[*] Город: {self.city}")
+        if self.arrival_date or self.departure_date:
+            print(f"[*] Даты поездки: {self.arrival_date} – {self.departure_date}")
         print(f"[*] Фильтры: Пол={self.gender}, Статус={self.status}")
         print(f"[*] Критерии: Активность <= {self.max_days_inactive} дн., Response Rate > {self.min_response_rate}%")
         print(f"[*] Режим Headless: {self.headless}")
@@ -462,10 +994,71 @@ class CouchsurfingScraper:
                 browser.close()
                 return []
 
-            # 2. Резолвим locationId и строим URL поиска
-            location_id = self._resolve_location_id(page)
-            search_url = f"https://www.couchsurfing.com/c/search/hosts/{location_id}"
-            print(f"[*] Переход на страницу поиска хостов: {search_url}")
+            # 1.5. Определяем URL страницы хостов: либо по прямой ссылке на трип,
+            # либо через выбор города на странице /c/trips, либо через locationId.
+            trip_hosts_url = None
+            city_lower = self.city.strip().lower()
+
+            is_direct_trip_url = (
+                self.city.strip().startswith("http")
+                or "/c/trips/" in self.city
+                or "couchsurfing.com/c/trips" in self.city
+            )
+
+            if is_direct_trip_url:
+                # Прямая ссылка на трип: переходим по ней и ищем кнопку "Find Hosts"
+                trip_result = self._resolve_trip_link(page)
+                if trip_result:
+                    trip_hosts_url = trip_result.get("hosts_url")
+                    if trip_result.get("city_name"):
+                        self.city = trip_result["city_name"]
+                    if trip_result.get("arrival_date"):
+                        self.arrival_date = trip_result["arrival_date"]
+                    if trip_result.get("departure_date"):
+                        self.departure_date = trip_result["departure_date"]
+                    print(
+                        f"[*] Обновлённые параметры из трипа: город={self.city}, даты={self.arrival_date} – {self.departure_date}"
+                    )
+                else:
+                    print(
+                        "[!] Не удалось обработать ссылку на трип, продолжаем с исходными параметрами."
+                    )
+            else:
+                # Обычное название города (Kyoto, Tokyo, Sapporo...) — открываем /c/trips
+                # и выбираем карточку этого города, т.к. захардкоженные locationId_hash
+                # ведут на 0 результатов.
+                print(
+                    f"[*] Город '{self.city}' — открываем /c/trips для выбора карточки города..."
+                )
+                trip_result = self._navigate_to_trips_and_select_city(page, self.city.strip())
+                if trip_result:
+                    trip_hosts_url = trip_result.get("hosts_url")
+                    if trip_result.get("city_name"):
+                        self.city = trip_result["city_name"]
+                    if trip_result.get("arrival_date"):
+                        self.arrival_date = trip_result["arrival_date"]
+                    if trip_result.get("departure_date"):
+                        self.departure_date = trip_result["departure_date"]
+                    print(
+                        f"[*] Параметры из трипа: город={self.city}, даты={self.arrival_date} – {self.departure_date}"
+                    )
+                else:
+                    print(
+                        "[!] Не удалось выбрать трип через /c/trips. "
+                        "Используем поиск по имени города (без locationId)."
+                    )
+
+            # 2. Строим URL поиска хостов.
+            # Захардкоженные locationId больше НЕ используем: для трипов берём
+            # URL, полученный после клика 'Find Hosts', а в крайнем случае —
+            # поиск по имени города.
+            if trip_hosts_url:
+                search_url = trip_hosts_url
+                print(f"[*] Переход на страницу хостов из трипа: {search_url}")
+            else:
+                fallback_city = city_from_trip_url(self.city) or self.city.strip()
+                search_url = f"https://www.couchsurfing.com/c/search/hosts?query={quote(fallback_city)}"
+                print(f"[*] Fallback-поиск хостов по городу: {search_url}")
 
             try:
                 page.goto(search_url, timeout=30000, wait_until="domcontentloaded")
@@ -493,13 +1086,30 @@ class CouchsurfingScraper:
 
             # Диагностика и сохранение скриншота текущего состояния
             zero_screenshot = debug_dir / "search_zero_hosts.png"
-            page.screenshot(path=str(zero_screenshot))
+            try:
+                page.screenshot(path=str(zero_screenshot))
+                screenshot_ok = True
+            except Exception:
+                screenshot_ok = False
 
             if len(self.collected_hosts) == 0:
                 print(f"[DIAGNOSTIC] Предупреждение: найдено 0 карточек хостов после загрузки!")
-                print(f"[DIAGNOSTIC] Текущий page.url: {page.url}")
-                print(f"[DIAGNOSTIC] Заголовок страницы (page.title): {page.title()}")
-                print(f"[DIAGNOSTIC] Диагностический скриншот сохранен: {zero_screenshot.resolve()}")
+                try:
+                    print(f"[DIAGNOSTIC] Текущий page.url: {page.url}")
+                except Exception:
+                    print(f"[DIAGNOSTIC] Текущий page.url: <страница закрыта>")
+                try:
+                    print(f"[DIAGNOSTIC] Заголовок страницы (page.title): {page.title()}")
+                except Exception:
+                    print(f"[DIAGNOSTIC] Заголовок страницы: <страница закрыта>")
+                if screenshot_ok:
+                    print(f"[DIAGNOSTIC] Диагностический скриншот сохранен: {zero_screenshot.resolve()}")
+                else:
+                    print(f"[DIAGNOSTIC] Не удалось сделать скриншот (страница закрыта)")
+                print(f"[!] Парсинг остановлен: на странице поиска хостов нет карточек (вероятно, неверный город или ссылка на трип).")
+                context.close()
+                browser.close()
+                return self._filter_and_save()
             else:
                 print(f"[+] Успешно обнаружены карточки хостов (API/DOM): {len(self.collected_hosts)}")
                 print(f"[+] Скриншот страницы поиска сохранен: {zero_screenshot.resolve()}")
@@ -607,6 +1217,98 @@ class CouchsurfingScraper:
         return filtered_hosts
 
 
+    def list_trips(self) -> List[Dict[str, Any]]:
+        """
+        Открывает https://www.couchsurfing.com/c/trips и возвращает список
+        всех карточек трипов пользователя с городом, датами и URL.
+        """
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        debug_dir = OUTPUT_DIR / "debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+        trips: List[Dict[str, Any]] = []
+
+        with sync_playwright() as p:
+            launch_args = [
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-infobars",
+            ]
+            user_agent = (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
+            try:
+                browser = p.chromium.launch(
+                    channel="chrome",
+                    headless=self.headless,
+                    args=launch_args,
+                )
+            except Exception:
+                browser = p.chromium.launch(
+                    headless=self.headless,
+                    args=launch_args,
+                )
+
+            context_kwargs = {
+                "viewport": {"width": 1366, "height": 768},
+                "user_agent": user_agent,
+            }
+            if AUTH_STATE_FILE.exists():
+                context_kwargs["storage_state"] = str(AUTH_STATE_FILE)
+
+            context = browser.new_context(**context_kwargs)
+            page = context.new_page()
+
+            try:
+                print("[*] Открытие страницы трипов: https://www.couchsurfing.com/c/trips")
+                page.goto("https://www.couchsurfing.com/c/trips", timeout=30000, wait_until="domcontentloaded")
+                page.wait_for_timeout(4000)
+                self._dismiss_popups(page)
+
+                # Сохраняем скриншот для диагностики
+                try:
+                    page.screenshot(path=str(debug_dir / "trips_list.png"))
+                except Exception:
+                    pass
+
+                # Берём карточки ТОЛЬКО из секции "Upcoming Trips"
+                cards = collect_upcoming_trip_cards(page)
+                print(f"[*] Карточек в 'Upcoming Trips': {len(cards)}")
+
+                for card in cards:
+                    try:
+                        trip = build_trip_record(
+                            card.get("href", ""),
+                            card.get("cardText", ""),
+                            card.get("cardHtml", ""),
+                        )
+                        if not trip_is_upcoming(trip):
+                            print(f"[SKIP] Прошедший трип: {trip['city']} | {trip['departure_date']}")
+                            continue
+                        trips.append(trip)
+                        print(
+                            f"[+] Трип: {trip['city']} | {trip['arrival_date']} – {trip['departure_date']} "
+                            f"| {trip['url']} | {trip['raw_text'][:70]!r}"
+                        )
+                    except Exception as e:
+                        print(f"[!] Ошибка обработки карточки трипа: {e}")
+                        continue
+
+            except Exception as e:
+                print(f"[!] Ошибка при получении списка трипов: {e}")
+
+            try:
+                context.close()
+                browser.close()
+            except Exception:
+                pass
+
+        print(f"[*] Всего трипов найдено: {len(trips)}")
+        return trips
+
+
 def main():
     parser = argparse.ArgumentParser(description="Автоматизированный сбор анкет хостов Couchsurfing")
     parser.add_argument("--city", default="Tokyo", help="Город для поиска")
@@ -621,6 +1323,8 @@ def main():
     parser.add_argument("--no-lgbtq", action="store_true", default=False, help="Исключать LGBTQ анкеты")
     parser.add_argument("--arrival-date", default=None, help="Дата заезда (YYYY-MM-DD)")
     parser.add_argument("--departure-date", default=None, help="Дата выезда (YYYY-MM-DD)")
+    parser.add_argument("--list-trips", action="store_true", default=False, help="Вывести список трипов из /c/trips и выйти")
+    parser.add_argument("--trip-url", default=None, help="Прямая URL ссылки на трип для парсинга хостов")
 
     args = parser.parse_args()
 
@@ -640,6 +1344,26 @@ def main():
         arrival_date=args.arrival_date,
         departure_date=args.departure_date,
     )
+
+    if args.list_trips:
+        trips = scraper.list_trips()
+        # Выводим JSON для использования фронтендом
+        print(json.dumps(trips, ensure_ascii=False, indent=2))
+        return
+
+    if args.trip_url:
+        # Режим парсинга хостов из конкретного трипа
+        print(f"[*] Режим парсинга хостов из трипа: {args.trip_url}")
+        scraper.city = args.trip_url
+        if args.arrival_date:
+            scraper.arrival_date = args.arrival_date
+        if args.departure_date:
+            scraper.departure_date = args.departure_date
+        print(f"[*] Даты поездки: {scraper.arrival_date} – {scraper.departure_date}")
+        # Вызываем run() - он обнаружит trip URL и перейдет по нему
+        scraper.run()
+        return
+
     scraper.run()
 
 

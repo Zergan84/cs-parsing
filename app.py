@@ -75,9 +75,22 @@ process_mgr = get_process_manager()
 context_mgr = get_personal_context_manager()
 profile_analyzer = get_profile_analyzer()
 
+# Singleton-ссылка на asyncio-таск запуска диспетчера.
+# Перед новым запуском незавершённый старый таск отменяется (два цикла ломают таймер).
+dispatcher_task: Optional[asyncio.Task] = None
+
 # Статические файлы для PWA и иконок
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+def _date_or_default(value, default: str) -> str:
+    """Возвращает ISO-дату из записи хоста/трипа либо дефолт."""
+    if value:
+        s = str(value).strip()
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+            return s
+    return default
 
 # Состояние фоновой перегенерации через LLM
 regen_state = {
@@ -119,6 +132,7 @@ class FilterParams(BaseModel):
     allow_couples: bool = True
     enrich_home: bool = False
     hide_sent: bool = True
+    city: Optional[str] = None
 
 
 class CookieInput(BaseModel):
@@ -472,7 +486,9 @@ async def dispatcher_resume():
             cmd.append("--headed")
         if d.get("dry_run", False):
             cmd.append("--dry-run")
-        asyncio.create_task(process_mgr.start_job("Автопилот", cmd, d))
+        res = await _start_dispatcher_job(cmd, d)
+        if not res.get("success"):
+            process_mgr.append_log(f"[RESUME] Не удалось запустить диспетчер: {res.get('error')}")
 
     process_mgr.append_log("[RESUME] Dispatcher resumed by user.")
     return {"status": "resumed", "is_paused": False, "emergency_stop": False}
@@ -525,6 +541,173 @@ async def start_scraper(params: ScraperParams):
     return {"status": "started", "city": params.city, "job_id": res.get("job_id")}
 
 
+@app.post("/api/scraper/stop")
+async def stop_scraper():
+    """Остановка активного процесса сбора анкет (scraper.py)."""
+    if not process_mgr.is_running or not process_mgr.active_proc:
+        return {"status": "not_running", "message": "Процесс сбора анкет не запущен."}
+    task_name = process_mgr.active_task_name
+    res = await process_mgr.stop_current_job()
+    process_mgr.append_log(f"[STOP] Scraper '{task_name}' остановлен пользователем.")
+    return {"status": "stopped", "task": task_name, "detail": res}
+
+
+@app.get("/api/trips/list")
+async def api_trips_list():
+    """Возвращает список трипов пользователя со страницы /c/trips."""
+    try:
+        import subprocess as _sp
+        result = _sp.run(
+            [sys.executable, "-u", str(BASE_DIR / "scraper.py"), "--list-trips", "--headless"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=str(BASE_DIR),
+        )
+        if result.returncode != 0:
+            return {"error": f"scraper.py --list-trips failed: {result.stderr}"}
+        # Parse JSON output from stdout
+        # The scraper prints log lines before the JSON array, so we need to find
+        # the line that starts a valid JSON array.
+        trips = None
+        stdout_stripped = result.stdout.strip()
+        try:
+            trips = json.loads(stdout_stripped)
+        except json.JSONDecodeError:
+            # Try to find JSON array in the output
+            lines = stdout_stripped.splitlines()
+            json_start = None
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                # JSON array starts with '[' followed by '{' or ']' (empty array)
+                if stripped.startswith("[") and (len(stripped) == 1 or stripped[1] in "{[" or stripped == "["):
+                    try:
+                        trips = json.loads("\n".join(lines[i:]))
+                        json_start = i
+                        break
+                    except json.JSONDecodeError:
+                        continue
+            if trips is None:
+                return {"error": f"Не удалось распарсить вывод списка трипов: {stdout_stripped[:500]}"}
+        return {"status": "ok", "trips": trips, "count": len(trips)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/search/erase-all")
+async def api_search_erase_all():
+    """Очистка всех данных поиска (hosts, queue, trips cache) из раздела Searching."""
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+
+        cleared = []
+
+        # 1. Clear hosts output files (scraped hosts data)
+        for f in ["hosts_tokyo.json", "hosts_tokyo_curated.json", "hosts_kyoto.json", "hosts_osaka.json", "hosts_sapporo.json"]:
+            p = OUTPUT_DIR / f
+            if p.exists():
+                p.write_text("[]", encoding="utf-8")
+                cleared.append(f)
+
+        # 2. Clear requests queue (sent/queued data)
+        qf = OUTPUT_DIR / "requests_queue.json"
+        if qf.exists():
+            try:
+                qf.write_text("[]", encoding="utf-8")
+                cleared.append("requests_queue.json")
+            except Exception:
+                pass
+
+        # 3. Clear sent log
+        slf = OUTPUT_DIR / "sent_log.json"
+        if slf.exists():
+            try:
+                slf.write_text("[]", encoding="utf-8")
+                cleared.append("sent_log.json")
+            except Exception:
+                pass
+
+        # 4. Clear inbox status
+        isf = OUTPUT_DIR / "inbox_status.json"
+        if isf.exists():
+            try:
+                isf.write_text("{}", encoding="utf-8")
+                cleared.append("inbox_status.json")
+            except Exception:
+                pass
+
+        process_mgr.append_log("[ERASE] Все данные поиска очищены пользователем.")
+
+        return {
+            "status": "ok",
+            "message": f"Очищено файлов: {len(cleared)}",
+            "cleared": cleared,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+class TripStartParams(BaseModel):
+    trip_url: str
+    city: Optional[str] = None
+    gender: str = "Any"
+    status: str = "Accepting Guests"
+    max_days: int = 7
+    min_rate: float = 75.0
+    pages: int = 10
+    no_couples: bool = False
+    no_lgbtq: bool = False
+    headless: bool = False
+    arrival_date: Optional[str] = None
+    departure_date: Optional[str] = None
+
+
+@app.post("/api/scraper/start")
+@app.post("/api/scraper/start-from-trip")
+async def start_scraper_from_trip(params: TripStartParams):
+    """Запуск сбора хостов по конкретной ссылке на трип."""
+    if get_setting("emergency_stop", "0") == "1":
+        return {"error": "Активирован Emergency Stop! Сначала снимите блокировку."}
+    if process_mgr.is_running:
+        return {"error": f"Процесс '{process_mgr.active_task_name}' уже выполняется!"}
+
+    cmd = [
+        sys.executable,
+        "-u",
+        str(BASE_DIR / "scraper.py"),
+        "--trip-url", params.trip_url,
+        "--gender", params.gender or "Any",
+        "--status", params.status,
+        "--max-days", str(params.max_days),
+        "--min-rate", str(params.min_rate),
+        "--pages", str(params.pages),
+    ]
+    if params.headless:
+        cmd.append("--headless")
+    if params.no_couples:
+        cmd.append("--no-couples")
+    if params.no_lgbtq:
+        cmd.append("--no-lgbtq")
+    if params.arrival_date:
+        cmd.extend(["--arrival-date", params.arrival_date])
+    if params.departure_date:
+        cmd.extend(["--departure-date", params.departure_date])
+
+    payload = params.model_dump()
+    res = await process_mgr.start_job("Сбор анкет (трип)", cmd, payload)
+    if not res.get("success"):
+        return {"error": res.get("error")}
+    return {
+        "status": "started",
+        "trip_url": params.trip_url,
+        "city": params.city,
+        "arrival_date": params.arrival_date,
+        "departure_date": params.departure_date,
+        "job_id": res.get("job_id"),
+    }
+
+
 @app.post("/api/start_filter")
 async def start_filter(params: FilterParams):
     """Запуск filter_hosts.py для очистки датасета от неактивных хостов."""
@@ -533,12 +716,15 @@ async def start_filter(params: FilterParams):
     if process_mgr.is_running:
         return {"error": f"Процесс '{process_mgr.active_task_name}' уже выполняется!"}
 
-    slug = "tokyo"
+    if params.city and params.city.strip():
+        slug = re.sub(r"\W+", "_", params.city.strip().lower())
+    else:
+        slug = "tokyo"
     input_file = OUTPUT_DIR / f"hosts_{slug}.json"
-    if not input_file.exists():
+    if not input_file.exists() and not (params.city and params.city.strip()):
         input_file = OUTPUT_DIR / "hosts_tokyo.json"
     if not input_file.exists():
-        return {"error": "Сначала соберите анкеты (нет исходного JSON файла)!"}
+        return {"error": f"Сначала соберите анкеты для города {params.city or 'Tokyo'} (нет исходного JSON файла)!"}
 
     cmd = [
         sys.executable,
@@ -794,17 +980,28 @@ async def reanalyze_host_profile(payload: ReanalyzePayload):
 
 @app.get("/api/results")
 @app.get("/api/hosts")
-async def get_results(curated: bool = False, hide_sent: bool = True):
+async def get_results(curated: bool = False, hide_sent: bool = True, city: Optional[str] = None):
     """Возвращает список хостов (сырых или очищенных) с поддержкой жесткого отсева отправленных."""
-    slug = "tokyo"
-    if curated:
-        json_path = OUTPUT_DIR / f"hosts_{slug}_curated.json"
-        if not json_path.exists():
-            json_path = OUTPUT_DIR / "hosts_tokyo_curated.json"
+    # Если город задан — читаем ТОЛЬКО его файлы (без fallback на Tokyo).
+    explicit_city = bool(city and city.strip())
+    if explicit_city:
+        slug = re.sub(r"\W+", "_", city.strip().lower())
+        if curated:
+            json_path = OUTPUT_DIR / f"hosts_{slug}_curated.json"
+            if not json_path.exists():
+                json_path = OUTPUT_DIR / f"hosts_{slug}.json"
+        else:
+            json_path = OUTPUT_DIR / f"hosts_{slug}.json"
     else:
-        json_path = OUTPUT_DIR / f"hosts_{slug}.json"
-        if not json_path.exists():
-            json_path = OUTPUT_DIR / "hosts_tokyo.json"
+        slug = "tokyo"
+        if curated:
+            json_path = OUTPUT_DIR / f"hosts_{slug}_curated.json"
+            if not json_path.exists():
+                json_path = OUTPUT_DIR / "hosts_tokyo_curated.json"
+        else:
+            json_path = OUTPUT_DIR / f"hosts_{slug}.json"
+            if not json_path.exists():
+                json_path = OUTPUT_DIR / "hosts_tokyo.json"
 
     if not json_path.exists():
         return []
@@ -837,6 +1034,7 @@ async def get_results(curated: bool = False, hide_sent: bool = True):
 
 class AddToQueuePayload(BaseModel):
     username: str
+    city: Optional[str] = None
 
 
 @app.post("/api/queue/add")
@@ -849,20 +1047,22 @@ async def add_host_to_queue(payload: AddToQueuePayload):
         if item.get("username", "").strip().lower() == target_username.lower():
             return {"status": "exists", "message": f"@{target_username} уже находится в очереди", "item": item}
 
-    # Поиск профиля хоста в сохраненных данных
+    # Поиск профиля хоста в сохраненных данных (ищем во ВСЕХ городских файлах)
     host_match = None
-    for fname in ["hosts_tokyo_curated.json", "hosts_tokyo.json"]:
-        fpath = OUTPUT_DIR / fname
-        if fpath.exists():
-            try:
-                with open(fpath, "r", encoding="utf-8") as f:
-                    cached_hosts = json.load(f)
-                for h in cached_hosts:
-                    if h.get("username", "").strip().lower() == target_username.lower():
-                        host_match = h
-                        break
-            except Exception:
-                pass
+    try:
+        host_files = sorted(OUTPUT_DIR.glob("hosts_*.json"))
+    except Exception:
+        host_files = []
+    for fpath in host_files:
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                cached_hosts = json.load(f)
+            for h in cached_hosts:
+                if h.get("username", "").strip().lower() == target_username.lower():
+                    host_match = h
+                    break
+        except Exception:
+            pass
         if host_match:
             break
 
@@ -877,16 +1077,25 @@ async def add_host_to_queue(payload: AddToQueuePayload):
 
     clean_name = sanitize_host_name(host_match.get("name") or target_username)
     first_name = sanitize_host_clean_name(clean_name)
-    clean_loc = sanitize_host_location(host_match.get("location"), "Tokyo")
+    city_hint = (payload.city or "").strip() or "Tokyo"
+    clean_loc = sanitize_host_location(host_match.get("location"), city_hint)
 
     gen_msg = None
+    # Даты берём из самого трипа/хоста, а не из глобального дефолта
+    check_in = _date_or_default(
+        host_match.get("arrival_date") or host_match.get("check_in"), DEFAULT_CHECK_IN
+    )
+    check_out = _date_or_default(
+        host_match.get("departure_date") or host_match.get("check_out"), DEFAULT_CHECK_OUT
+    )
+    print(f"[QUEUE] @{target_username}: даты {check_in} – {check_out}")
     try:
         from llm_agent import get_llm_agent
         llm = get_llm_agent()
         gen_msg = llm.generate_request(
             host=host_match,
-            check_in=DEFAULT_CHECK_IN,
-            check_out=DEFAULT_CHECK_OUT,
+            check_in=check_in,
+            check_out=check_out,
             guest_context=DEFAULT_CONTEXT,
         )
     except Exception as e:
@@ -894,7 +1103,7 @@ async def add_host_to_queue(payload: AddToQueuePayload):
 
     if not gen_msg:
         from message_generator import generate_stay_request
-        gen_msg = generate_stay_request(host_match, check_in=DEFAULT_CHECK_IN, check_out=DEFAULT_CHECK_OUT)
+        gen_msg = generate_stay_request(host_match, check_in=check_in, check_out=check_out)
 
     new_item = {
         "id": target_username,
@@ -911,8 +1120,8 @@ async def add_host_to_queue(payload: AddToQueuePayload):
         "instagram_handle": host_match.get("instagram_handle"),
         "instagram_url": host_match.get("instagram_url"),
         "status": "Draft",
-        "check_in": DEFAULT_CHECK_IN,
-        "check_out": DEFAULT_CHECK_OUT,
+        "check_in": check_in,
+        "check_out": check_out,
         "message": gen_msg,
         "generated_message": gen_msg,
         "word_count": len(gen_msg.split()),
@@ -928,25 +1137,43 @@ async def add_host_to_queue(payload: AddToQueuePayload):
 
 class QueueAllPayload(BaseModel):
     usernames: Optional[List[str]] = None
+    city: Optional[str] = None
 
 
 @app.post("/api/requests/queue_all")
 @app.post("/api/queue/all")
 async def queue_all_hosts_endpoint(payload: Optional[QueueAllPayload] = None):
-    """Массово добавляет хостов в очередь отправки."""
+    """Массово добавляет хостов в очередь отправки (для выбранного города)."""
     target_usernames = payload.usernames if payload and payload.usernames else None
+    city = payload.city if payload else None
 
     all_hosts = []
-    for fname in ["hosts_tokyo_curated.json", "hosts_tokyo.json"]:
-        fpath = OUTPUT_DIR / fname
-        if fpath.exists():
-            try:
-                with open(fpath, "r", encoding="utf-8") as f:
-                    all_hosts = json.load(f)
-                if all_hosts:
-                    break
-            except Exception:
-                pass
+    seen = set()
+
+    # Если город известен — берём файлы этого города, иначе все hosts_*.json
+    if city and city.strip():
+        slug = re.sub(r"\W+", "_", city.strip().lower())
+        candidates = [
+            OUTPUT_DIR / f"hosts_{slug}_curated.json",
+            OUTPUT_DIR / f"hosts_{slug}.json",
+        ]
+    else:
+        candidates = sorted(OUTPUT_DIR.glob("hosts_*.json"))
+
+    for fpath in candidates:
+        if not fpath.exists():
+            continue
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                hosts = json.load(f)
+        except Exception:
+            continue
+        for h in hosts:
+            u = str(h.get("username") or h.get("id") or "").strip().lower()
+            if not u or u in seen:
+                continue
+            seen.add(u)
+            all_hosts.append(h)
 
     if target_usernames:
         u_set = set(u.strip().lower() for u in target_usernames if u.strip())
@@ -1686,6 +1913,34 @@ async def app_startup_cleanup():
         logger.warning(f"Ошибка при очистке статусов sending на старте: {e}")
 
 
+async def _cancel_dispatcher_task() -> None:
+    """Отменяет незавершённый таск запуска диспетчера (если он есть)."""
+    global dispatcher_task
+    task = dispatcher_task
+    if task is not None and not task.done():
+        logger.warning("Отмена предыдущего незавершённого dispatcher_task — запускаем только один цикл.")
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning(f"Ошибка при отмене старого dispatcher_task: {e}")
+    dispatcher_task = None
+
+
+async def _start_dispatcher_job(cmd: List[str], params: Dict[str, Any]) -> Dict[str, Any]:
+    """Единственная точка запуска автопилота: сначала гарантированно убирает старый таск."""
+    global dispatcher_task
+    await _cancel_dispatcher_task()
+    dispatcher_task = asyncio.create_task(process_mgr.start_job("Автопилот", cmd, params))
+    try:
+        return await dispatcher_task
+    finally:
+        if dispatcher_task is not None and dispatcher_task.done():
+            dispatcher_task = None
+
+
 @app.post("/api/autopilot/start")
 @app.post("/api/dispatcher/start")
 async def start_autopilot(params: AutopilotParams):
@@ -1726,8 +1981,8 @@ async def start_autopilot(params: AutopilotParams):
     else:
         cmd.append("--no-jitter")
 
-    if params.period_minutes is not None:
-        cmd.extend(["--period-minutes", str(params.period_minutes)])
+    # Исключаем устаревший period_minutes во избежание генерации коротких 35-сек интервалов
+    # Паузы всегда строго определяются min_interval_minutes и max_interval_minutes
     if params.interval_seconds is not None:
         cmd.extend(["--interval-seconds", str(params.interval_seconds)])
     else:
@@ -1760,7 +2015,7 @@ async def start_autopilot(params: AutopilotParams):
         except Exception:
             pass
 
-    res = await process_mgr.start_job("Автопилот", cmd, params.model_dump())
+    res = await _start_dispatcher_job(cmd, params.model_dump())
     if not res.get("success"):
         return {"error": res.get("error")}
     return {"status": "started", "dry_run": params.dry_run, "job_id": res.get("job_id")}
@@ -1808,6 +2063,7 @@ async def resume_autopilot():
 @app.post("/api/dispatcher/stop")
 async def stop_autopilot():
     """Остановка автопилота."""
+    await _cancel_dispatcher_task()
     res = await process_mgr.stop_current_job()
 
     status_file = OUTPUT_DIR / "autopilot_status.json"

@@ -35,6 +35,28 @@ DEFAULT_CHECK_IN = "2026-11-18"
 DEFAULT_CHECK_OUT = "2026-11-20"
 DEFAULT_CONTEXT = DEFAULT_GUEST_CONTEXT
 
+# Стоп-фразы: хост явно не принимает гостей — не добавляем в очередь на отправку.
+BLACKLIST_PHRASES = (
+    "not open to hosting",
+    "can't host",
+    "cannot host",
+    "no hosting",
+    "currently not hosting",
+    "stopped hosting",
+    "not hosting",
+)
+
+
+def is_blacklisted(about_me: Optional[str]) -> Optional[str]:
+    """Возвращает сработавшую стоп- фразу или None, если хост подходит."""
+    if not about_me:
+        return None
+    text = str(about_me).strip().lower()
+    for phrase in BLACKLIST_PHRASES:
+        if phrase in text:
+            return phrase
+    return None
+
 
 class RequestQueueManager:
     """Менеджер очереди запросов с двухсторонней персистентностью SQLite + JSON."""
@@ -72,9 +94,18 @@ class RequestQueueManager:
                         if not u:
                             continue
                         u_clean = str(u).strip().lower()
-                        if st in ("SENT_SUCCESS", "SUCCESS", "DRY_RUN_SUCCESS"):
+                        # Только реальные отправки. DRY_RUN и ложные "already sent" (FAILED/skipped без
+                        # подтверждения видимым текстом) НЕ считаются отправленными.
+                        # Старые SENT_SUCCESS с пометкой "No send button / Active dialogue" — это
+                        # артефакт ложного скипа, а не реальная отправка.
+                        false_skip_artifact = (
+                            "detected as already sent" in notes
+                            and "visible" not in notes
+                            and "deduplicated" not in notes
+                        )
+                        if st in ("SENT_SUCCESS", "SUCCESS") and not false_skip_artifact:
                             sent.add(u_clean)
-                        elif "already sent" in notes or "already sent" in err:
+                        elif st == "ALREADY_SENT" and ("visible" in notes or "deduplicated via inbox" in notes):
                             sent.add(u_clean)
             except Exception:
                 pass
@@ -83,7 +114,7 @@ class RequestQueueManager:
         try:
             with db_session() as conn:
                 cur = conn.cursor()
-                cur.execute("SELECT username FROM sending_history WHERE status = 'SENT_SUCCESS';")
+                cur.execute("SELECT username FROM sending_history WHERE UPPER(status) IN ('SENT_SUCCESS', 'SUCCESS');")
                 for row in cur.fetchall():
                     if row[0]:
                         sent.add(str(row[0]).strip().lower())
@@ -94,18 +125,29 @@ class RequestQueueManager:
                     if row[0]:
                         sent.add(str(row[0]).strip().lower())
 
-                # Запросы со статусом Sent/Declined
-                cur.execute("SELECT username, host_id FROM requests WHERE LOWER(status) IN ('sent', 'declined', 'completed');")
+                # Запросы со статусом Sent/Declined/Completed. Для Sent требуем реальную дату
+                # либо явное подтверждение — иначе ложный skip снова спрячет кандидата.
+                cur.execute("""
+                    SELECT h.username, sq.host_id, sq.sent_at, sq.notes
+                    FROM sending_queue sq
+                    LEFT JOIN hosts h ON h.id = sq.host_id
+                    WHERE LOWER(sq.status) IN ('sent', 'declined', 'completed');
+                """)
                 for row in cur.fetchall():
-                    if row[0]:
-                        sent.add(str(row[0]).strip().lower())
-                    if row[1]:
-                        sent.add(str(row[1]).strip().lower())
-
-                cur.execute("SELECT host_id FROM sending_queue WHERE LOWER(status) IN ('sent', 'declined', 'completed');")
-                for row in cur.fetchall():
-                    if row[0]:
-                        sent.add(str(row[0]).strip().lower())
+                    username, host_id, sent_at, notes = row
+                    notes_l = str(notes or "").lower()
+                    confirmed = (
+                        bool(sent_at)
+                        or ("already sent" in notes_l and "visible" in notes_l)
+                        or ("deduplicated" in notes_l and "inbox" in notes_l)
+                        or str(notes or "").lower().startswith("sent (confirmed")
+                    )
+                    if not confirmed:
+                        continue
+                    if username:
+                        sent.add(str(username).strip().lower())
+                    if host_id:
+                        sent.add(str(host_id).strip().lower())
         except Exception:
             pass
 
@@ -123,8 +165,9 @@ class RequestQueueManager:
 
         deduped_count = 0
         now_iso = datetime.now().isoformat()
-        historical_iso = "2026-11-01T00:00:00"
-        historical_str = "2026-11-01 00:00:00"
+        # Фейковая дата sent_at больше не подставляется; запись в sent_log помечается
+        # меткой времени дедупликации (mode=sync_dedup исключается из счетчика "сегодня").
+        historical_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         # 1. Обновление SQLite (историческая дата, чтобы не искажать счетчик за сегодня)
         try:
@@ -134,11 +177,11 @@ class RequestQueueManager:
                     cur.execute(
                         """
                         UPDATE sending_queue 
-                        SET status = 'Sent', notes = 'Already Sent (Deduplicated)', sent_at = ?, updated_at = ?
+                        SET status = 'Sent', notes = 'Already Sent (Deduplicated)', updated_at = ?
                         WHERE (LOWER(host_id) = ? OR host_id IN (SELECT id FROM hosts WHERE LOWER(username) = ?)) 
                           AND LOWER(status) IN ('approved', 'queued');
                         """,
-                        (historical_iso, now_iso, u, u),
+                        (now_iso, u, u),
                     )
         except Exception as e:
             logger.warning(f"Ошибка обновления SQLite при дедупликации: {e}")
@@ -156,7 +199,6 @@ class RequestQueueManager:
                     if u in sent_set and st in ("approved", "queued"):
                         item["status"] = "Sent"
                         item["notes"] = "Already Sent (Deduplicated)"
-                        item["sent_at"] = historical_iso
                         item["updated_at"] = now_iso
                         deduped_count += 1
                         updated = True
@@ -686,17 +728,111 @@ class RequestQueueManager:
         return target_item
 
     def approve_all_drafts(self) -> int:
-        """Одобряет все черновики в очереди."""
+        """Одобряет все черновики в очереди, пропуская хосты из черного списка."""
         now_iso = datetime.now().isoformat()
+        approved_count = 0
+        skipped_count = 0
         with db_session() as conn:
             cur = conn.cursor()
+            # Берём черновики вместе с about_me хоста, чтобы проверить черный список.
             cur.execute(
-                "UPDATE sending_queue SET status = 'Approved', updated_at = ? WHERE status = 'Draft';",
-                (now_iso,),
+                """
+                SELECT sq.host_id, h.about_me, h.about_me_clean
+                FROM sending_queue sq
+                LEFT JOIN hosts h ON h.id = sq.host_id
+                WHERE LOWER(sq.status) = 'draft';
+                """
             )
-            count = cur.rowcount
+            drafts = cur.fetchall()
+            for host_id, about_me, about_me_clean in drafts:
+                bio = about_me_clean or about_me or ""
+                blacklisted_phrase = is_blacklisted(bio)
+                if blacklisted_phrase:
+                    cur.execute(
+                        """
+                        UPDATE sending_queue
+                        SET status = 'Skipped', notes = ?, updated_at = ?
+                        WHERE host_id = ? AND LOWER(status) = 'draft';
+                        """,
+                        (f"Not open to hosting: '{blacklisted_phrase}'", now_iso, host_id),
+                    )
+                    logger.info(
+                        f"[FILTER] Пропущен хост @{host_id}: обнаружен стоп-флаг '{blacklisted_phrase}' (not open to hosting)."
+                    )
+                    skipped_count += 1
+                else:
+                    cur.execute(
+                        "UPDATE sending_queue SET status = 'Approved', updated_at = ? WHERE host_id = ? AND LOWER(status) = 'draft';",
+                        (now_iso, host_id),
+                    )
+                    approved_count += 1
         self.save_queue(self.load_queue(exclude_sent=False))
-        return count
+        logger.info(f"[FILTER] Одобрено: {approved_count}, пропущено по черному списку: {skipped_count}.")
+        return approved_count
+
+    def cleanup_blacklisted_from_queue(self) -> int:
+        """Однократная очистка текущей очереди: Approved/Queued хосты с черносписочной bio → Skipped."""
+        now_iso = datetime.now().isoformat()
+        skipped_count = 0
+
+        # 1. SQLite: sending_queue + hosts
+        try:
+            with db_session() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT sq.host_id, h.username, h.about_me, h.about_me_clean
+                    FROM sending_queue sq
+                    LEFT JOIN hosts h ON h.id = sq.host_id
+                    WHERE LOWER(sq.status) IN ('approved', 'queued');
+                    """
+                )
+                candidates = cur.fetchall()
+                for host_id, username, about_me, about_me_clean in candidates:
+                    bio = about_me_clean or about_me or ""
+                    blacklisted_phrase = is_blacklisted(bio)
+                    if blacklisted_phrase:
+                        cur.execute(
+                            """
+                            UPDATE sending_queue
+                            SET status = 'Skipped', notes = ?, updated_at = ?
+                            WHERE host_id = ? AND LOWER(status) IN ('approved', 'queued');
+                            """,
+                            (f"Not open to hosting: '{blacklisted_phrase}'", now_iso, host_id),
+                        )
+                        logger.info(
+                            f"[CLEANUP] Хост @{username or host_id} переведён в Skipped: стоп-флаг '{blacklisted_phrase}'."
+                        )
+                        skipped_count += 1
+        except Exception as e:
+            logger.warning(f"Ошибка очистки черного списка в SQLite: {e}")
+
+        # 2. JSON queue
+        if QUEUE_FILE.exists():
+            try:
+                queue = json.loads(QUEUE_FILE.read_text(encoding="utf-8"))
+                changed = False
+                for item in queue:
+                    st = str(item.get("status", "")).lower()
+                    if st in ("approved", "queued"):
+                        bio = str(item.get("about_me_clean") or item.get("about_me") or "")
+                        blacklisted_phrase = is_blacklisted(bio)
+                        if blacklisted_phrase:
+                            item["status"] = "Skipped"
+                            item["notes"] = f"Not open to hosting: '{blacklisted_phrase}'"
+                            item["updated_at"] = now_iso
+                            changed = True
+                            logger.info(
+                                f"[CLEANUP] Хост @{item.get('username')} переведён в Skipped: стоп-флаг '{blacklisted_phrase}'."
+                            )
+                if changed:
+                    QUEUE_FILE.write_text(json.dumps(queue, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception as e:
+                logger.warning(f"Ошибка очистки черного списка в JSON: {e}")
+
+        if skipped_count:
+            logger.info(f"[CLEANUP] Всего переведено в Skipped по черному списку: {skipped_count}.")
+        return skipped_count
 
     def enqueue_hosts(self, hosts_list: List[Dict[str, Any]]) -> int:
         """Массовое добавление хостов в очередь (SQLite + JSON)."""
@@ -718,6 +854,14 @@ class RequestQueueManager:
                     if not u or u.lower() in existing_users or u.lower() in sent_users:
                         continue
 
+                    # Черный список: хост явно не принимает гостей — не добавляем в очередь.
+                    blacklisted_phrase = is_blacklisted(h.get("about_me", "") or h.get("about_me_clean", ""))
+                    if blacklisted_phrase:
+                        logger.info(
+                            f"[FILTER] Пропущен хост @{u}: обнаружен стоп-флаг '{blacklisted_phrase}' (not open to hosting)."
+                        )
+                        continue
+
                     clean_name = h.get("clean_name") or h.get("name") or u
                     first_name = clean_name.split()[0] if clean_name else u
                     loc = h.get("location") or "Tokyo, Japan"
@@ -725,7 +869,10 @@ class RequestQueueManager:
                         loc = loc.get("locationDescription", {}).get("description", "Tokyo")
 
                     msg_id = f"msg_{u}_{uuid.uuid4().hex[:6]}"
-                    default_msg = generate_stay_request(h, check_in=DEFAULT_CHECK_IN, check_out=DEFAULT_CHECK_OUT)
+                    # Даты берём из трипа/хоста, чтобы автопилот отправлял на нужные даты
+                    check_in = str(h.get("arrival_date") or h.get("check_in") or DEFAULT_CHECK_IN).strip()
+                    check_out = str(h.get("departure_date") or h.get("check_out") or DEFAULT_CHECK_OUT).strip()
+                    default_msg = generate_stay_request(h, check_in=check_in, check_out=check_out)
 
                     # 1. Запись в hosts
                     cur.execute(
@@ -757,7 +904,7 @@ class RequestQueueManager:
                             word_count, qc_passed, is_active, created_at
                         ) VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?);
                         """,
-                        (msg_id, u, DEFAULT_CHECK_IN, DEFAULT_CHECK_OUT, default_msg, len(default_msg.split()), now_iso),
+                        (msg_id, u, check_in, check_out, default_msg, len(default_msg.split()), now_iso),
                     )
 
                     # 3. Сохранение в sending_queue
@@ -787,8 +934,8 @@ class RequestQueueManager:
                         "instagram_handle": h.get("instagram_handle"),
                         "instagram_url": h.get("instagram_url"),
                         "status": "Draft",
-                        "check_in": DEFAULT_CHECK_IN,
-                        "check_out": DEFAULT_CHECK_OUT,
+                        "check_in": check_in,
+                        "check_out": check_out,
                         "message": default_msg,
                         "generated_message": default_msg,
                         "word_count": len(default_msg.split()),

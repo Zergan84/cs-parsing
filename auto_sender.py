@@ -199,18 +199,41 @@ class AutoSender:
         with open(SENT_LOG_FILE, "w", encoding="utf-8") as f:
             json.dump(logs, f, ensure_ascii=False, indent=2)
 
-    def update_queue_status(self, username: str, new_status: str, notes: Optional[str] = None, sent_at: Optional[str] = None) -> None:
-        """Обновляет статус карточки хоста в requests_queue.json и SQLite."""
+    def update_queue_status(
+        self,
+        username: str,
+        new_status: str,
+        notes: Optional[str] = None,
+        sent_at: Optional[str] = None,
+        attempts: Optional[int] = None,
+        increment_attempts: bool = False,
+    ) -> None:
+        """Обновляет статус карточки хоста в requests_queue.json и SQLite.
+
+        `attempts` / `increment_attempts` учитываются только в JSON-очереди
+        (в таблице sending_queue нет такой колонки) и используются для
+        сортировки кандидатов, чтобы проблемный хост уходил в конец очереди.
+        """
         now_iso = datetime.now().isoformat()
-        if sent_at is None:
-            if notes and ("Already Sent" in notes or "Detected as already sent" in notes or "Deduplicated" in notes):
-                effective_sent_at = "2026-11-01T00:00:00"
-            elif new_status.lower() == "sent":
-                effective_sent_at = now_iso
-            else:
-                effective_sent_at = None
-        else:
+        status_norm = (new_status or "").strip().lower()
+        notes_lower = (notes or "").lower()
+
+        # sent_at ставится ТОЛЬКО для реального подтверждённого клика Send.
+        # "Already sent" (особенно подтверждённый лишь отсутствием кнопки) — не WAS SENT:
+        # дату не подставляем, а у Approved/Queued/Failed/Skipped старую дату очищаем.
+        is_sent_status = status_norm in ("sent", "was sent")
+        is_already = "already sent" in notes_lower or "deduplicated" in notes_lower
+        clear_sent_at = False
+
+        if sent_at is not None:
             effective_sent_at = sent_at
+        elif is_sent_status and not is_already:
+            effective_sent_at = now_iso
+        elif not is_sent_status:
+            effective_sent_at = None
+            clear_sent_at = True
+        else:
+            effective_sent_at = None
 
         if QUEUE_FILE.exists():
             try:
@@ -224,7 +247,13 @@ class AutoSender:
                             item["notes"] = notes
                         if effective_sent_at:
                             item["sent_at"] = effective_sent_at
+                        elif clear_sent_at:
+                            item.pop("sent_at", None)
                         item["updated_at"] = now_iso
+                        if increment_attempts:
+                            item["attempts"] = int(item.get("attempts") or 0) + 1
+                        elif attempts is not None:
+                            item["attempts"] = int(attempts)
                         break
 
                 with open(QUEUE_FILE, "w", encoding="utf-8") as f:
@@ -240,19 +269,23 @@ class AutoSender:
                     cur.execute(
                         """
                         UPDATE sending_queue 
-                        SET status = ?, notes = ?, sent_at = CASE WHEN ? IS NOT NULL THEN ? ELSE sent_at END, updated_at = ?
+                        SET status = ?, notes = ?,
+                            sent_at = CASE WHEN ? IS NOT NULL THEN ? WHEN ? = 1 THEN NULL ELSE sent_at END,
+                            updated_at = ?
                         WHERE host_id IN (SELECT id FROM hosts WHERE username = ? OR id = ?);
                         """,
-                        (new_status, notes, effective_sent_at, effective_sent_at, now_iso, username, username),
+                        (new_status, notes, effective_sent_at, effective_sent_at, int(clear_sent_at), now_iso, username, username),
                     )
                 else:
                     cur.execute(
                         """
                         UPDATE sending_queue 
-                        SET status = ?, sent_at = CASE WHEN ? IS NOT NULL THEN ? ELSE sent_at END, updated_at = ?
+                        SET status = ?,
+                            sent_at = CASE WHEN ? IS NOT NULL THEN ? WHEN ? = 1 THEN NULL ELSE sent_at END,
+                            updated_at = ?
                         WHERE host_id IN (SELECT id FROM hosts WHERE username = ? OR id = ?);
                         """,
-                        (new_status, effective_sent_at, effective_sent_at, now_iso, username, username),
+                        (new_status, effective_sent_at, effective_sent_at, int(clear_sent_at), now_iso, username, username),
                     )
         except Exception:
             pass
@@ -348,6 +381,7 @@ class AutoSender:
         next_send_time: Optional[float] = None,
         next_delay_seconds: Optional[int] = None,
         last_status: str = "Idle",
+        seconds_remaining: Optional[int] = None,  # совместимость со старыми вызовами (вычисляется автоматически)
     ) -> None:
         """Сохраняет актуальный статус автопилота для отображения в UI."""
         now = time.time()
@@ -374,8 +408,11 @@ class AutoSender:
             "updated_at": datetime.now().isoformat(),
         }
         try:
-            with open(STATUS_FILE, "w", encoding="utf-8") as f:
+            # Атомарная запись: UI никогда не прочитает наполовину записанный JSON.
+            tmp_file = STATUS_FILE.with_suffix(".json.tmp")
+            with open(tmp_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_file, STATUS_FILE)
         except Exception:
             pass
 
@@ -514,6 +551,246 @@ class AutoSender:
         except Exception as e:
             log_step("DEBUG", f"fill_form_dates: {e}")
 
+    # ------------------------------------------------------------------
+    # Вспомогательные методы надежной отправки
+    # ------------------------------------------------------------------
+    ALREADY_SENT_PHRASES = (
+        "you sent a request to",
+        "this user needs to accept your request before you can send another message",
+    )
+
+    def detect_already_sent(self, page) -> Optional[str]:
+        """
+        Возвращает найденную фразу, ТОЛЬКО если на странице ВИДИМ текст
+        'You sent a request to' или 'This user needs to accept your request...'.
+        page.content() НЕ используется: в HTML есть i18n-бандлы с этими строками.
+        """
+        try:
+            body_text = (page.inner_text("body") or "").lower()
+        except Exception:
+            return None
+        for phrase in self.ALREADY_SENT_PHRASES:
+            if phrase in body_text:
+                return phrase
+        return None
+
+    SEND_BUTTON_SELECTOR = (
+        "button[data-testid='send-request-button']:visible, "
+        "button:visible:has-text('Send Request'), "
+        "button:visible:has-text('Send request'), "
+        "button:visible:has-text('Отправить запрос')"
+    )
+
+    def _log_visible_controls(self, page) -> None:
+        """Логирует видимые заголовки и тексты кнопок — для диагностики того, что именно показывает сайт."""
+        try:
+            texts = page.evaluate("""() => {
+              const seen = new Set();
+              const out = [];
+              const add = (el) => {
+                try {
+                  const t = (el.innerText || el.textContent || '').trim();
+                  if (t && t.length < 140 && !seen.has(t)) { seen.add(t); out.push(t); }
+                } catch (e) {}
+              };
+              document.querySelectorAll('h1,h2,h3,h4,button,[role="button"],a').forEach(add);
+              return out;
+            }""")
+            for t in (texts or [])[:40]:
+                log_step("DIAG", f"Видимый элемент на странице: {t}")
+        except Exception as e:
+            log_step("DEBUG", f"Диагностика видимых элементов страницы: {e}")
+
+    def _has_visible_send_form(self, page) -> bool:
+        """Есть ли на странице реально видимая форма отправки (textarea или кнопка Send Request)."""
+        try:
+            if page.locator("textarea:visible").count() > 0:
+                return True
+        except Exception:
+            pass
+        try:
+            btn = page.locator(self.SEND_BUTTON_SELECTOR).first
+            return btn.count() > 0 and btn.is_visible()
+        except Exception:
+            return False
+
+    def wait_for_send_form_or_already_sent(self, page, timeout: int = 15) -> Tuple[str, Optional[str]]:
+        """
+        Ждёт до `timeout` секунд появления формы отправки.
+        Возвращает:
+          ("form", None)                  — форма/кнопка появились, можно отправлять;
+          ("already", <visible text>)     — формы нет, но виден явный текст уже отправленного запроса;
+          ("timeout", <visible text|None>)— форма так и не загрузилась (НЕ считаем отправленным).
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._has_visible_send_form(page):
+                return "form", None
+            reason = self.detect_already_sent(page)
+            if reason:
+                return "already", reason
+            time.sleep(0.25)
+
+        if self._has_visible_send_form(page):
+            return "form", None
+        return "timeout", self.detect_already_sent(page)
+
+    def _mark_already_sent(self, username: str, host_name: str, target_city: str, arrival_date: str, departure_date: str, reason: str) -> str:
+        """Skip ТОЛЬКО при явном видимом тексте. sent_at не выставляется (это не наш WAS SENT)."""
+        log_step("SKIP", f"[SKIP] Запрос хосту @{username} уже отправлен ранее (видимый текст: '{reason}').")
+        self.update_queue_status(username, "Skipped", notes=f"Already sent on Couchsurfing (visible: '{reason}')")
+        self.append_sent_log({
+            "id": username,
+            "username": username,
+            "name": host_name,
+            "target_city": target_city,
+            "arrival_date": arrival_date,
+            "departure_date": departure_date,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "status": "ALREADY_SENT",
+            "mode": "skipped",
+            "notes": f"Already sent on Couchsurfing (visible text: '{reason}')",
+        })
+        return "ALREADY_SENT"
+
+    def dismiss_cookie_banner(self, page) -> None:
+        """Закрывает cookie-баннер (он перекрывает нижние карточки поездок)."""
+        for sel in ("button:visible:has-text('Reject All')", "button:visible:has-text('Accept')"):
+            try:
+                btn = page.locator(sel).first
+                if btn.count() > 0 and btn.is_visible():
+                    btn.click(timeout=3000)
+                    page.wait_for_timeout(600)
+                    log_step("NAV", "Cookie-баннер закрыт.")
+                    return
+            except Exception:
+                pass
+
+    def is_trip_selection_screen(self, page) -> bool:
+        try:
+            loc = page.get_by_text("Which trip is this stay for?")
+            return loc.count() > 0 and loc.first.is_visible()
+        except Exception:
+            return False
+
+    @staticmethod
+    def _trip_date_hint(arrival_date: str, departure_date: str) -> str:
+        """'2026-11-16','2026-11-19' -> 'nov1619'; кросс-месяц -> 'nov30dec2' (без пробелов/тире)."""
+        try:
+            a = datetime.strptime(arrival_date[:10], "%Y-%m-%d")
+            d = datetime.strptime(departure_date[:10], "%Y-%m-%d")
+            if a.month == d.month:
+                return f"{a.strftime('%b').lower()}{a.day}{d.day}"
+            return f"{a.strftime('%b').lower()}{a.day}{d.strftime('%b').lower()}{d.day}"
+        except Exception:
+            return ""
+
+    def select_trip_card(self, page, city: str, arrival_date: str, departure_date: str) -> bool:
+        """
+        Находит карточку поездки по городу (+ даты для приоритета) и кликает её overlay-кнопку.
+        Карточка = ближайший предок overlay-кнопки (button.absolute.inset-0), содержащий ровно одну такую кнопку.
+        """
+        date_hint = self._trip_date_hint(arrival_date, departure_date)
+        js = r"""
+        ({city, dateHint}) => {
+            document.querySelectorAll('[data-cs-trip-pick]').forEach(e => e.removeAttribute('data-cs-trip-pick'));
+            const norm = s => (s || '').toLowerCase().replace(/[\s\u2013\u2014\-\u00b7•,]/g, '');
+            const overlays = [...document.querySelectorAll('button')].filter(
+                b => b.classList.contains('absolute') && b.classList.contains('inset-0'));
+            let best = null, bestScore = -1, bestText = '';
+            for (const b of overlays) {
+                let card = b.parentElement, depth = 0;
+                while (card && depth < 6) {
+                    const n = [...card.querySelectorAll('button')].filter(
+                        x => x.classList.contains('absolute') && x.classList.contains('inset-0')).length;
+                    if (n > 1) { card = null; break; }
+                    if (norm(card.innerText).includes(norm(city))) break;
+                    card = card.parentElement; depth++;
+                }
+                if (!card) continue;
+                const t = norm(card.innerText);
+                if (!t.includes(norm(city))) continue;
+                let score = 1;
+                if (dateHint && t.includes(dateHint)) score += 10;
+                if (score > bestScore) { best = b; bestScore = score; bestText = card.innerText; }
+            }
+            if (!best) return null;
+            best.setAttribute('data-cs-trip-pick', '1');
+            best.scrollIntoView({block: 'center'});
+            return {score: bestScore, text: (bestText || '').replace(/\s+/g, ' ').slice(0, 120)};
+        }
+        """
+        try:
+            info = page.evaluate(js, {"city": city, "dateHint": date_hint})
+        except Exception as e:
+            log_step("DEBUG", f"select_trip_card evaluate: {e}")
+            info = None
+        if not info:
+            log_step("TRIP", f"Карточка поездки для '{city}' не найдена (date_hint={date_hint}).")
+            return False
+        if info.get("score", 0) < 10:
+            log_step("TRIP", f"ВНИМАНИЕ: карточка '{city}' найдена, но даты {arrival_date} – {departure_date} не совпали: {info.get('text')}")
+        try:
+            page.locator("[data-cs-trip-pick='1']").first.click(timeout=8000)
+        except Exception as e:
+            log_step("TRIP", f"Не удалось кликнуть карточку поездки: {e}")
+            return False
+        log_step("TRIP", f"Выбрана карточка поездки: {info.get('text')}")
+        return True
+
+    def _fail_attempt(self, page, username: str, host_name: str, reason: str, error_screenshot, error_html) -> str:
+        """Ошибка формы/сети: НЕ помечаем как Sent. Возвращаем хост в очередь со статусом Queued."""
+        log_step("ERROR", f"[NOT SENT] @{username}: {reason}. Хост возвращён в очередь (Queued), sent_at не выставлен.")
+        try:
+            page.screenshot(path=str(error_screenshot))
+            error_html.write_text(page.content(), encoding="utf-8")
+        except Exception:
+            pass
+        self.append_sent_log({
+            "id": username,
+            "username": username,
+            "name": host_name,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "status": "FAILED",
+            "mode": "error",
+            "error": reason,
+            "proof_screenshot": str(error_screenshot),
+            "error_html": str(error_html),
+        })
+        self.update_queue_status(username, "Queued", notes=f"Last attempt failed: {reason}", increment_attempts=True)
+        return "ERROR"
+
+    def _record_dry_run_success(
+        self,
+        username: str,
+        host_name: str,
+        target_city: str,
+        arrival_date: str,
+        departure_date: str,
+        before_screenshot: Path,
+        found_selector: str,
+    ) -> None:
+        """
+        Пишет результат тестового прогона (dry-run) только в sent_log.json.
+        Статус записи в requests_queue.json НЕ меняется — остаётся 'Approved'.
+        """
+        self.append_sent_log({
+            "id": username,
+            "username": username,
+            "name": host_name,
+            "target_city": target_city,
+            "arrival_date": arrival_date,
+            "departure_date": departure_date,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "status": "dry_run_success",
+            "http_status": None,
+            "mode": "dry_run",
+            "proof_screenshot": str(before_screenshot),
+            "before_screenshot": str(before_screenshot),
+            "button_selector": found_selector,
+            "notes": "Form verified and filled in dry-run mode. Send button was not clicked.",
+        })
+
     def process_host(self, page, host_item: Dict[str, Any]) -> bool:
         """
         Выполняет отправку запроса для одного хоста с расширенной верификацией.
@@ -568,6 +845,40 @@ class AutoSender:
             page.goto(stay_url, timeout=35000, wait_until="domcontentloaded")
             time.sleep(random.uniform(2.0, 3.5))
 
+            # Диагностика сессии: текущий адрес и заголовок страницы
+            try:
+                cur_url = page.url
+                cur_title = page.title()
+                log_step("SESSION", f"Страница хоста @{username}: {cur_url}")
+                log_step("SESSION", f"Заголовок страницы: {cur_title}")
+            except Exception as e:
+                log_step("DEBUG", f"Не удалось прочитать url/title страницы: {e}")
+
+            # Проверка, не выбросило ли на логин (сессия недействительна / истекла)
+            if "/login" in page.url.lower() or "sign in" in (page.title() or "").lower() or "log in" in (page.title() or "").lower():
+                log_step("CRITICAL", f"Сессия недействительна — перенаправление на логин для @{username}! Автопилот остановлен.")
+                page.screenshot(path=str(error_screenshot))
+                error_html.write_text(page.content(), encoding="utf-8")
+                self.append_sent_log({
+                    "id": username,
+                    "username": username,
+                    "name": host_name,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "status": "FAILED",
+                    "mode": "error",
+                    "error": "Session expired: redirected to login",
+                    "proof_screenshot": str(error_screenshot),
+                    "error_html": str(error_html),
+                })
+                self.update_queue_status(username, "Queued", notes="Session expired: redirected to login", increment_attempts=True)
+                self.update_autopilot_status(
+                    is_running=False,
+                    current_host=username,
+                    last_status="Остановлен: сессия истекла (требуется повторный вход)",
+                )
+                self.is_running = False
+                return False
+
             # 2. Проверка защиты Cloudflare / Капчи
             if self.check_security_challenges(page):
                 log_step("CRITICAL", f"Обнаружен Cloudflare / Капча / 429 на {username}! Аварийная остановка.")
@@ -592,130 +903,113 @@ class AutoSender:
                 self.is_running = False
                 return False
 
-            # 2.5. Немедленная проверка: был ли запрос уже отправлен ранее / существует ли активный диалог
-            already_sent_detected = False
-            skip_reason = ""
+            # 2.5. Закрываем cookie-баннер, чтобы он не перехватывал клики
+            self.dismiss_cookie_banner(page)
+
+            # 2.6. Агрессивное удаление оверлеев и баннеров куки из DOM (чтобы не блокировали клики)
             try:
-                body_text = page.inner_text("body").lower()
-                banned_triggers = [
-                    "awaiting response",
-                    "pending stay",
-                    "you sent a request",
-                    "you've sent a request",
-                    "you have sent a request",
-                    "this user needs to accept your request before you can send another message",
-                    "you already sent a request",
-                    "already requested",
-                    "request sent",
-                    "request already sent",
-                ]
-                for bt in banned_triggers:
-                    if bt in body_text:
-                        already_sent_detected = True
-                        skip_reason = f"Обнаружен текст '{bt}'"
-                        break
-
-                if not already_sent_detected:
-                    view_btn = page.locator(
-                        "button:has-text('View Request'), a:has-text('View Request'), "
-                        "button:has-text('View request'), a:has-text('View request'), "
-                        "[data-testid*='view-request'], button:has-text('Cancel Request'), "
-                        "button:has-text('Cancel request')"
-                    )
-                    if view_btn.count() > 0 and view_btn.first.is_visible():
-                        already_sent_detected = True
-                        skip_reason = "Обнаружена кнопка 'View/Cancel Request'"
-                    elif page.locator(".message-thread, [data-testid='conversation-view'], .conversation-history, [data-testid*='chat-message']").count() > 0:
-                        already_sent_detected = True
-                        skip_reason = "Обнаружен активный тред диалога"
+                page.evaluate("""() => {
+                    const selectors = [
+                        '#cookie-banner', '.cookie-banner', '[class*="cookie"]', '[id*="cookie"]',
+                        '.modal-backdrop', '[class*="overlay"]', '[class*="gdpr"]', '[id*="gdpr"]',
+                        '[class*="consent"]', '[id*="consent"]'
+                    ];
+                    selectors.forEach(sel => {
+                        try {
+                            document.querySelectorAll(sel).forEach(el => el.remove());
+                        } catch (e) {}
+                    });
+                }""")
+                page.wait_for_timeout(500)
             except Exception as e:
-                log_step("DEBUG", f"Ошибка проверки существующих диалогов: {e}")
+                log_step("DEBUG", f"Очистка оверлеев куки: {e}")
 
-            if already_sent_detected:
-                log_step("SKIP", f"[SKIP] Запрос хосту @{username} уже отправлен ранее ({skip_reason}). Запись перемещена в Sent Requests.")
-                self.update_queue_status(username, "Sent", notes=f"Detected as already sent on Couchsurfing ({skip_reason})", sent_at="2026-11-01T00:00:00")
-                self.append_sent_log({
-                    "id": username,
-                    "username": username,
-                    "name": host_name,
-                    "target_city": target_city,
-                    "arrival_date": arrival_date,
-                    "departure_date": departure_date,
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "status": "ALREADY_SENT",
-                    "mode": "skipped",
-                    "proof_screenshot": str(before_screenshot) if before_screenshot.exists() else "",
-                    "notes": f"Detected as already sent on Couchsurfing ({skip_reason})",
-                })
-                return "ALREADY_SENT"
-
-            # 3. ДИНАМИЧЕСКИЙ ВЫБОР КАРТОЧКИ ПОЕЗДКИ (TRIP SELECTION) ПО ГОРОДУ И ДАТАМ
-            page.wait_for_timeout(2000)
-            trip_found = False
-
-            # Поиск элемента карточки/селектора, содержащего текст города
-            city_variants = [target_city]
-            raw_loc = host_item.get("target_city") or host_item.get("location")
-            if raw_loc and raw_loc not in city_variants:
-                city_variants.append(raw_loc)
-
-            for city_q in city_variants:
-                trip_selector = page.locator(
-                    f'.trip-card:has-text("{city_q}"), '
-                    f'[data-testid="trip-option"]:has-text("{city_q}"), '
-                    f'[data-testid*="trip"]:has-text("{city_q}"), '
-                    f'div:has-text("{city_q}"):has(button.absolute.inset-0.z-10), '
-                    f'button:has-text("{city_q}")'
-                )
+            # Программное нажатие на известные кнопки согласия с куки, если они есть
+            for consent_text in ("Accept", "Got it", "Agree", "I agree", "OK", "Принять", "Согласен"):
                 try:
-                    if trip_selector.count() > 0:
-                        for i in range(trip_selector.count()):
-                            candidate_card = trip_selector.nth(i)
-                            if candidate_card.is_visible():
-                                overlay = candidate_card.locator("button.absolute.inset-0.z-10, button").first
-                                if overlay.count() > 0 and overlay.is_visible():
-                                    overlay.click()
-                                else:
-                                    candidate_card.click()
-                                trip_found = True
-                                log_step("TRIP", f"Выбрана существующая карточка поездки для города {target_city}.")
-                                page.wait_for_timeout(1500)
-                                break
-                except Exception as e:
-                    log_step("DEBUG", f"Ошибка при клике карточки поездки для {city_q}: {e}")
+                    consent_btn = page.locator(
+                        f'button:visible:has-text("{consent_text}"), a:visible:has-text("{consent_text}")'
+                    ).first
+                    if consent_btn.count() > 0 and consent_btn.is_visible():
+                        consent_btn.click(timeout=2000)
+                        page.wait_for_timeout(500)
+                        log_step("NAV", f"Нажата кнопка согласия с куки: '{consent_text}'")
+                        break
+                except Exception:
+                    pass
 
-                if trip_found:
-                    break
+            # 2.7. Универсальный поиск и клик по кнопке "Request Stay"
+            # Ищем любые элементы (a, button, [role="button"]) с текстом "Request Stay" (без учёта регистра).
+            request_btn = page.locator(
+                'a, button, [role="button"]'
+            ).filter(
+                has_text=re.compile("Request Stay", re.IGNORECASE)
+            ).first
 
-            if not trip_found:
-                # ЕСЛИ карточка для этого города НЕ найдена (или предложен ввод новых дат):
-                log_step("TRIP", f"Карточка поездки не найдена, отправка с прямым указанием дат {arrival_date} - {departure_date}.")
-
-                # Выбрать опцию "Create new trip / Other dates"
-                new_trip_selectors = [
-                    "button:has-text('Create new trip')",
-                    "button:has-text('Create a new trip')",
-                    "button:has-text('Other dates')",
-                    "button:has-text('Different dates')",
-                    "[data-testid='create-new-trip']",
-                    "[data-testid='other-dates']",
-                    "button:has-text('New trip')",
-                ]
-                for nts in new_trip_selectors:
+            found = False
+            try:
+                # Ждём появления кнопки до 3 секунд (кнопка может подгружаться динамически).
+                deadline = time.time() + 3
+                while time.time() < deadline:
                     try:
-                        el = page.locator(nts)
-                        if el.count() > 0 and el.first.is_visible():
-                            el.first.click()
-                            page.wait_for_timeout(1500)
-                            log_step("TRIP", f"Выбрана опция создания поездки/других дат: {nts}")
+                        if request_btn.count() > 0 and request_btn.is_visible():
+                            found = True
                             break
                     except Exception:
                         pass
+                    page.wait_for_timeout(300)
 
-                # Заполнить форму дат напрямую
-                self.fill_form_dates(page, arrival_date, departure_date)
+                if not found:
+                    # Прокручиваем страницу вниз — на адаптивной/моб. верстке кнопка может быть ниже первого экрана.
+                    log_step("DEBUG", "Кнопка 'Request Stay' не видна сразу — прокрутка страницы вниз...")
+                    try:
+                        page.evaluate("window.scrollBy(0, window.innerHeight);")
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(1000)
+                    try:
+                        if request_btn.count() > 0 and request_btn.is_visible():
+                            found = True
+                    except Exception:
+                        pass
 
-            # 4. Переход к экрану Stay Details
+                if not found:
+                    page.screenshot(path=str(DEBUG_DIR / f"profile_{username}.png"))
+                    return self._fail_attempt(
+                        page, username, host_name,
+                        f"Кнопка 'Request Stay' не найдена на странице профиля хоста @{username} (форма не открылась)",
+                        error_screenshot, error_html,
+                    )
+
+                try:
+                    request_btn.scroll_into_view_if_needed()
+                except Exception:
+                    pass
+                log_step("NAV", "Нажатие кнопки 'Request Stay' на профиле хоста...")
+                request_btn.click(force=True)
+                page.wait_for_timeout(2500)
+                log_step("NAV", "Кнопка 'Request Stay' нажата, ожидаем открытие формы/модалки.")
+            except Exception as e:
+                page.screenshot(path=str(DEBUG_DIR / f"profile_{username}.png"))
+                return self._fail_attempt(
+                    page, username, host_name,
+                    f"Кнопка 'Request Stay' не кликнута: {e}",
+                    error_screenshot, error_html,
+                )
+
+            # 3. ВЫБОР КАРТОЧКИ ПОЕЗДКИ ПО ГОРОДУ И ДАТАМ
+            trip_screen = self.is_trip_selection_screen(page)
+            if trip_screen:
+                picked = self.select_trip_card(page, target_city, arrival_date, departure_date)
+                if not picked:
+                    return self._fail_attempt(
+                        page, username, host_name,
+                        f"Карточка поездки для {target_city} ({arrival_date} – {departure_date}) не найдена на экране выбора Trip",
+                        error_screenshot, error_html,
+                    )
+                page.wait_for_timeout(1500)
+
+            # 4. Переход к экрану Stay Details (если есть кнопка Next / Stay Details)
             try:
                 stay_details_btn = page.locator(
                     "button:has-text('Stay Details'), button:has-text('Next'), [data-testid='stay-request-next-button']"
@@ -727,58 +1021,54 @@ class AutoSender:
             except Exception:
                 pass
 
-            # 5. Поиск поля ввода сообщения
+            # Защита: если всё ещё на экране выбора поездки — НЕ вводим текст
+            if self.is_trip_selection_screen(page):
+                return self._fail_attempt(
+                    page, username, host_name,
+                    "Форма осталась на экране 'Which trip is this stay for?' — карточка поездки не применилась",
+                    error_screenshot, error_html,
+                )
+
+            # Заполнение дат вручную (если поля присутствуют на экране Stay Details)
+            self.fill_form_dates(page, arrival_date, departure_date)
+
+            # 5. Ждём появления формы/кнопки Send Request до 15 секунд.
+            # "Уже отправлено" — ТОЛЬКО при явном видимом тексте, а не из-за отсутствия селектора.
+            form_state, already_reason = self.wait_for_send_form_or_already_sent(page, timeout=15)
+            if form_state == "already" and already_reason:
+                return self._mark_already_sent(
+                    username, host_name, target_city, arrival_date, departure_date, already_reason
+                )
+            if form_state == "timeout":
+                # Диагностика: что именно показывает сайт на экране (заголовки, кнопки).
+                self._log_visible_controls(page)
+                if already_reason:
+                    return self._mark_already_sent(
+                        username, host_name, target_city, arrival_date, departure_date, already_reason
+                    )
+                return self._fail_attempt(
+                    page, username, host_name,
+                    "Форма отправки не загрузилась за 15 сек: нет ни textarea, ни кнопки 'Send Request' (сеть/селектор). Повторная отправка не выполнялась.",
+                    error_screenshot, error_html,
+                )
+
+            # 5.1. Поле ввода сообщения (форма уже видна; даём 5 сек на появление textarea)
             textarea = None
             try:
-                page.wait_for_selector("textarea", timeout=7000)
-                textarea = page.query_selector("textarea")
+                ta = page.locator("textarea:visible").first
+                ta.wait_for(state="visible", timeout=5000)
+                textarea = ta
             except Exception:
-                textarea = page.query_selector("[role='textbox'], [contenteditable='true']")
+                textarea = None
 
-            if not textarea:
-                # Проверяем, возможно запрос уже был отправлен и страница находится в режиме переписки/ожидания
-                page_text_lower = page.content().lower()
-                already_sent_triggers = [
-                    "awaiting response", "pending stay", "you sent a request",
-                    "this user needs to accept your request before you can send another message",
-                    "view request", "cancel request", "couch request sent",
-                    "request sent", "your stay request"
-                ]
-                is_already = any(trig in page_text_lower for trig in already_sent_triggers)
-                if is_already:
-                    log_step("SKIP", f"[SKIP] Запрос хосту @{username} уже отправлен ранее (textarea отсутствует, активен диалог). Перемещен в Sent Requests.")
-                    self.update_queue_status(username, "Sent", notes="Detected as already sent on Couchsurfing (Active dialogue detected)", sent_at="2026-11-01T00:00:00")
-                    self.append_sent_log({
-                        "id": username,
-                        "username": username,
-                        "name": host_name,
-                        "target_city": target_city,
-                        "arrival_date": arrival_date,
-                        "departure_date": departure_date,
-                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "status": "ALREADY_SENT",
-                        "mode": "skipped",
-                        "notes": "Detected as already sent on Couchsurfing (No textarea / Active dialogue)",
-                    })
-                    return "ALREADY_SENT"
+            if textarea is None:
+                return self._fail_attempt(
+                    page, username, host_name,
+                    "Форма открылась, но поле ввода сообщения (textarea) не найдено",
+                    error_screenshot, error_html,
+                )
 
-                log_step("ERROR", f"Текстовое поле ввода не найдено на странице {username}!")
-                page.screenshot(path=str(error_screenshot))
-                error_html.write_text(page.content(), encoding="utf-8")
-                self.append_sent_log({
-                    "id": username,
-                    "username": username,
-                    "name": host_name,
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "status": "FAILED",
-                    "error": "Textarea not found",
-                    "proof_screenshot": str(error_screenshot),
-                    "error_html": str(error_html),
-                })
-                return False
-
-            # Ввод текста
-            # Runtime-санитизация текста перед вводом
+            # Runtime-санитизация текста перед вводом (берем актуальный текст из очереди)
             try:
                 if QUEUE_FILE.exists():
                     with open(QUEUE_FILE, "r", encoding="utf-8") as f_q:
@@ -790,121 +1080,59 @@ class AutoSender:
             except Exception:
                 pass
             message = sanitize_before_send(message)
+            if not message.strip():
+                return self._fail_attempt(page, username, host_name, "Пустой текст сообщения в очереди", error_screenshot, error_html)
+
             self.human_type(textarea, message)
-            log_step("INPUT", f"Даты {arrival_date} – {departure_date} установлены, текст введен (символов: {len(message)})")
+            log_step("INPUT", f"Даты {arrival_date} – {departure_date}, текст введен (символов: {len(message)})")
             time.sleep(random.uniform(1.0, 2.0))
 
             # 6. Скриншот заполненной формы ПЕРЕД отправкой
             page.screenshot(path=str(before_screenshot))
             log_step("SCREENSHOT", f"Скриншот заполненной формы: {before_screenshot}")
 
-            # 7. Поиск кнопки отправки и логирование селектора
-            send_selectors = [
-                "button[data-testid='send-request-button']",
-                "button:has-text('Send Request')",
-                "button:has-text('Send request')",
-                "button:has-text('Отправить запрос')",
-                "button:has-text('Send')",
-                "button[type='submit']",
-            ]
+            # 7. Кнопка отправки: ждем до 15 сек
+            send_locator = page.locator(self.SEND_BUTTON_SELECTOR).first
+            try:
+                send_locator.wait_for(state="visible", timeout=15000)
+            except Exception:
+                return self._fail_attempt(
+                    page, username, host_name,
+                    "Кнопка 'Send Request' не появилась за 15 сек",
+                    error_screenshot, error_html,
+                )
 
-            found_selector = None
-            send_btn = None
-            for sel in send_selectors:
-                el = page.query_selector(sel)
-                if el and el.is_visible():
-                    found_selector = sel
-                    send_btn = el
-                    break
-
-            if not send_btn:
-                # Проверяем, возможно запрос уже отправлен и кнопка скрыта
-                page_text_lower = page.content().lower()
-                already_sent_triggers = [
-                    "awaiting response", "pending stay", "you sent a request",
-                    "this user needs to accept your request before you can send another message",
-                    "view request", "cancel request", "couch request sent",
-                    "request sent", "your stay request"
-                ]
-                is_already = any(trig in page_text_lower for trig in already_sent_triggers)
-                if is_already:
-                    log_step("SKIP", f"[SKIP] Запрос хосту @{username} уже отправлен ранее (кнопка отправки отсутствует, диалог открыт). Перемещен в Sent Requests.")
-                    self.update_queue_status(username, "Sent", notes="Detected as already sent on Couchsurfing (Active dialogue detected)", sent_at="2026-11-01T00:00:00")
-                    self.append_sent_log({
-                        "id": username,
-                        "username": username,
-                        "name": host_name,
-                        "target_city": target_city,
-                        "arrival_date": arrival_date,
-                        "departure_date": departure_date,
-                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "status": "ALREADY_SENT",
-                        "mode": "skipped",
-                        "notes": "Detected as already sent on Couchsurfing (No send button / Active dialogue)",
-                    })
-                    return "ALREADY_SENT"
-
-                log_step("ERROR", f"Кнопка отправки ('Send Request') не найдена на странице {username}!")
-                page.screenshot(path=str(error_screenshot))
-                error_html.write_text(page.content(), encoding="utf-8")
-                self.append_sent_log({
-                    "id": username,
-                    "username": username,
-                    "name": host_name,
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "status": "FAILED",
-                    "error": "Send button not found",
-                    "proof_screenshot": str(error_screenshot),
-                    "error_html": str(error_html),
-                })
-                return False
-
+            send_btn = send_locator
+            found_selector = "Send Request button"
+            btn_text = (send_btn.inner_text() or "").strip()
             btn_disabled = send_btn.is_disabled()
-            btn_text = send_btn.inner_text().strip()
-            log_step("BUTTON", f"Найдена кнопка: selector='{found_selector}', text='{btn_text}', disabled={btn_disabled}")
+            log_step("BUTTON", f"Найдена кнопка: text='{btn_text}', disabled={btn_disabled}")
 
             if btn_disabled:
-                log_step("ERROR", f"Кнопка отправки неактивна (disabled) для {username}!")
-                page.screenshot(path=str(error_screenshot))
-                error_html.write_text(page.content(), encoding="utf-8")
-                self.append_sent_log({
-                    "id": username,
-                    "username": username,
-                    "name": host_name,
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "status": "FAILED",
-                    "error": "Send button is disabled",
-                    "proof_screenshot": str(error_screenshot),
-                    "error_html": str(error_html),
-                })
-                return False
+                return self._fail_attempt(
+                    page, username, host_name,
+                    "Кнопка 'Send Request' неактивна (disabled)",
+                    error_screenshot, error_html,
+                )
 
-            # 8. РЕЖИМ DRY-RUN
+            # 8. РЕЖИМ DRY-RUN — без клика
             if self.dry_run:
-                log_step("DRY-RUN", f"Симуляция успешна: форма заполнена, кнопка верифицирована. Клик не производился.")
-                self.append_sent_log({
-                    "id": username,
-                    "username": username,
-                    "name": host_name,
-                    "target_city": target_city,
-                    "arrival_date": arrival_date,
-                    "departure_date": departure_date,
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "status": "DRY_RUN_SUCCESS",
-                    "http_status": None,
-                    "mode": "dry_run",
-                    "proof_screenshot": str(before_screenshot),
-                    "before_screenshot": str(before_screenshot),
-                    "button_selector": found_selector,
-                    "notes": "Form verified and filled in dry-run mode. Send button was not clicked.",
-                })
-                self.update_queue_status(username, "Sent (Dry-Run)")
+                log_step("DRY-RUN", "Симуляция успешна: форма заполнена, кнопка верифицирована. Клик не производился.")
+                self._record_dry_run_success(
+                    username=username,
+                    host_name=host_name,
+                    target_city=target_city,
+                    arrival_date=arrival_date,
+                    departure_date=departure_date,
+                    before_screenshot=before_screenshot,
+                    found_selector=found_selector,
+                )
                 return True
 
             # 9. БОЕВОЙ РЕЖИМ: Очистка буфера ответов, клик и строгая верификация
             api_responses.clear()
-            log_step("CLICK", f"Кнопка отправки нажата (селектор: {found_selector})")
             send_btn.click()
+            log_step("CLICK", f"Кнопка отправки нажата ('{btn_text}')")
 
             # Ожидание подтверждения: только реальный сетевой ответ или подтвержденный переход в чат
             start_wait = time.time()
@@ -1010,6 +1238,33 @@ class AutoSender:
             })
             return False
 
+    def compute_human_delay(self, idx: int, res_is_error: bool, delays_schedule: List[float]) -> int:
+        """
+        Единая точка расчёта паузы перед следующей попыткой.
+        Human Jitter применяется и после успешной отправки, и после ошибки формы/сети.
+        """
+        if self.test_mode:
+            return random.randint(6, 12)
+
+        if self.interval_seconds:
+            base = max(10, int(self.interval_seconds))
+            return max(10, int(base * random.uniform(0.9, 1.1)))
+
+        if not res_is_error and delays_schedule and 0 <= idx - 1 < len(delays_schedule):
+            sleep_seconds = int(delays_schedule[idx - 1])
+        elif self.jitter_enabled and self.max_interval_minutes > self.min_interval_minutes:
+            sleep_seconds = random.randint(
+                self.min_interval_minutes * 60,
+                self.max_interval_minutes * 60,
+            )
+        else:
+            sleep_seconds = self.min_interval_minutes * 60
+
+        # Жёсткий минимум Human Jitter между реальными попытками.
+        if sleep_seconds < 300:
+            sleep_seconds = random.randint(300, 600)
+        return int(sleep_seconds)
+
     def check_emergency_stop(self) -> bool:
         """Проверяет глобальный флаг экстренной остановки из базы данных."""
         try:
@@ -1021,6 +1276,25 @@ class AutoSender:
                 return bool(row and row[0] == "1")
         except Exception:
             return False
+
+    def _select_candidates(self, queue: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Отбирает кандидатов к отправке из очереди.
+
+        СТРОГОЕ ПРАВИЛО: только со статусом 'Approved'.
+        - Без --target: все записи со статусом 'Approved'.
+        - С --target: запись с данным username, только если статус 'Approved'
+          (статус 'Sent' автоматически исключается, т.к. Approved != Sent).
+        Draft, Skipped, Failed, Queued и прочие статусы НЕ попадают в список.
+        """
+        if self.target_username:
+            target_norm = self.target_username.strip().lower()
+            return [
+                x for x in queue
+                if str(x.get("username", "")).strip().lower() == target_norm
+                and x.get("status") == "Approved"
+            ]
+        return [x for x in queue if x.get("status") == "Approved"]
 
     def run(self) -> None:
         """Основной цикл работы автопилота с поддержкой лимитов и интервалов."""
@@ -1064,39 +1338,57 @@ class AutoSender:
         with open(QUEUE_FILE, "r", encoding="utf-8") as f:
             queue = json.load(f)
 
+        # Предварительная проверка для --target: различаем "не найдено в очереди"
+        # и "найдено, но статус не Approved". Обе ситуации завершаются ДО запуска
+        # браузера (sync_playwright не вызывается, отправка не производится).
         if self.target_username:
             target_norm = self.target_username.strip().lower()
-            candidates = [x for x in queue if x.get("username") == self.target_username]
-            if not candidates:
+            target_record = next(
+                (x for x in queue if str(x.get("username", "")).strip().lower() == target_norm),
+                None,
+            )
+            if target_record is None:
                 log_step("WARN", f"Хост '{self.target_username}' не найден в очереди.")
                 return
-        else:
-            # СТРОГОЕ ПРАВИЛО: отправляем ТОЛЬКО Approved или Queued. Никаких случайных отправок Draft!
-            candidates = [x for x in queue if x.get("status") in ("Approved", "Queued")]
-            if not candidates:
-                log_step("INFO", "В очереди нет хостов со статусом 'Approved' или 'Queued'. Автоматическая отправка черновиков ('Draft') строго заблокирована!")
-                self.update_autopilot_status(
-                    is_running=False,
-                    is_paused=False,
-                    current_host=None,
-                    seconds_remaining=0,
-                    last_status="Нет одобренных хостов к отправке",
+            current_status = target_record.get("status")
+            if current_status != "Approved":
+                log_step(
+                    "WARN",
+                    f"Хост '{self.target_username}' имеет статус '{current_status}', ожидается 'Approved'. Отправка отменена.",
                 )
                 return
+
+        candidates = self._select_candidates(queue)
+
+        if not candidates:
+            log_step("INFO", "В очереди нет хостов со статусом 'Approved'. Отправка черновиков ('Draft', 'Skipped' и др.) строго заблокирована — ничего не отправляется.")
+            self.update_autopilot_status(
+                is_running=False,
+                is_paused=False,
+                current_host=None,
+                seconds_remaining=0,
+                last_status="Нет одобренных хостов к отправке",
+            )
+            return
+
+        # Защита от зацикливания на одном проблемном хосте:
+        # сортируем по попыткам (attempts ASC) и времени последнего обновления (updated_at ASC),
+        # чтобы хост с ошибкой формы уходил в конец очереди, а автопилот переходил к следующему.
+        candidates.sort(key=lambda x: (int(x.get("attempts") or 0), x.get("updated_at") or ""))
 
         if self.max_requests and len(candidates) > self.max_requests:
             candidates = candidates[:self.max_requests]
 
         log_step("QUEUE", f"Отобрано кандидатов к отправке: {len(candidates)}")
 
-        # Вычисление графика рандомизированных пауз при заданном периоде времени
+        # Пауза между кандидатами ВСЕГДА строго в диапазоне
+        # --min-interval-minutes .. --max-interval-minutes (300–600 сек по умолчанию).
+        # Конфликтующий --period-minutes (генерировал 35-sek интервалы) больше не используется.
         delays_schedule: List[float] = []
-        if self.period_minutes and len(candidates) > 1:
-            delays_schedule = compute_randomized_delays(len(candidates), self.period_minutes)
-            delays_repr = [f"{int(s//60)}m {int(s%60)}s" for s in delays_schedule]
-            log_step("SCHEDULE", f"Сгенерирован рандомизированный график пауз: {delays_repr}")
+        self.period_minutes = None
 
         processed_this_run = 0
+        consecutive_failures = 0
 
         # 3. Инициализация Playwright
         with sync_playwright() as p:
@@ -1168,6 +1460,21 @@ class AutoSender:
 
                 processed_this_run += 1
 
+                # Учет подряд идущих ошибок формы: 3 ошибки подряд -> остановка (что-то сломалось на сайте)
+                if res is True or res == "ALREADY_SENT":
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+                    if consecutive_failures >= 3:
+                        log_step("HALT", f"[HALT] {consecutive_failures} ошибки формы подряд. Диспетчер остановлен — проверьте скриншоты в output/debug/.")
+                        self.update_autopilot_status(
+                            is_running=False,
+                            is_paused=False,
+                            current_host=None,
+                            last_status=f"Остановлен: {consecutive_failures} ошибки подряд (см. Live Logs)",
+                        )
+                        break
+
                 # Проверка лимита на запуск (--max-requests)
                 if self.max_requests and processed_this_run >= self.max_requests:
                     log_step("FINISH", f"Достигнут лимит запросов на запуск (--max-requests {self.max_requests}). Завершение.")
@@ -1187,26 +1494,27 @@ class AutoSender:
 
                 # Обязательная пауза перед следующим кандидатом (никогда не пропускается!)
                 if idx < len(candidates) and self.is_running:
-                    if res is True or res == "SENT_SUCCESS":
-                        # УСПЕШНАЯ ОТПРАВКА -> ОБЯЗАТЕЛЬНЫЙ HUMAN JITTER (5-10 мин; в test mode 6-12 сек)
-                        if self.test_mode:
-                            sleep_seconds = random.randint(6, 12)
-                        elif self.jitter_enabled and self.max_interval_minutes > self.min_interval_minutes:
-                            sleep_seconds = random.randint(
-                                self.min_interval_minutes * 60,
-                                self.max_interval_minutes * 60
-                            )
-                        else:
-                            sleep_seconds = self.min_interval_minutes * 60
+                    if res is not True and res != "SENT_SUCCESS" and res != "ALREADY_SENT":
+                        # ОШИБКА ФОРМЫ -> тоже полноценный Human Jitter (никаких быстрых повторов)
+                        res_is_error = True
+                    else:
+                        res_is_error = False
+
+                    if res is True or res == "SENT_SUCCESS" or res_is_error:
+                        # УСПЕШНАЯ ОТПРАВКА / ОШИБКА -> ОБЯЗАТЕЛЬНЫЙ HUMAN JITTER (5-10 мин; в test mode 6-12 сек)
+                        sleep_seconds = self.compute_human_delay(idx, res_is_error, delays_schedule)
 
                         mins = int(sleep_seconds // 60)
                         secs = int(sleep_seconds % 60)
                         pause_type = "🎲 Human Jitter"
                         status_msg = f"Ожидание перед следующим запросом ({int(sleep_seconds)} сек)"
-                        log_step("SLEEP", f"Ожидание {int(sleep_seconds)} сек ({mins} мин {secs} сек) ({pause_type}) до следующего запроса...")
+                        if res_is_error:
+                            log_step("SLEEP", f"@{username} НЕ отправлен (ошибка формы/сети, возвращён в очередь Queued). Пауза {int(sleep_seconds)} сек ({mins} мин {secs} сек) ({pause_type})...")
+                        else:
+                            log_step("SLEEP", f"Ожидание {int(sleep_seconds)} сек ({mins} мин {secs} сек) ({pause_type}) до следующего запроса...")
 
                     else:
-                        # ПРОПУСК / ALREADY_SENT / ОШИБКА -> БЕЗОПАСНАЯ КОРОТКАЯ ПАУЗА (30-60 сек; в test mode 4-8 сек)
+                        # ALREADY_SENT (подтверждено видимым текстом) -> короткая безопасная пауза (30-60 сек)
                         if self.test_mode:
                             sleep_seconds = random.randint(4, 8)
                         else:
@@ -1275,6 +1583,130 @@ class AutoSender:
         log_step("DONE", "Работа автопилота полностью завершена.")
 
 
+_SINGLETON_LOCK_HANDLE = None
+
+
+def _read_lock_pid(lock_file: Path) -> int:
+    try:
+        return int(lock_file.read_text().strip() or 0)
+    except Exception:
+        return 0
+
+
+def _is_auto_sender_process(pid: int) -> bool:
+    """Не убиваем чужой процесс, если PID успел переиспользоваться."""
+    try:
+        import subprocess as _sp
+        cmdline = _sp.run(["ps", "-p", str(pid), "-o", "command="],
+                          capture_output=True, text=True).stdout
+        return "auto_sender" in cmdline
+    except Exception:
+        return False
+
+
+def _terminate_old_dispatcher(pid: int) -> None:
+    """SIGTERM -> ожидание -> SIGKILL для старого экземпляра автопилота."""
+    import signal
+
+    if not pid or pid == os.getpid() or not _is_auto_sender_process(pid):
+        return
+    log_step("SINGLETON", f"Найден старый экземпляр диспетчера (PID {pid}) — отменяем его перед запуском нового.")
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return
+        time.sleep(0.2)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def acquire_singleton_lock() -> None:
+    """
+    Singleton диспетчера: одновременно работает строго ОДИН процесс auto_sender.
+
+    На Unix используем flock (атомарно, без гонки TOCTOU): если старый процесс держит
+    блокировку — мягко завершаем его и забираем блокировку себе. PID-файл нужен только
+    для диагностики и адресной остановки. Если взять блокировку не удалось — процесс
+    НЕ стартует (защита от двух параллельных циклов, ломающих таймер).
+    """
+    import atexit
+    import signal
+
+    global _SINGLETON_LOCK_HANDLE
+
+    lock_file = OUTPUT_DIR / "auto_sender.pid"
+    guard_file = OUTPUT_DIR / "auto_sender.lock"
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    my_pid = os.getpid()
+
+    try:
+        import fcntl  # type: ignore
+    except ImportError:
+        fcntl = None
+
+    if fcntl is not None:
+        guard = open(guard_file, "a+")
+        acquired = False
+        for _ in range(24):  # до ~6 секунд: даём старому процессу завершиться
+            try:
+                fcntl.flock(guard.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError:
+                old_pid = _read_lock_pid(lock_file)
+                if old_pid and old_pid != my_pid:
+                    _terminate_old_dispatcher(old_pid)
+                else:
+                    time.sleep(0.25)
+        if not acquired:
+            try:
+                guard.close()
+            except Exception:
+                pass
+            raise RuntimeError(
+                "Не удалось получить singleton-блокировку auto_sender: уже работает другой экземпляр диспетчера."
+            )
+        _SINGLETON_LOCK_HANDLE = guard
+    else:
+        # Windows/без fcntl: прежняя PID-проверка.
+        old_pid = _read_lock_pid(lock_file)
+        _terminate_old_dispatcher(old_pid)
+
+    lock_file.write_text(str(my_pid))
+
+    def _release():
+        global _SINGLETON_LOCK_HANDLE
+        try:
+            if lock_file.exists() and lock_file.read_text().strip() == str(my_pid):
+                lock_file.unlink()
+        except Exception:
+            pass
+        if _SINGLETON_LOCK_HANDLE is not None:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(_SINGLETON_LOCK_HANDLE.fileno(), fcntl.LOCK_UN)
+                _SINGLETON_LOCK_HANDLE.close()
+            except Exception:
+                pass
+            _SINGLETON_LOCK_HANDLE = None
+
+    atexit.register(_release)
+
+    def _on_term(signum, frame):
+        _release()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _on_term)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Фоновый автопилот отправки запросов Couchsurfing")
     parser.add_argument("--daily-limit", type=int, default=DEFAULT_DAILY_LIMIT, help="Суточный лимит (по умолчанию 100)")
@@ -1294,6 +1726,8 @@ def main():
     parser.add_argument("--test-mode", action="store_true", help="Быстрый тестовый режим пауз (секунды вместо минут)")
 
     args = parser.parse_args()
+
+    acquire_singleton_lock()
 
     sender = AutoSender(
         daily_limit=args.daily_limit,

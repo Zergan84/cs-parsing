@@ -613,6 +613,26 @@
       cursor: pointer;
     }
 
+    /* Search date inputs: vertical stack, no overlap */
+    .search-date-grid {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      width: 100%;
+    }
+    .date-field {
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .search-date-input {
+      width: 100%;
+      min-width: 0;
+      height: 36px;
+      box-sizing: border-box;
+    }
+
     .filter-checkbox-item {
       display: flex;
       align-items: center;
@@ -1463,6 +1483,72 @@
       background: var(--amber-bg);
       border-color: var(--amber-border);
       color: var(--amber-400);
+    }
+
+    /* Trip cards in SEARCH TARGET */
+    .trip-card-btn {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px;
+      background: var(--ink-850);
+      border: 1px solid var(--ink-700);
+      border-radius: 8px;
+      cursor: pointer;
+      text-align: left;
+      width: 100%;
+      transition: all 0.15s ease;
+      font-family: inherit;
+    }
+    .trip-card-btn:hover {
+      border-color: var(--amber-500);
+      background: var(--ink-800);
+    }
+    .trip-card-btn:active {
+      transform: scale(0.98);
+    }
+    .trip-card-btn.selected {
+      border-color: var(--amber-500);
+      box-shadow: 0 0 0 1px var(--amber-500) inset;
+    }
+
+    /* City filter pills next to Queue All */
+    .city-filter-pills {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .city-pill {
+      background: var(--ink-800);
+      border: 1px solid var(--ink-600);
+      color: var(--ink-300);
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      user-select: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .city-pill:hover {
+      background: var(--ink-700);
+      color: var(--ink-100);
+      border-color: var(--ink-500);
+    }
+    .city-pill.active {
+      background: var(--amber-500);
+      border-color: var(--amber-500);
+      color: #0A0C10;
+    }
+    .city-pill.active:hover {
+      background: var(--amber-400);
+    }
+    .city-pill-count {
+      font-weight: 500;
+      opacity: 0.9;
     }
 
     /* Queue Date Manager Bar */
@@ -3437,28 +3523,43 @@
         <aside class="control-sidebar">
           <div>
             <p class="sidebar-section-title">SEARCH TARGET</p>
+
+            <!-- Trip List Controls -->
             <div class="form-group">
-              <label class="form-label">City / Location</label>
-              <input type="text" class="form-input" id="search-city" value="Tokyo, Japan" placeholder="City name">
+              <button type="button" class="btn btn-primary btn-lg" id="btn-load-trips" onclick="loadTrips()" style="width: 100%;">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><path d="M12 3v12"/><path d="M3 12h18"/></svg>
+                🔄 Загрузить трипы из /c/trips
+              </button>
+              <button type="button" class="btn btn-danger btn-md" id="btn-erase-all" onclick="eraseAllSearch()" style="width: 100%; margin-top: 8px;">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H6c-1 0-2-1-2-2V6"/><path d="M19 4v1c0 1-1 2-2 2H6c-1 0-2-1-2-2V4"/><path d="M19 16v1c0 1-1 2-2 2H6c-1 0-2-1-2-2v-1"/></svg>
+                🗑️ Erase All
+              </button>
             </div>
 
-            <!-- Stay Request Dates & Quick Presets -->
-            <div class="form-group" style="width: 100%; max-width: 100%; box-sizing: border-box;">
-              <div style="display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; width: 100%; max-width: 100%; box-sizing: border-box;">
-                <div style="min-width: 0;">
-                  <label class="form-label" for="search-checkin">Check-in Date</label>
-                  <input type="date" class="form-input tabular-nums" id="search-checkin" value="2026-11-16" style="width: 100% !important; min-width: 0 !important; max-width: 100% !important; box-sizing: border-box !important;">
-                </div>
-                <div style="min-width: 0;">
-                  <label class="form-label" for="search-checkout">Check-out Date</label>
-                  <input type="date" class="form-input tabular-nums" id="search-checkout" value="2026-11-19" style="width: 100% !important; min-width: 0 !important; max-width: 100% !important; box-sizing: border-box !important;">
+            <!-- Trip Cards Container -->
+            <div class="form-group" style="margin-bottom: 0;">
+              <label class="form-label">Мои предстоящие трипы (кликните для парсинга хостов)</label>
+              <div id="trips-list" style="display: flex; flex-direction: column; gap: 8px; max-height: 400px; overflow-y: auto; padding: 10px; background: var(--ink-900); border: 1px solid var(--ink-700); border-radius: 8px;">
+                <div style="text-align: center; color: var(--ink-400); font-size: 12px; padding: 20px;">
+                  Нажмите "Загрузить трипы" чтобы увидеть карточки поездок
                 </div>
               </div>
-              <div class="search-date-presets" style="display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px;">
-                <button type="button" class="preset-pill-badge active" onclick="applySearchPreset('Tokyo', '2026-11-16', '2026-11-19', this)">Tokyo: 16–19 Nov</button>
-                <button type="button" class="preset-pill-badge" onclick="applySearchPreset('Kyoto', '2026-11-19', '2026-11-22', this)">Kyoto: 19–22 Nov</button>
-                <button type="button" class="preset-pill-badge" onclick="applySearchPreset('Sapporo', '2026-11-22', '2026-11-24', this)">Sapporo: 22–24 Nov</button>
+            </div>
+
+            <!-- Trip Dates (заполняются кликом по карточке трипа) -->
+            <div class="form-group">
+              <label class="form-label">Trip Dates</label>
+              <div style="display: flex; flex-direction: column; gap: 8px;">
+                <label style="font-size: 11px; color: var(--ink-400); display: flex; flex-direction: column; gap: 4px;">
+                  Check-in
+                  <input type="date" class="form-input" id="search-checkin">
+                </label>
+                <label style="font-size: 11px; color: var(--ink-400); display: flex; flex-direction: column; gap: 4px;">
+                  Check-out
+                  <input type="date" class="form-input" id="search-checkout">
+                </label>
               </div>
+              <div id="selected-trip-label" style="font-size: 11px; color: var(--amber-400); margin-top: 6px;"></div>
             </div>
 
             <div class="form-group">
@@ -3500,9 +3601,9 @@
           </div>
 
           <div class="sidebar-actions">
-            <button type="button" class="btn btn-primary btn-lg" id="btn-start-scraping" onclick="startScraping()">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="m9 12-4.5 4.5"/><path d="M4 20l4-4"/></svg>
-              <span id="btn-scrape-text">Start Scraping</span>
+            <button type="button" class="btn btn-danger btn-md" id="btn-stop-scraping" onclick="stopScraper()" style="display:none;">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="6" height="6"/></svg>
+              <span id="btn-stop-text">Stop Scraper</span>
             </button>
 
             <button type="button" class="btn btn-secondary btn-md" id="btn-deep-filter" onclick="startDeepFilter()">
@@ -3529,6 +3630,14 @@
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
                 <span id="btn-queue-all-text">⚡ Queue All (0)</span>
               </button>
+
+              <!-- City filter pills -->
+              <div class="city-filter-pills">
+                <button type="button" class="city-pill active" id="city-pill-all" onclick="setCityFilter('all', this)">📍 All <span class="city-pill-count" id="city-count-all"></span></button>
+                <button type="button" class="city-pill" id="city-pill-tokyo" onclick="setCityFilter('tokyo', this)">🗼 Tokyo <span class="city-pill-count" id="city-count-tokyo"></span></button>
+                <button type="button" class="city-pill" id="city-pill-kyoto" onclick="setCityFilter('kyoto', this)">⛩️ Kyoto <span class="city-pill-count" id="city-count-kyoto"></span></button>
+                <button type="button" class="city-pill" id="city-pill-sapporo" onclick="setCityFilter('sapporo', this)">❄️ Sapporo <span class="city-pill-count" id="city-count-sapporo"></span></button>
+              </div>
             </div>
           </div>
 
@@ -4068,8 +4177,12 @@
     let queueFilter = 'pending';
     let isEmergencyStopped = false;
     let isScrapingRunning = false;
+    let wasScrapingRunning = false;
     let autopilotData = {};
     let currentSort = { column: 'rating', order: 'desc' };
+    let cityFilter = 'all';
+    let selectedHostCity = null; // Город для отображения хостов (из выбранного трипа)
+    let tripsData = []; // Список загруженных трипов (для поиска города по URL)
 
     let activeAnchors = [
       "Mountain Trekking", "Cinema Nights", "Tech Meetups", 
@@ -4104,7 +4217,7 @@
       window.scrollTo({ top: 0, behavior: 'instant' });
 
       if (tabId === 'queue') loadQueue();
-      if (tabId === 'search' && hostsData.length === 0) loadHosts();
+      if (tabId === 'search') loadHosts();
       if (tabId === 'autopilot') loadAutopilot();
       if (tabId === 'inbox') loadInbox();
       if (tabId === 'context') loadContext();
@@ -4124,15 +4237,18 @@
 
         // Process status
         isScrapingRunning = !!data.is_running;
-        const scrapeBtn = document.getElementById('btn-start-scraping');
-        const scrapeText = document.getElementById('btn-scrape-text');
-        if (scrapeBtn && scrapeText) {
+        if (wasScrapingRunning && !isScrapingRunning) {
+          // Парсинг завершился — подтягиваем хосты выбранного трипа
+          console.log('[UI] Scraper finished — reloading hosts for', selectedHostCity || 'default city');
+          loadHosts();
+        }
+        wasScrapingRunning = isScrapingRunning;
+        const stopBtn = document.getElementById('btn-stop-scraping');
+        if (stopBtn) {
           if (isScrapingRunning) {
-            scrapeBtn.disabled = true;
-            scrapeText.textContent = "Scanning Profiles...";
+            stopBtn.style.display = 'inline-flex';
           } else {
-            scrapeBtn.disabled = false;
-            scrapeText.textContent = "Start Scraping";
+            stopBtn.style.display = 'none';
           }
         }
 
@@ -4319,7 +4435,7 @@
         const res = await fetch('/api/requests/queue_all', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ usernames: usernames })
+          body: JSON.stringify({ usernames: usernames, city: selectedHostCity || undefined })
         });
         const data = await res.json();
 
@@ -4377,7 +4493,8 @@
 
         queuedUsernames = new Set(queueData.map(q => (q.username || '').toLowerCase()));
 
-        const res = await fetch('/api/hosts?curated=true&hide_sent=true');
+        const cityParam = selectedHostCity ? `&city=${encodeURIComponent(selectedHostCity)}` : '';
+        const res = await fetch(`/api/hosts?curated=true&hide_sent=true${cityParam}`);
         if (!res.ok) throw new Error("Failed to fetch hosts");
         const data = await res.json();
         hostsData = Array.isArray(data) ? data : [];
@@ -4394,7 +4511,13 @@
       const subbarCount = document.getElementById('subbar-count');
       if (!tbody && !mobileContainer) return;
 
-      const list = sortHostsData(hostsData);
+      updateCityPillCounts();
+
+      let list = hostsData;
+      if (cityFilter !== 'all') {
+        list = hostsData.filter(h => getCityKey(h.location) === cityFilter);
+      }
+      list = sortHostsData(list);
       if (subbarCount) subbarCount.textContent = list.length + " profiles";
 
       if (list.length === 0) {
@@ -4574,7 +4697,7 @@
         const res = await fetch('/api/queue/add', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: username })
+          body: JSON.stringify({ username: username, city: selectedHostCity || undefined })
         });
         const data = await res.json();
         if (res.ok) {
@@ -4619,6 +4742,36 @@
           btn.innerHTML = originalHtml;
         }
       }
+    }
+
+    // ---------- City filter pills ----------
+    function getCityKey(location) {
+      if (!location) return 'other';
+      const s = String(location).toLowerCase();
+      if (s.includes('sapporo')) return 'sapporo';
+      if (s.includes('kyoto')) return 'kyoto';
+      if (s.includes('tokyo')) return 'tokyo';
+      return 'other';
+    }
+
+    function updateCityPillCounts() {
+      const counts = { all: 0, tokyo: 0, kyoto: 0, sapporo: 0 };
+      hostsData.forEach(h => {
+        counts.all++;
+        const k = getCityKey(h.location);
+        if (Object.prototype.hasOwnProperty.call(counts, k)) counts[k]++;
+      });
+      ['all', 'tokyo', 'kyoto', 'sapporo'].forEach(c => {
+        const el = document.getElementById('city-count-' + c);
+        if (el) el.textContent = ' (' + counts[c] + ')';
+      });
+    }
+
+    function setCityFilter(city, el) {
+      cityFilter = city;
+      document.querySelectorAll('.city-pill').forEach(b => b.classList.remove('active'));
+      if (el) el.classList.add('active');
+      renderHostsTable();
     }
 
     function applySearchPreset(city, inDate, outDate, el) {
@@ -4670,6 +4823,191 @@
       }
     }
 
+    async function stopScraper() {
+      try {
+        const res = await fetch('/api/scraper/stop', { method: 'POST' });
+        const data = await res.json();
+        if (data.error) {
+          alert(data.error);
+        } else {
+          // Immediately reflect stopped state in UI
+          const stopBtn = document.getElementById('btn-stop-scraping');
+          if (stopBtn) stopBtn.style.display = 'none';
+          checkGlobalStatus();
+          switchTab('logs');
+        }
+      } catch (e) {
+        alert("Failed to stop scraper: " + e.message);
+      }
+    }
+
+    async function loadTrips() {
+      const btn = document.getElementById('btn-load-trips');
+      const tripsList = document.getElementById('trips-list');
+      const originalText = btn.innerHTML;
+      btn.disabled = true;
+      btn.innerHTML = '<span style="display:inline-block;width:14px;height:14px;border:2px solid #F59E0B;border-top-color:transparent;border-radius:50%;animation:spin 0.6s linear infinite;margin-right:6px;"></span>Загрузка трипов...';
+
+      try {
+        const res = await fetch('/api/trips/list');
+        const data = await res.json();
+        if (data.error) {
+          alert(data.error);
+          tripsList.innerHTML = `<div style="text-align: center; color: var(--ink-400); font-size: 12px; padding: 20px;">Ошибка: ${data.error}</div>`;
+        } else {
+          const trips = data.trips || [];
+          tripsData = trips; // Сохраняем для поиска города по URL
+          if (trips.length === 0) {
+            tripsList.innerHTML = `<div style="text-align: center; color: var(--ink-400); font-size: 12px; padding: 20px;">Предстоящие трипы не найдены. Создайте поездку на Couchsurfing.</div>`;
+          } else {
+            let html = '';
+            trips.forEach(trip => {
+              const city = trip.city || 'Неизвестно';
+              const url = trip.url || '';
+              const arrival = trip.arrival_date || '';
+              const departure = trip.departure_date || '';
+              const datesText = trip.dates_text || (arrival && departure ? `${arrival} – ${departure}` : (arrival || departure || ''));
+              const rawText = (trip.raw_text || '').replace(/\n/g, ' ');
+              html += `
+                <button type="button" class="trip-card-btn"
+                  data-trip-url="${escapeHtml(url)}"
+                  data-trip-city="${escapeHtml(city)}"
+                  data-check-in="${escapeHtml(arrival)}"
+                  data-check-out="${escapeHtml(departure)}"
+                  data-dates-text="${escapeHtml(datesText)}"
+                  onclick="startScrapingFromTrip(this)" style="
+                  display: flex;
+                  flex-direction: column;
+                  gap: 6px;
+                  padding: 12px;
+                  background: var(--ink-850);
+                  border: 1px solid var(--ink-700);
+                  border-radius: 8px;
+                  cursor: pointer;
+                  text-align: left;
+                  width: 100%;
+                  transition: all 0.15s ease;
+                " onmouseover="this.style.borderColor='var(--amber-500)'" onmouseout="this.style.borderColor='var(--ink-700)'">
+                  <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 8px;">
+                    <div style="font-weight: 600; color: var(--ink-100); font-size: 15px;">${escapeHtml(city)}</div>
+                    ${datesText ? `<div style="font-size: 12px; color: var(--amber-400); font-weight: 600; background: rgba(245, 158, 11, 0.1); padding: 2px 6px; border-radius: 4px; white-space: nowrap;">${escapeHtml(datesText)}</div>` : ''}
+                  </div>
+                  ${rawText ? `<div style="font-size: 11px; color: var(--ink-500); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(rawText)}</div>` : ''}
+                  <div style="font-size: 11px; color: var(--emerald-400); font-weight: 600; margin-top: 4px;">▶ Парсинг хостов этого трипа</div>
+                </button>
+              `;
+            });
+            tripsList.innerHTML = html;
+          }
+        }
+      } catch (e) {
+        alert("Failed to load trips: " + e.message);
+        tripsList.innerHTML = `<div style="text-align: center; color: var(--ink-400); font-size: 12px; padding: 20px;">Ошибка загрузки трипов</div>`;
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = originalText;
+      }
+    }
+
+    async function eraseAllSearch() {
+      if (!confirm("Удалить все данные поиска? Это очистит таблицу хостов, статистику и кэш раздела Searching.")) {
+        return;
+      }
+      try {
+        const res = await fetch('/api/search/erase-all', { method: 'POST' });
+        const data = await res.json();
+        if (data.error) {
+          alert(data.error);
+        } else {
+          alert(data.message || "Все данные поиска удалены");
+          // Clear the hosts table
+          const tbody = document.getElementById('hosts-table-body');
+          if (tbody) tbody.innerHTML = '';
+          const mobileContainer = document.getElementById('mobile-host-cards');
+          if (mobileContainer) mobileContainer.innerHTML = '';
+          const subbarCount = document.getElementById('subbar-count');
+          if (subbarCount) subbarCount.textContent = "0 profiles";
+          // Clear trips list too
+          const tripsList = document.getElementById('trips-list');
+          if (tripsList) tripsList.innerHTML = `<div style="text-align: center; color: var(--ink-400); font-size: 12px; padding: 20px;">Нажмите "Загрузить трипы" чтобы увидеть карточки поездок</div>`;
+          checkGlobalStatus();
+        }
+      } catch (e) {
+        alert("Failed to erase search data: " + e.message);
+      }
+    }
+
+    async function startScrapingFromTrip(cardEl) {
+      // Читаем точные данные прямо из DOM карточки трипа
+      const tripUrl = (cardEl && cardEl.dataset && cardEl.dataset.tripUrl) || '';
+      const tripCity = (cardEl && cardEl.dataset && cardEl.dataset.tripCity) || '';
+      const tripArrival = (cardEl && cardEl.dataset && cardEl.dataset.checkIn) || '';
+      const tripDeparture = (cardEl && cardEl.dataset && cardEl.dataset.checkOut) || '';
+      const datesText = (cardEl && cardEl.dataset && cardEl.dataset.datesText) || '';
+
+      if (!tripUrl) {
+        alert('Не удалось определить URL выбранного трипа.');
+        return;
+      }
+
+      const gender = document.getElementById('search-gender').value || "Any";
+      const steps = parseInt(document.getElementById('search-steps').value, 10) || 500;
+      const noCouples = document.getElementById('filter-no-couples').checked;
+      const noLgbtq = document.getElementById('filter-no-lgbtq').checked;
+      const headless = document.getElementById('filter-headless').checked;
+
+      // 1) Заполняем поля дат в левой панели реальными датами трипа
+      const inInput = document.getElementById('search-checkin');
+      const outInput = document.getElementById('search-checkout');
+      if (inInput) inInput.value = tripArrival || '';
+      if (outInput) outInput.value = tripDeparture || '';
+
+      const label = document.getElementById('selected-trip-label');
+      if (label) {
+        const shownDates = datesText || [tripArrival, tripDeparture].filter(Boolean).join(' – ');
+        label.textContent = tripCity ? `Выбран: ${tripCity}${shownDates ? ' · ' + shownDates : ''}` : '';
+      }
+
+      // 2) Подсвечиваем выбранную карточку
+      document.querySelectorAll('.trip-card-btn').forEach(b => b.classList.remove('selected'));
+      if (cardEl) cardEl.classList.add('selected');
+
+      // 3) Запоминаем город, чтобы после парсинга показать его хостов
+      if (tripCity && tripCity !== 'Неизвестно') {
+        selectedHostCity = tripCity;
+        const subLoc = document.getElementById('subbar-location');
+        if (subLoc) subLoc.textContent = tripCity;
+        console.log(`[UI] Выбран трип: ${tripCity} | ${tripArrival} – ${tripDeparture} | ${tripUrl}`);
+      }
+
+      try {
+        const res = await fetch('/api/scraper/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            trip_url: tripUrl,
+            city: tripCity || null,
+            gender: gender,
+            pages: steps,
+            headless: headless,
+            no_couples: noCouples,
+            no_lgbtq: noLgbtq,
+            arrival_date: tripArrival || null,
+            departure_date: tripDeparture || null,
+          })
+        });
+        const data = await res.json();
+        if (data.error) {
+          alert(data.error);
+        } else {
+          checkGlobalStatus();
+          switchTab('logs');
+        }
+      } catch (e) {
+        alert("Failed to start scraper from trip: " + e.message);
+      }
+    }
+
     async function startDeepFilter() {
       const badge = document.getElementById('badge-deep-filter');
       if (badge) badge.style.display = badge.style.display === 'none' ? 'inline-flex' : 'none';
@@ -4681,7 +5019,8 @@
           body: JSON.stringify({
             gender: "any",
             allow_couples: !document.getElementById('filter-no-couples').checked,
-            hide_sent: true
+            hide_sent: true,
+            city: selectedHostCity || undefined
           })
         });
         const data = await res.json();
@@ -5656,7 +5995,11 @@
     // ----------------------------------------------------
     // SCREEN 3: AUTOPILOT DISPATCHER
     // ----------------------------------------------------
+    let autopilotLoadInFlight = false;
     async function loadAutopilot() {
+      // Защита от наложения запросов поллинга: старый ответ не должен перезаписывать новый.
+      if (autopilotLoadInFlight) return;
+      autopilotLoadInFlight = true;
       try {
         const res = await fetch('/api/autopilot/status');
         if (!res.ok) return;
@@ -5664,6 +6007,8 @@
         renderAutopilot();
       } catch (e) {
         console.error("Autopilot status error:", e);
+      } finally {
+        autopilotLoadInFlight = false;
       }
     }
 
@@ -5787,14 +6132,34 @@
       }
     }
 
+    // Абсолютный дедлайн обратного отсчета (ms). Секунды считаются от дедлайна, а не декрементом,
+    // поэтому поллинг бэкенда и тикер не конфликтуют и секунды не "прыгают".
+    let countdownDeadlineMs = 0;
+
+    function syncCountdownFromServer(serverRemaining) {
+      const serverRem = Math.max(0, parseInt(serverRemaining, 10) || 0);
+      const localRem = countdownDeadlineMs ? Math.max(0, Math.ceil((countdownDeadlineMs - Date.now()) / 1000)) : -1;
+      // Пересинхронизация только при реальном расхождении (>2 сек) или новом интервале
+      if (localRem < 0 || Math.abs(serverRem - localRem) > 2) {
+        countdownDeadlineMs = Date.now() + serverRem * 1000;
+      }
+      currentSecondsRemaining = Math.max(0, Math.ceil((countdownDeadlineMs - Date.now()) / 1000));
+    }
+
     function startCountdownTicker() {
+      // Строго ОДИН таймер: очищаем и локальный, и глобальный (на случай повторной инициализации скрипта)
       if (countdownInterval) clearInterval(countdownInterval);
+      if (window.__apCountdownInterval) clearInterval(window.__apCountdownInterval);
       countdownInterval = setInterval(() => {
-        if (autopilotActive && !autopilotPaused && currentSecondsRemaining > 0) {
-          currentSecondsRemaining--;
-          updateCountdownDisplay();
+        if (autopilotActive && !autopilotPaused && countdownDeadlineMs) {
+          const rem = Math.max(0, Math.ceil((countdownDeadlineMs - Date.now()) / 1000));
+          if (rem !== currentSecondsRemaining) {
+            currentSecondsRemaining = rem;
+            updateCountdownDisplay();
+          }
         }
-      }, 1000);
+      }, 250);
+      window.__apCountdownInterval = countdownInterval;
     }
 
     let previousSentUsernames = null;
@@ -5820,7 +6185,7 @@
       autopilotPaused = isPaused;
 
       if (autopilotData.seconds_remaining !== undefined && autopilotData.seconds_remaining !== null) {
-        currentSecondsRemaining = Math.max(0, parseInt(autopilotData.seconds_remaining, 10) || 0);
+        syncCountdownFromServer(autopilotData.seconds_remaining);
       }
 
       if (autopilotData.next_delay_seconds) {
@@ -6169,7 +6534,6 @@
             min_interval_minutes: minMinutes,
             max_interval_minutes: maxMinutes,
             jitter_enabled: jitterEnabled,
-            period_minutes: minMinutes,
             interval_seconds: jitterEnabled ? null : (minMinutes * 60),
             delay_min: minMinutes,
             delay_max: maxMinutes,
@@ -6824,10 +7188,14 @@
       startCountdownTicker();
 
       // Poll periodically
-      setInterval(checkGlobalStatus, 4000);
-      setInterval(checkSystemHealth, 15000);
-      setInterval(loadAutopilot, 2500);
-      setInterval(loadInbox, 6000);
+      // Поллинг: защищаемся от двойной инициализации (дублирующие интервалы)
+      (window.__apPollIntervals || []).forEach(id => clearInterval(id));
+      window.__apPollIntervals = [
+        setInterval(checkGlobalStatus, 4000),
+        setInterval(checkSystemHealth, 15000),
+        setInterval(loadAutopilot, 2500),
+        setInterval(loadInbox, 6000),
+      ];
     });
   </script>
 

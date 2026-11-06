@@ -317,23 +317,32 @@ def get_sent_usernames() -> set:
     """
     sent = set()
 
-    # 1. Из SQLite
+    # 1. Из SQLite: ТОЛЬКО реальные успешные отправки.
+    # FAILED / VERIFICATION_REQUIRED / DRY_RUN и ложные "already sent" сюда не попадают.
     try:
         with db_session() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT username, host_id FROM sending_history;")
+            cur.execute("SELECT username, host_id FROM sending_history WHERE UPPER(status) IN ('SENT_SUCCESS', 'SUCCESS');")
             for row in cur.fetchall():
                 if row["username"]:
                     sent.add(str(row["username"]).strip().lower())
                 if row["host_id"]:
                     sent.add(str(row["host_id"]).strip().lower())
             cur.execute("""
-                SELECT sq.host_id, h.username 
+                SELECT sq.host_id, h.username, sq.sent_at, sq.notes
                 FROM sending_queue sq 
                 LEFT JOIN hosts h ON sq.host_id = h.id 
-                WHERE sq.status LIKE 'Sent%';
+                WHERE LOWER(sq.status) IN ('sent', 'declined', 'completed');
             """)
             for row in cur.fetchall():
+                notes = str(row["notes"] or "").lower()
+                # Реальная отправка = есть sent_at. Явный visible-текст уже отправленного
+                # запроса тоже считаем отправленным, но без выдуманной даты.
+                is_real = bool(row["sent_at"])
+                is_visible_already = "already sent" in notes and "visible" in notes
+                is_dedup_inbox = "deduplicated" in notes and "inbox" in notes
+                if not (is_real or is_visible_already or is_dedup_inbox):
+                    continue
                 if row["username"]:
                     sent.add(str(row["username"]).strip().lower())
                 if row["host_id"]:
@@ -362,12 +371,19 @@ def get_sent_usernames() -> set:
                 if isinstance(d, list):
                     for item in d:
                         u = item.get("username") or item.get("host_id")
-                        if u:
+                        if not u:
+                            continue
+                        st = str(item.get("status", "")).upper()
+                        notes = str(item.get("notes", "")).lower()
+                        # Только реальный успех или подтверждённый видимым текстом already-sent.
+                        if st in ("SENT_SUCCESS", "SUCCESS"):
+                            sent.add(str(u).strip().lower())
+                        elif st == "ALREADY_SENT" and ("visible" in notes or "deduplicated via inbox" in notes):
                             sent.add(str(u).strip().lower())
         except Exception:
             pass
 
-    # 4. Из requests_queue.json
+    # 4. Из requests_queue.json: только реальный Sent с датой или явным подтверждением.
     queue_path = OUTPUT_DIR / "requests_queue.json"
     if queue_path.exists():
         try:
@@ -375,10 +391,18 @@ def get_sent_usernames() -> set:
                 q = json.load(f)
                 if isinstance(q, list):
                     for item in q:
-                        if str(item.get("status", "")).startswith("Sent"):
-                            u = item.get("username") or item.get("id")
-                            if u:
-                                sent.add(str(u).strip().lower())
+                        if str(item.get("status", "")).strip().lower() not in ("sent", "was sent", "declined", "completed"):
+                            continue
+                        notes = str(item.get("notes", "")).lower()
+                        if not (
+                            item.get("sent_at")
+                            or ("already sent" in notes and "visible" in notes)
+                            or ("deduplicated" in notes and "inbox" in notes)
+                        ):
+                            continue
+                        u = item.get("username") or item.get("id")
+                        if u:
+                            sent.add(str(u).strip().lower())
         except Exception:
             pass
 
