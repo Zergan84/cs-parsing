@@ -358,38 +358,50 @@
       display: flex !important;
     }
 
-    /* Dedicated visible scrollbar for Message Queue */
-    #tab-queue {
-      overflow-y: scroll !important;
-      overflow-x: hidden !important;
-      scrollbar-gutter: stable !important;
-      scrollbar-width: thin !important;
-      scrollbar-color: var(--ink-500) var(--ink-900) !important;
-    }
-    #tab-queue::-webkit-scrollbar {
-      width: 10px !important;
-      display: block !important;
-    }
-    #tab-queue::-webkit-scrollbar-track {
-      background: var(--ink-900) !important;
-      border-left: 1px solid var(--ink-800) !important;
-      border-radius: 4px;
-    }
-    #tab-queue::-webkit-scrollbar-thumb {
-      background: var(--ink-600) !important;
-      border-radius: 6px !important;
-      border: 2px solid var(--ink-900) !important;
-    }
-    #tab-queue::-webkit-scrollbar-thumb:hover {
-      background: var(--amber-500) !important;
-    }
-
+    /* Unified scrollbar style — applied to all scrollable sections */
+    #tab-queue,
     #tab-autopilot,
     #tab-inbox,
     #tab-context,
     #tab-logs {
       overflow-y: auto !important;
       overflow-x: hidden !important;
+      scrollbar-gutter: stable !important;
+      scrollbar-width: thin !important;
+      scrollbar-color: var(--ink-500) var(--ink-900) !important;
+    }
+    #tab-queue::-webkit-scrollbar,
+    #tab-autopilot::-webkit-scrollbar,
+    #tab-inbox::-webkit-scrollbar,
+    #tab-context::-webkit-scrollbar,
+    #tab-logs::-webkit-scrollbar {
+      width: 10px !important;
+      display: block !important;
+    }
+    #tab-queue::-webkit-scrollbar-track,
+    #tab-autopilot::-webkit-scrollbar-track,
+    #tab-inbox::-webkit-scrollbar-track,
+    #tab-context::-webkit-scrollbar-track,
+    #tab-logs::-webkit-scrollbar-track {
+      background: var(--ink-900) !important;
+      border-left: 1px solid var(--ink-800) !important;
+      border-radius: 4px;
+    }
+    #tab-queue::-webkit-scrollbar-thumb,
+    #tab-autopilot::-webkit-scrollbar-thumb,
+    #tab-inbox::-webkit-scrollbar-thumb,
+    #tab-context::-webkit-scrollbar-thumb,
+    #tab-logs::-webkit-scrollbar-thumb {
+      background: var(--ink-600) !important;
+      border-radius: 6px !important;
+      border: 2px solid var(--ink-900) !important;
+    }
+    #tab-queue::-webkit-scrollbar-thumb:hover,
+    #tab-autopilot::-webkit-scrollbar-thumb:hover,
+    #tab-inbox::-webkit-scrollbar-thumb:hover,
+    #tab-context::-webkit-scrollbar-thumb:hover,
+    #tab-logs::-webkit-scrollbar-thumb:hover {
+      background: var(--amber-500) !important;
     }
 
     #tab-search {
@@ -3536,7 +3548,7 @@
               </button>
             </div>
 
-            <!-- Trip Cards Container -->
+            <!-- Trip Cards Container (collapsible) -->
             <div class="form-group" style="margin-bottom: 0;">
               <label class="form-label">Мои предстоящие трипы (кликните для парсинга хостов)</label>
               <div id="trips-list" style="display: flex; flex-direction: column; gap: 8px; padding: 10px; background: var(--ink-900); border: 1px solid var(--ink-700); border-radius: 8px;">
@@ -3544,6 +3556,9 @@
                   Нажмите "Загрузить трипы" чтобы увидеть карточки поездок
                 </div>
               </div>
+              <button type="button" id="btn-show-all-trips" onclick="toggleShowAllTrips()" style="display:none; margin-top: 8px; width: 100%; padding: 6px; background: var(--ink-850); border: 1px solid var(--ink-700); color: var(--amber-400); font-size: 11px; border-radius: 6px; cursor: pointer;">
+                Показать все трипы
+              </button>
             </div>
 
             <div class="form-group">
@@ -4851,8 +4866,11 @@
           if (trips.length === 0) {
             tripsList.innerHTML = `<div style="text-align: center; color: var(--ink-400); font-size: 12px; padding: 20px;">Предстоящие трипы не найдены. Создайте поездку на Couchsurfing.</div>`;
           } else {
+            const MAX_VISIBLE_TRIPS = 3;
+            const showAll = trips.length > MAX_VISIBLE_TRIPS;
+            const visibleTrips = showAll ? trips.slice(0, MAX_VISIBLE_TRIPS) : trips;
             let html = '';
-            trips.forEach(trip => {
+            visibleTrips.forEach(trip => {
               const city = trip.city || 'Неизвестно';
               const url = trip.url || '';
               const arrival = trip.arrival_date || '';
@@ -4889,6 +4907,15 @@
               `;
             });
             tripsList.innerHTML = html;
+            const btnShowAll = document.getElementById('btn-show-all-trips');
+            if (showAll) {
+              btnShowAll.style.display = 'block';
+              btnShowAll.textContent = `Показать все трипы (${trips.length})`;
+              window.tripsAllExpanded = false;
+            } else {
+              btnShowAll.style.display = 'none';
+              window.tripsAllExpanded = true;
+            }
           }
         }
       } catch (e) {
@@ -4897,6 +4924,101 @@
       } finally {
         btn.disabled = false;
         btn.innerHTML = originalText;
+      }
+    }
+
+    function toggleShowAllTrips() {
+      const tripsList = document.getElementById('trips-list');
+      const btn = document.getElementById('btn-show-all-trips');
+      const trips = tripsData || [];
+      if (!tripsList || !btn || trips.length === 0) return;
+
+      if (!window.tripsAllExpanded) {
+        // Show all cards
+        let html = '';
+        trips.forEach(trip => {
+          const city = trip.city || 'Неизвестно';
+          const url = trip.url || '';
+          const arrival = trip.arrival_date || '';
+          const departure = trip.departure_date || '';
+          const datesText = trip.dates_text || (arrival && departure ? `${arrival} – ${departure}` : (arrival || departure || ''));
+          const rawText = (trip.raw_text || '').replace(/\n/g, ' ');
+          html += `
+            <button type="button" class="trip-card-btn"
+              data-trip-url="${escapeHtml(url)}"
+              data-trip-city="${escapeHtml(city)}"
+              data-check-in="${escapeHtml(arrival)}"
+              data-check-out="${escapeHtml(departure)}"
+              data-dates-text="${escapeHtml(datesText)}"
+              onclick="startScrapingFromTrip(this)" style="
+              display: flex;
+              flex-direction: column;
+              gap: 6px;
+              padding: 12px;
+              background: var(--ink-850);
+              border: 1px solid var(--ink-700);
+              border-radius: 8px;
+              cursor: pointer;
+              text-align: left;
+              width: 100%;
+              transition: all 0.15s ease;
+            " onmouseover="this.style.borderColor='var(--amber-500)'" onmouseout="this.style.borderColor='var(--ink-700)'">
+              <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 8px;">
+                <div style="font-weight: 600; color: var(--ink-100); font-size: 15px;">${escapeHtml(city)}</div>
+                ${datesText ? `<div style="font-size: 12px; color: var(--amber-400); font-weight: 600; background: rgba(245, 158, 11, 0.1); padding: 2px 6px; border-radius: 4px; white-space: nowrap;">${escapeHtml(datesText)}</div>` : ''}
+              </div>
+              ${rawText ? `<div style="font-size: 11px; color: var(--ink-500); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(rawText)}</div>` : ''}
+              <div style="font-size: 11px; color: var(--emerald-400); font-weight: 600; margin-top: 4px;">▶ Парсинг хостов этого трипа</div>
+            </button>
+          `;
+        });
+        tripsList.innerHTML = html;
+        btn.textContent = `Скрыть трипы`;
+        window.tripsAllExpanded = true;
+      } else {
+        // Show only first 3
+        const MAX_VISIBLE_TRIPS = 3;
+        const visibleTrips = trips.slice(0, MAX_VISIBLE_TRIPS);
+        let html = '';
+        visibleTrips.forEach(trip => {
+          const city = trip.city || 'Неизвестно';
+          const url = trip.url || '';
+          const arrival = trip.arrival_date || '';
+          const departure = trip.departure_date || '';
+          const datesText = trip.dates_text || (arrival && departure ? `${arrival} – ${departure}` : (arrival || departure || ''));
+          const rawText = (trip.raw_text || '').replace(/\n/g, ' ');
+          html += `
+            <button type="button" class="trip-card-btn"
+              data-trip-url="${escapeHtml(url)}"
+              data-trip-city="${escapeHtml(city)}"
+              data-check-in="${escapeHtml(arrival)}"
+              data-check-out="${escapeHtml(departure)}"
+              data-dates-text="${escapeHtml(datesText)}"
+              onclick="startScrapingFromTrip(this)" style="
+              display: flex;
+              flex-direction: column;
+              gap: 6px;
+              padding: 12px;
+              background: var(--ink-850);
+              border: 1px solid var(--ink-700);
+              border-radius: 8px;
+              cursor: pointer;
+              text-align: left;
+              width: 100%;
+              transition: all 0.15s ease;
+            " onmouseover="this.style.borderColor='var(--amber-500)'" onmouseout="this.style.borderColor='var(--ink-700)'">
+              <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 8px;">
+                <div style="font-weight: 600; color: var(--ink-100); font-size: 15px;">${escapeHtml(city)}</div>
+                ${datesText ? `<div style="font-size: 12px; color: var(--amber-400); font-weight: 600; background: rgba(245, 158, 11, 0.1); padding: 2px 6px; border-radius: 4px; white-space: nowrap;">${escapeHtml(datesText)}</div>` : ''}
+              </div>
+              ${rawText ? `<div style="font-size: 11px; color: var(--ink-500); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(rawText)}</div>` : ''}
+              <div style="font-size: 11px; color: var(--emerald-400); font-weight: 600; margin-top: 4px;">▶ Парсинг хостов этого трипа</div>
+            </button>
+          `;
+        });
+        tripsList.innerHTML = html;
+        btn.textContent = `Показать все трипы (${trips.length})`;
+        window.tripsAllExpanded = false;
       }
     }
 
