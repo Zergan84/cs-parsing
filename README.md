@@ -16,16 +16,19 @@ couchsurfing_scraper/
 ├── message_generator.py     # Шаг 2: Генератор персонализированных stay requests
 ├── request_manager.py       # Шаг 2: Очередь запросов, синхронизация и автосохранение
 ├── app.py                   # FastAPI веб-сервер с вкладками (http://localhost:8000)
+├── app_health.py            # Мониторинг здоровья Ollama/LLaVA/Tailscale (/api/system/health)
 ├── test_unit.py             # Модульные тесты всех компонентов
 ├── templates/
 │   └── index.html           # Современный интерфейс со вкладками
 ├── requirements.txt         # Зависимости
 ├── user_data/               # Сохраненная сессия (auth_state.json)
-└── output/
-    ├── hosts_tokyo.json             # Сырые анкеты
-    ├── hosts_tokyo_curated.json     # Верифицированные хосты с Instagram и жильем
-    ├── hosts_tokyo_curated.csv
-    └── requests_queue.json          # Очередь сгенерированных запросов и статусов
+├── output/
+│   ├── hosts_tokyo.json             # Сырые анкеты
+│   ├── hosts_tokyo_curated.json     # Верифицированные хосты с Instagram и жильем
+│   ├── hosts_tokyo_curated.csv
+│   ├── requests_queue.json          # Очередь сгенерированных запросов и статусов
+│   └── kyoto_hosts_dossier.json       # Досье хостов Киото (оценка, индикаторы)
+└── output/kyoto_hosts_detailed_dossiers.json  # Детальные досье топ-20 хостов
 ```
 
 ---
@@ -44,6 +47,15 @@ python app.py
 ```
 Перейдите в браузере: **`http://localhost:8000`** (или по вашему Tailscale IP: `http://100.x.x.x:8000`).
 
+### 3. Проверка здоровья системы (Ollama / LLaVA / Tailscale)
+Эндпоинт: **`GET /api/system/health`**
+
+Возвращает состояние каждого компонента:
+- `ollama` — доступность API Ollama
+- `llm` — результат реального тестового запроса к `qwen2.5:7b`
+- `llava` — результат реального Vision-теста к `llava:latest`
+- `tailscale` — фактическое состояние Tailscale mesh
+
 ---
 
 ## 🖥️ Функционал веб-интерфейса
@@ -51,7 +63,7 @@ python app.py
 ### 📋 Вкладка 1: "Поиск и База хостов"
 * Таблица верифицированных кандидатов с колонками:
   - **Имя / Профиль** хоста и пол/состав
-  - **Район** (Локация в Токио)
+  - **Район** (Локация в Киото)
   - **Тип жилья** (Private Room / Shared Room / Couch)
   - **Рейтинг и скорость отклика** (Response Rate, References)
   - **Ссылка на профиль Couchsurfing**
@@ -65,8 +77,8 @@ python app.py
 ### ✨ Вкладка 2: "Генератор запросов (Шаг 2)"
 
 #### А. Верхняя панель параметров
-- **Check-in Date**: по умолчанию `2026-11-11` (настраиваемая дата).
-- **Check-out Date**: по умолчанию `2026-11-14` (настраиваемая дата).
+- **Check-in Date**: по умолчанию `2026-11-19` (настраиваемая дата).
+- **Check-out Date**: по умолчанию `2026-11-21` (настраиваемая дата).
 - **Контекст гостя**:
   > *"Andrey, professional ski instructor heading to Club Med Tomamu (Hokkaido) for the winter season. 10+ years on Couchsurfing, tidy, independent, loves mountains, sports, authentic local food and respectful cultural exchange. Spends daytime out exploring the city."*
 - Кнопка **«⚡ Перегенерировать для всех»**: обновляет тексты всех кандидатов под новые даты/контекст в один клик.
@@ -78,7 +90,7 @@ python app.py
 1. **Сводку**: Имя, возраст, пол/пара, спальное место, правила дома, ссылки.
 2. **Плашку Instagram** (если найден): *"Есть Instagram: @username — можно написать напрямую"* со ссылкой в профиль.
 3. **Бейдж секретного слова** (если есть в bio): кодовое слово органично встроено в приветствие.
-4. **Редактируемый Textarea**: живой персонализированный текст запроса на английском языке (3-4 емких абзаца с отсылкой к интересам хоста, датам, инструкторскому сезону в Томаму, 10+ годам на CS и уважению к личному пространству).
+4. **Редактируемый Textarea**: живой персонализированный текст запроса на английском языке (3-4 емких абзаца с отсылкой к интересам хоста, датам, инструкторскому сезону в Томаму, 10+ годам на CS и уважением к личному пространству).
 5. **📋 Copy to Clipboard**: копирование готового сообщения в буфер обмена в один клик.
 6. **💬 Open CS Message Page**: быстрый переход на страницу отправки запроса в Couchsurfing.
 7. **Статусы карточки**: переключение между `Draft`, `✅ Approved` и `❌ Skipped`.
@@ -96,3 +108,27 @@ python app.py
 python -m unittest test_unit.py
 ```
 10 тестов проверяют классификатор пола, отсев стоп-слов, извлечение Instagram, детекцию кодовых слов и генерацию запросов.
+
+---
+
+## 📊 Дашборд здоровья системы (Ollama / LLaVA / Tailsdale)
+
+Эндпоинт `GET /api/system/health` возвращает JSON со статусом каждого компонента:
+
+```json
+{
+  "ollama": {"status": "online", "is_active": true},
+  "llm": {"status": "online", "is_active": true},
+  "llava": {"status": "offline", "is_active": false},
+  "tailscale": {"status": "active", "ip": "100.x.x.x", "is_active": true}
+}
+```
+
+- **Ollama** — проверяется доступность API `http://localhost:11434/api/tags`
+- **LLM** — выполняется реальный тестовый запрос к `qwen2.5:7b` через `/api/generate`
+- **LLaVA** — выполняется реальный Vision-тест к `llava:latest` через `/api/generate`
+- **Tailscale** — проверяется через `tailscale status --json`
+
+Все проверки выполняются с таймаутами (2с Ollama, 3с LLM, 5с LLaVA, 1.5с Tailscale) и логируются с указанием причины ошибки в случае неудачи.
+
+---
