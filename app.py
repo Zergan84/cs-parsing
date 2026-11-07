@@ -336,6 +336,8 @@ async def get_status():
 async def get_system_health():
     """Live health check для Ollama и Tailscale."""
     ollama_online = False
+    llm_online = False
+    llava_online = False
     model_name = "qwen2.5:7b"
     try:
         import urllib.request
@@ -356,7 +358,47 @@ async def get_system_health():
                 model_name = models[0]
     except Exception:
         ollama_online = False
-
+    llm_online = False
+    llava_online = False
+    
+    # LLM test request to qwen2.5:7b
+    if ollama_online:
+        try:
+            # json imported at module level
+            data = json.dumps({"model": "qwen2.5:7b", "prompt": "test", "stream": False}).encode("utf-8")
+            req = urllib.request.Request(
+                "http://localhost:11434/api/generate",
+                data=data,
+                method="POST"
+            )
+            req.add_header("Content-Type", "application/json")
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                if resp.status == 200:
+                    llm_online = True
+        except Exception as e:
+            print(f"LLM test failed: {type(e).__name__}: {e}")
+    else:
+        print("Ollama offline - LLM unavailable")
+    
+    # LLaVA Vision test
+    if ollama_online:
+        try:
+            # json imported at module level
+            data = json.dumps({"model": "llava:latest", "prompt": "describe: [test]", "stream": False, "images": []}).encode("utf-8")
+            req = urllib.request.Request(
+                "http://localhost:11434/api/generate",
+                data=data,
+                method="POST"
+            )
+            req.add_header("Content-Type", "application/json")
+            with urllib.request.urlopen(req, timeout=5.0) as resp:
+                if resp.status == 200:
+                    llava_online = True
+        except Exception as e:
+            print(f"LLaVA test failed: {type(e).__name__}: {e}")
+    else:
+        print("Ollama offline - LLaVA unavailable")
+    
     ts_active = False
     ts_ip = None
     try:
@@ -389,6 +431,14 @@ async def get_system_health():
             "status": "online" if ollama_online else "offline",
             "model": model_name if ollama_online else "Offline",
             "is_active": ollama_online
+        },
+        "llm": {
+            "status": "online" if llm_online else "offline",
+            "is_active": llm_online
+        },
+        "llava": {
+            "status": "online" if llava_online else "offline",
+            "is_active": llava_online
         },
         "tailscale": {
             "status": "active" if ts_active else "off",

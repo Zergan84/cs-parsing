@@ -333,6 +333,7 @@ class CouchsurfingLLM:
             for v_name in [
                 "llama3.2-vision:11b",
                 "llama3.2-vision:latest",
+                "llava:latest",
                 "llava:7b",
                 "llava:13b",
                 "minicpm-v:latest",

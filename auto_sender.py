@@ -14,6 +14,7 @@ auto_sender.py - Модуль фонового автопилота отправ
 """
 
 import argparse
+import fcntl
 import json
 import os
 import random
@@ -26,6 +27,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from playwright.sync_api import sync_playwright
+
+from request_manager import RequestQueueManager
 
 if sys.platform == "win32":
     try:
@@ -48,30 +51,35 @@ DEFAULT_DELAY_MIN = 15  # минут
 DEFAULT_DELAY_MAX = 35  # минут
 
 
-def sanitize_before_send(text: str) -> str:
-    """Локальная фильтрация текста перед вводом 'в последнюю секунду'."""
+def sanitize_before_send(text: str, host_clean_name: Optional[str] = None) -> str:
+    """Локальная фильтрация текста перед вводом 'в последнюю секунду' (без подстановки 'there')."""
     lines = text.split('\n')
     if not lines:
         return text
 
     first_line = lines[0]
-    # Ловим паттерны "Hey Name,", "Hi Name:" и чистим мусорные суффиксы
-    match = re.match(r'^(Hey|Hi|Hello|Hola)\s+([^,\n!:]+)([,!:]?)(.*)$', first_line, re.IGNORECASE)
+    fake_placeholders = {"there", "host", "user", "member", "unknown", "none", "null"}
+
+    # Ловим паттерны "Hey Name,", "Hi Name:", "Hello!" и чистим мусорные суффиксы
+    match = re.match(r'^(Hey|Hi|Hello|Hola)(?:\s+([^,\n!:]+))?([,!:]?)(.*)$', first_line, re.IGNORECASE)
     if match:
         greeting_word = random.choice(['Hey', 'Hi', 'Hello'])
-        raw_name = match.group(2)
-        # Чистим приписки "in Tokyo", спецсимволы и берем только первое слово
-        clean_name = re.sub(r'(?i)\s+(in|from|at)\s+.*$', '', raw_name)
-        clean_name = clean_name.strip().split()[0]
-        cleaned_letters = re.sub(r'[^a-zA-Zа-яА-ЯёЁ]', '', clean_name).capitalize()
-        if cleaned_letters:
-            clean_name = cleaned_letters
-        else:
-            cjk = re.sub(r'[^\w]|[\d_]', '', clean_name)
-            clean_name = cjk if cjk else "there"
+        clean_name = ""
 
-        rest_of_line = match.group(4).strip()
-        # Устранение неестественных вставок bio вида ", introvert who loves..."
+        if host_clean_name and host_clean_name.strip() and host_clean_name.strip().lower() not in fake_placeholders:
+            cand = re.findall(r'[a-zA-Zа-яА-ЯёЁ]+', host_clean_name.strip())
+            if cand and cand[0].lower() not in fake_placeholders:
+                clean_name = cand[0].capitalize()
+
+        if not clean_name and match.group(2):
+            raw_name = match.group(2)
+            raw_name = re.sub(r'(?i)\s+(in|from|at)\s+.*$', '', raw_name).strip()
+            first_word = raw_name.split()[0] if raw_name.split() else ""
+            cand = re.findall(r'[a-zA-Zа-яА-ЯёЁ]+', first_word)
+            if cand and cand[0].lower() not in fake_placeholders:
+                clean_name = cand[0].capitalize()
+
+        rest_of_line = (match.group(4) or "").strip()
         rest_of_line = re.sub(
             r'^[,\s]*(?:(?:an?\s+)?[a-zA-Z\s-]{2,30}\s+who\s+(?:loves|enjoys|likes|is|wants)[^,.]+[,.]?\s*)',
             '',
@@ -82,11 +90,9 @@ def sanitize_before_send(text: str) -> str:
         if rest_of_line:
             rest_of_line = rest_of_line[0].upper() + rest_of_line[1:]
 
-        # Собираем чистую первую строчку
-        if rest_of_line:
-            lines[0] = f"{greeting_word} {clean_name}! {rest_of_line}".strip()
-        else:
-            lines[0] = f"{greeting_word} {clean_name}!"
+        # Если имя извлечено — "Hi Sakura!", если пустое — универсальное "Hello!"
+        base_greeting = f"{greeting_word} {clean_name}!" if clean_name else "Hello!"
+        lines[0] = f"{base_greeting} {rest_of_line}".strip() if rest_of_line else base_greeting
         return '\n'.join(lines)
     return text
 
@@ -164,6 +170,9 @@ class AutoSender:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
+        # Единый источник истины для очереди — RequestQueueManager (SQLite + JSON синхронизация)
+        self.queue_manager = RequestQueueManager()
+
     def get_sent_today_count(self) -> int:
         """Подсчитывает количество успешно отправленных запросов за сегодняшний день."""
         if not SENT_LOG_FILE.exists():
@@ -186,18 +195,42 @@ class AutoSender:
             return 0
 
     def append_sent_log(self, entry: Dict[str, Any]) -> None:
-        """Записывает подробный результат отправки в sent_log.json."""
+        """Записывает подробный результат отправки в sent_log.json с файловым_lock и атомарной записью."""
         logs = []
         if SENT_LOG_FILE.exists():
             try:
                 with open(SENT_LOG_FILE, "r", encoding="utf-8") as f:
-                    logs = json.load(f)
+                    try:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                    except (OSError, ImportError):
+                        pass
+                    try:
+                        logs = json.load(f)
+                    except Exception:
+                        logs = []
+                    finally:
+                        try:
+                            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                        except (OSError, ImportError):
+                            pass
             except Exception:
                 logs = []
 
         logs.append(entry)
-        with open(SENT_LOG_FILE, "w", encoding="utf-8") as f:
-            json.dump(logs, f, ensure_ascii=False, indent=2)
+        tmp_file = SENT_LOG_FILE.with_suffix(".json.tmp")
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            except (OSError, ImportError):
+                pass
+            try:
+                json.dump(logs, f, ensure_ascii=False, indent=2)
+            finally:
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                except (OSError, ImportError):
+                    pass
+        os.replace(tmp_file, SENT_LOG_FILE)
 
     def update_queue_status(
         self,
@@ -238,7 +271,19 @@ class AutoSender:
         if QUEUE_FILE.exists():
             try:
                 with open(QUEUE_FILE, "r", encoding="utf-8") as f:
-                    queue = json.load(f)
+                    try:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                    except (OSError, ImportError):
+                        pass
+                    try:
+                        queue = json.load(f)
+                    except Exception:
+                        queue = []
+                    finally:
+                        try:
+                            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                        except (OSError, ImportError):
+                            pass
 
                 for item in queue:
                     if item.get("username") == username:
@@ -256,8 +301,20 @@ class AutoSender:
                             item["attempts"] = int(attempts)
                         break
 
-                with open(QUEUE_FILE, "w", encoding="utf-8") as f:
-                    json.dump(queue, f, ensure_ascii=False, indent=2)
+                tmp_queue = QUEUE_FILE.with_suffix(".json.tmp")
+                with open(tmp_queue, "w", encoding="utf-8") as f:
+                    try:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                    except (OSError, ImportError):
+                        pass
+                    try:
+                        json.dump(queue, f, ensure_ascii=False, indent=2)
+                    finally:
+                        try:
+                            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                        except (OSError, ImportError):
+                            pass
+                os.replace(tmp_queue, QUEUE_FILE)
             except Exception as e:
                 log_step("WARN", f"Ошибка обновления очереди JSON: {e}")
 
@@ -334,24 +391,19 @@ class AutoSender:
                         chat_members.add(m.group(1).lower())
 
                 if chat_members:
-                    now_iso = datetime.now().isoformat()
-                    with open(QUEUE_FILE, "r", encoding="utf-8") as f:
-                        q_data = json.load(f)
                     newly_removed = 0
-                    for item in q_data:
+                    sync_queue = self.queue_manager.load_queue(exclude_sent=False)
+                    for item in sync_queue:
                         u = (item.get("username") or "").lower()
                         if u in chat_members and item.get("status") in ("Approved", "Queued"):
-                            item["status"] = "Sent"
-                            item["notes"] = "Already Sent (Detected in Inbox/Sent Requests)"
-                            item["sent_at"] = now_iso
-                            self.update_queue_status(item.get("username"), "Sent", notes="Already Sent (Detected in Inbox/Sent Requests)")
+                            self.queue_manager.update_item(
+                                item.get("username"),
+                                status="Sent",
+                                message=item.get("generated_message"),
+                            )
                             log_step("SYNC", f"[SYNC] Исключен из очереди уже отправленный хост: @{item.get('username')}")
                             newly_removed += 1
                             deduped += 1
-
-                    if newly_removed > 0:
-                        with open(QUEUE_FILE, "w", encoding="utf-8") as f:
-                            json.dump(q_data, f, ensure_ascii=False, indent=2)
             except Exception as e:
                 log_step("DEBUG", f"Ошибка экспресс-проверки чатов: {e}")
 
@@ -411,7 +463,17 @@ class AutoSender:
             # Атомарная запись: UI никогда не прочитает наполовину записанный JSON.
             tmp_file = STATUS_FILE.with_suffix(".json.tmp")
             with open(tmp_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                except (OSError, ImportError):
+                    pass
+                try:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                finally:
+                    try:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                    except (OSError, ImportError):
+                        pass
             os.replace(tmp_file, STATUS_FILE)
         except Exception:
             pass
@@ -442,21 +504,21 @@ class AutoSender:
             return False
 
     def human_type(self, element, text: str) -> None:
-        """Имитирует естественный человеческий ввод текста."""
-        element.click()
+        """Имитирует естественный человеческий ввод текста с жесткими таймаутами."""
+        element.click(timeout=10000)
         time.sleep(random.uniform(0.3, 0.6))
-        element.fill("")
+        element.fill("", timeout=10000)
 
         if len(text) > 400:
             first_part = text[:70]
             rest_part = text[70:]
             for char in first_part:
-                element.type(char, delay=random.uniform(20, 45))
+                element.type(char, delay=random.uniform(20, 45), timeout=5000)
             time.sleep(0.3)
-            element.type(rest_part, delay=4)
+            element.type(rest_part, delay=4, timeout=15000)
         else:
             for char in text:
-                element.type(char, delay=random.uniform(25, 55))
+                element.type(char, delay=random.uniform(25, 55), timeout=5000)
                 if char in (".", "!", "?", "\n"):
                     time.sleep(random.uniform(0.12, 0.3))
                 elif random.random() < 0.04:
@@ -738,11 +800,11 @@ class AutoSender:
         log_step("TRIP", f"Выбрана карточка поездки: {info.get('text')}")
         return True
 
-    def _fail_attempt(self, page, username: str, host_name: str, reason: str, error_screenshot, error_html) -> str:
-        """Ошибка формы/сети: НЕ помечаем как Sent. Возвращаем хост в очередь со статусом Queued."""
-        log_step("ERROR", f"[NOT SENT] @{username}: {reason}. Хост возвращён в очередь (Queued), sent_at не выставлен.")
+    def _fail_attempt(self, page, username: str, host_name: str, reason: str, error_screenshot, error_html) -> bool:
+        """Ошибка формы/сети/таймаут: помечаем хоста как FAILED, пишем в лог и переходим к следующему."""
+        log_step("ERROR", f"[FAILED] @{username}: {reason}. Статус изменён на FAILED, переходим к следующему хосту.")
         try:
-            page.screenshot(path=str(error_screenshot))
+            page.screenshot(path=str(error_screenshot), timeout=5000)
             error_html.write_text(page.content(), encoding="utf-8")
         except Exception:
             pass
@@ -757,8 +819,8 @@ class AutoSender:
             "proof_screenshot": str(error_screenshot),
             "error_html": str(error_html),
         })
-        self.update_queue_status(username, "Queued", notes=f"Last attempt failed: {reason}", increment_attempts=True)
-        return "ERROR"
+        self.update_queue_status(username, "FAILED", notes=f"Failed: {reason}", increment_attempts=True)
+        return False
 
     def _record_dry_run_success(
         self,
@@ -841,8 +903,15 @@ class AutoSender:
         page.on("response", handle_response)
 
         try:
+            # 0. Жесткие таймауты Playwright против бесконечных зависаний
+            try:
+                page.set_default_timeout(15000)
+                page.set_default_navigation_timeout(25000)
+            except Exception:
+                pass
+
             # 1. Загрузка страницы формы
-            page.goto(stay_url, timeout=35000, wait_until="domcontentloaded")
+            page.goto(stay_url, timeout=25000, wait_until="domcontentloaded")
             time.sleep(random.uniform(2.0, 3.5))
 
             # Диагностика сессии: текущий адрес и заголовок страницы
@@ -974,7 +1043,10 @@ class AutoSender:
                         pass
 
                 if not found:
-                    page.screenshot(path=str(DEBUG_DIR / f"profile_{username}.png"))
+                    try:
+                        page.screenshot(path=str(DEBUG_DIR / f"profile_{username}.png"), timeout=5000)
+                    except Exception:
+                        pass
                     return self._fail_attempt(
                         page, username, host_name,
                         f"Кнопка 'Request Stay' не найдена на странице профиля хоста @{username} (форма не открылась)",
@@ -982,15 +1054,18 @@ class AutoSender:
                     )
 
                 try:
-                    request_btn.scroll_into_view_if_needed()
+                    request_btn.scroll_into_view_if_needed(timeout=5000)
                 except Exception:
                     pass
                 log_step("NAV", "Нажатие кнопки 'Request Stay' на профиле хоста...")
-                request_btn.click(force=True)
+                request_btn.click(force=True, timeout=15000)
                 page.wait_for_timeout(2500)
                 log_step("NAV", "Кнопка 'Request Stay' нажата, ожидаем открытие формы/модалки.")
             except Exception as e:
-                page.screenshot(path=str(DEBUG_DIR / f"profile_{username}.png"))
+                try:
+                    page.screenshot(path=str(DEBUG_DIR / f"profile_{username}.png"), timeout=5000)
+                except Exception:
+                    pass
                 return self._fail_attempt(
                     page, username, host_name,
                     f"Кнопка 'Request Stay' не кликнута: {e}",
@@ -1016,7 +1091,7 @@ class AutoSender:
                 )
                 if stay_details_btn.count() > 0 and stay_details_btn.first.is_visible():
                     log_step("NAV", "Переход к разделу Stay Details...")
-                    stay_details_btn.first.click()
+                    stay_details_btn.first.click(timeout=15000)
                     page.wait_for_timeout(2000)
             except Exception:
                 pass
@@ -1052,11 +1127,11 @@ class AutoSender:
                     error_screenshot, error_html,
                 )
 
-            # 5.1. Поле ввода сообщения (форма уже видна; даём 5 сек на появление textarea)
+            # 5.1. Поле ввода сообщения (форма уже видна; даём 15 сек на появление textarea)
             textarea = None
             try:
                 ta = page.locator("textarea:visible").first
-                ta.wait_for(state="visible", timeout=5000)
+                ta.wait_for(state="visible", timeout=15000)
                 textarea = ta
             except Exception:
                 textarea = None
@@ -1068,18 +1143,9 @@ class AutoSender:
                     error_screenshot, error_html,
                 )
 
-            # Runtime-санитизация текста перед вводом (берем актуальный текст из очереди)
-            try:
-                if QUEUE_FILE.exists():
-                    with open(QUEUE_FILE, "r", encoding="utf-8") as f_q:
-                        q_items = json.load(f_q)
-                    for q_item in q_items:
-                        if q_item.get("username") == username and q_item.get("generated_message"):
-                            message = q_item["generated_message"]
-                            break
-            except Exception:
-                pass
-            message = sanitize_before_send(message)
+            # Runtime-санитизация текста перед вводом (текст уже в host_item из очереди)
+            message = host_item.get("generated_message", "") or ""
+            message = sanitize_before_send(message, host_name)
             if not message.strip():
                 return self._fail_attempt(page, username, host_name, "Пустой текст сообщения в очереди", error_screenshot, error_html)
 
@@ -1088,8 +1154,11 @@ class AutoSender:
             time.sleep(random.uniform(1.0, 2.0))
 
             # 6. Скриншот заполненной формы ПЕРЕД отправкой
-            page.screenshot(path=str(before_screenshot))
-            log_step("SCREENSHOT", f"Скриншот заполненной формы: {before_screenshot}")
+            try:
+                page.screenshot(path=str(before_screenshot), timeout=5000)
+                log_step("SCREENSHOT", f"Скриншот заполненной формы: {before_screenshot}")
+            except Exception:
+                pass
 
             # 7. Кнопка отправки: ждем до 15 сек
             send_locator = page.locator(self.SEND_BUTTON_SELECTOR).first
@@ -1104,8 +1173,8 @@ class AutoSender:
 
             send_btn = send_locator
             found_selector = "Send Request button"
-            btn_text = (send_btn.inner_text() or "").strip()
-            btn_disabled = send_btn.is_disabled()
+            btn_text = (send_btn.inner_text(timeout=5000) or "").strip()
+            btn_disabled = send_btn.is_disabled(timeout=5000)
             log_step("BUTTON", f"Найдена кнопка: text='{btn_text}', disabled={btn_disabled}")
 
             if btn_disabled:
@@ -1131,7 +1200,7 @@ class AutoSender:
 
             # 9. БОЕВОЙ РЕЖИМ: Очистка буфера ответов, клик и строгая верификация
             api_responses.clear()
-            send_btn.click()
+            send_btn.click(timeout=15000)
             log_step("CLICK", f"Кнопка отправки нажата ('{btn_text}')")
 
             # Ожидание подтверждения: только реальный сетевой ответ или подтвержденный переход в чат
@@ -1176,7 +1245,10 @@ class AutoSender:
             # 10. Фиксация результата в БД и логах
             if submission_confirmed:
                 time.sleep(1.5)
-                page.screenshot(path=str(after_screenshot))
+                try:
+                    page.screenshot(path=str(after_screenshot), timeout=5000)
+                except Exception:
+                    pass
                 log_step("SUCCESS", f"Отправка верифицирована! Ответ сервера: {http_status or 200} OK. Скриншот: {after_screenshot}")
 
                 self.append_sent_log({
@@ -1197,31 +1269,33 @@ class AutoSender:
                 self.update_queue_status(username, "Sent")
                 return True
             else:
-                page.screenshot(path=str(error_screenshot))
-                error_html.write_text(page.content(), encoding="utf-8")
+                try:
+                    page.screenshot(path=str(error_screenshot), timeout=5000)
+                    error_html.write_text(page.content(), encoding="utf-8")
+                except Exception:
+                    pass
                 err_text = f"HTTP {http_status}" if http_status else "Отправка не подтверждена за отведенное время"
-                log_step("WARN", f"Подтверждение отправки отсутствует: {err_text}. Статус: VERIFICATION_REQUIRED. Скриншот: {error_screenshot}")
+                log_step("WARN", f"Подтверждение отправки отсутствует: {err_text}. Статус: FAILED. Скриншот: {error_screenshot}")
 
-                # Ни в коем случае не помечаем как Sent и не отправляем повторно!
                 self.append_sent_log({
                     "id": username,
                     "username": username,
                     "name": host_name,
                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "status": "VERIFICATION_REQUIRED",
+                    "status": "FAILED",
                     "http_status": http_status,
                     "mode": "live",
                     "proof_screenshot": str(error_screenshot),
                     "before_screenshot": str(before_screenshot),
-                    "notes": f"Submission clicked but unverified. Marked as VERIFICATION_REQUIRED. Manual inspection recommended.",
+                    "notes": f"Submission clicked but unverified ({err_text}). Marked as FAILED.",
                 })
-                self.update_queue_status(username, "Verification_Required")
+                self.update_queue_status(username, "FAILED", notes=f"Submission unverified: {err_text}", increment_attempts=True)
                 return False
 
         except Exception as e:
-            log_step("ERROR", f"Исключение при обработке {username}: {e}")
+            log_step("ERROR", f"Исключение при обработке @{username}: {e}. Статус изменён на FAILED, переход к следующему хосту.")
             try:
-                page.screenshot(path=str(error_screenshot))
+                page.screenshot(path=str(error_screenshot), timeout=5000)
                 error_html.write_text(page.content(), encoding="utf-8")
             except Exception:
                 pass
@@ -1236,7 +1310,13 @@ class AutoSender:
                 "proof_screenshot": str(error_screenshot),
                 "error_html": str(error_html),
             })
+            self.update_queue_status(username, "FAILED", notes=f"Exception: {e}", increment_attempts=True)
             return False
+        finally:
+            try:
+                page.remove_listener("response", handle_response)
+            except Exception:
+                pass
 
     def compute_human_delay(self, idx: int, res_is_error: bool, delays_schedule: List[float]) -> int:
         """
@@ -1292,9 +1372,9 @@ class AutoSender:
             return [
                 x for x in queue
                 if str(x.get("username", "")).strip().lower() == target_norm
-                and x.get("status") == "Approved"
+                and str(x.get("status", "")).strip().lower() == "approved"
             ]
-        return [x for x in queue if x.get("status") == "Approved"]
+        return [x for x in queue if str(x.get("status", "")).strip().lower() == "approved"]
 
     def run(self) -> None:
         """Основной цикл работы автопилота с поддержкой лимитов и интервалов."""
@@ -1330,38 +1410,19 @@ class AutoSender:
         # 1.5. Синхронизация очереди перед отбором (исключение уже отправленных хостов)
         self.sync_queue_against_sent_and_inbox()
 
-        # 2. Загрузка очереди кандидатов
-        if not QUEUE_FILE.exists():
-            log_step("WARN", "Файл requests_queue.json не найден. Сначала выполните генерацию очереди.")
-            return
+        # 2. Загрузка очереди кандидатов (единый канонический источник и порядок)
+        candidates = self.queue_manager.get_ready_dispatch_candidates()
 
-        with open(QUEUE_FILE, "r", encoding="utf-8") as f:
-            queue = json.load(f)
-
-        # Предварительная проверка для --target: различаем "не найдено в очереди"
-        # и "найдено, но статус не Approved". Обе ситуации завершаются ДО запуска
-        # браузера (sync_playwright не вызывается, отправка не производится).
+        # Предварительная проверка для --target
         if self.target_username:
             target_norm = self.target_username.strip().lower()
-            target_record = next(
-                (x for x in queue if str(x.get("username", "")).strip().lower() == target_norm),
-                None,
-            )
-            if target_record is None:
-                log_step("WARN", f"Хост '{self.target_username}' не найден в очереди.")
+            candidates = [c for c in candidates if str(c.get("username", "")).strip().lower() == target_norm]
+            if not candidates:
+                log_step("WARN", f"Хост '{self.target_username}' не найден среди готовых к отправке (Approved/Queued) или уже отправлен.")
                 return
-            current_status = target_record.get("status")
-            if current_status != "Approved":
-                log_step(
-                    "WARN",
-                    f"Хост '{self.target_username}' имеет статус '{current_status}', ожидается 'Approved'. Отправка отменена.",
-                )
-                return
-
-        candidates = self._select_candidates(queue)
 
         if not candidates:
-            log_step("INFO", "В очереди нет хостов со статусом 'Approved'. Отправка черновиков ('Draft', 'Skipped' и др.) строго заблокирована — ничего не отправляется.")
+            log_step("INFO", "В очереди нет хостов со статусом 'Approved'/'Queued'. Отправка черновиков ('Draft', 'Skipped') заблокирована.")
             self.update_autopilot_status(
                 is_running=False,
                 is_paused=False,
@@ -1370,11 +1431,6 @@ class AutoSender:
                 last_status="Нет одобренных хостов к отправке",
             )
             return
-
-        # Защита от зацикливания на одном проблемном хосте:
-        # сортируем по попыткам (attempts ASC) и времени последнего обновления (updated_at ASC),
-        # чтобы хост с ошибкой формы уходил в конец очереди, а автопилот переходил к следующему.
-        candidates.sort(key=lambda x: (int(x.get("attempts") or 0), x.get("updated_at") or ""))
 
         if self.max_requests and len(candidates) > self.max_requests:
             candidates = candidates[:self.max_requests]

@@ -260,20 +260,20 @@ def collect_upcoming_trip_cards(page) -> List[Dict[str, str]]:
         cards = page.evaluate(
             """(sectionTitles) => {
                 const titles = sectionTitles || [];
-                const heading = [...document.querySelectorAll('h1,h2,h3,h4')]
-                    .find(e => (e.innerText || '').trim() === 'Upcoming Trips');
+                const headings = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6')]
+                    .filter(e => titles.includes((e.innerText || '').trim()));
                 let scope = null;
-                if (heading) {
+                for (const heading of headings) {
                     let el = heading;
-                    for (let i = 0; i < 6 && el; i++) {
-                        const hasAnchors = el.querySelectorAll('a[href*="/c/trips/"]').length > 0;
-                        const hasOtherSection = [...el.querySelectorAll('h1,h2,h3,h4')].some(x => {
-                            const t = (x.innerText || '').trim();
-                            return titles.includes(t) && t !== 'Upcoming Trips';
-                        });
-                        if (hasAnchors && !hasOtherSection) { scope = el; break; }
+                    for (let i = 0; i < 10 && el; i++) {
+                        const anchors = el.querySelectorAll('a[href*="/c/trips/"]');
+                        if (anchors.length > 0) {
+                            scope = el;
+                            break;
+                        }
                         el = el.parentElement;
                     }
+                    if (scope) break;
                 }
                 const anchors = scope
                     ? [...scope.querySelectorAll('a[href*="/c/trips/"]')]
@@ -285,7 +285,7 @@ def collect_upcoming_trip_cards(page) -> List[Dict[str, str]]:
                     if (!href || seen.has(href)) continue;
                     seen.add(href);
                     let card = a;
-                    for (let i = 0; i < 6 && card; i++) {
+                    for (let i = 0; i < 10 && card; i++) {
                         if ((card.innerText || '').trim().length > 3) break;
                         card = card.parentElement;
                     }
@@ -402,24 +402,36 @@ class CouchsurfingScraper:
     def _check_auth_validity(self, page) -> bool:
         """
         Проверяет валидность сессии перед началом поиска.
-        Открывает /dashboard или /c/chat и проверяет, нет ли редиректа на страницу входа.
+        Открывает /dashboard и проверяет, нет ли редиректа на страницу входа.
         """
         print("[*] Проверка валидности сессии авторизации...")
         try:
             page.goto("https://www.couchsurfing.com/dashboard", timeout=25000, wait_until="domcontentloaded")
             page.wait_for_timeout(2500)
             curr_url = page.url.lower()
-            if (
+            page_title = (page.title() or "").lower()
+
+            is_redirect_to_login = (
                 "/users/sign_in" in curr_url
                 or "/login" in curr_url
                 or "/session/new" in curr_url
-                or "sign in" in page.title().lower()
-            ):
-                print("[ERROR] Сессия в auth_state.json недействительна! Запустите auth.py для обновления кук")
+                or "sign in" in page_title
+                or "log in" in page_title
+            )
+
+            if is_redirect_to_login:
+                print("[ERROR] Сессия в auth_state.json недействительна или истекла!")
+                print("        Запустите: python3 auth.py (ручной вход в браузере)")
+                print("        Или обновите куки через веб-интерфейс: POST /api/set_cookie")
                 debug_dir = OUTPUT_DIR / "debug"
                 debug_dir.mkdir(parents=True, exist_ok=True)
-                page.screenshot(path=str(debug_dir / "auth_invalid.png"))
+                try:
+                    page.screenshot(path=str(debug_dir / "auth_invalid.png"))
+                    print(f"[+] Диагностический скриншот: {debug_dir / 'auth_invalid.png'}")
+                except Exception:
+                    pass
                 return False
+
             print(f"[+] Сессия подтверждена. URL: {page.url} ({page.title()})")
             return True
         except Exception as e:
@@ -435,11 +447,11 @@ class CouchsurfingScraper:
         print(f"[*] Определение locationId для города: {self.city}...")
 
         # Быстрый маппинг для популярных городов (известные location-хэши Couchsurfing)
+        # Оставляем только верифицированный ID Токио. Остальные города resolvingятся
+        # динамически через /c/locations/<город> и /c/explore, чтобы не подменять
+        # чужие города токийским хэшем и не возвращать 0 результатов.
         known_cities = {
             "tokyo": "2pdyyI6P65u26SGYJJtEbWWXjeT_lc",
-            "kyoto": "3uGmH4tR8kL2pN9vW1xY7zA5bC6_d_lc",
-            "sapporo": "4vHnJ5kS9mL3qO0wX2yZ8aB7cD8_e_lc",
-            "paris": "2u5Z5oEaL98Xv8j0bI5E5zX5eOY_lc",
         }
         if city_lower in known_cities:
             loc_id = known_cities[city_lower]
@@ -699,6 +711,18 @@ class CouchsurfingScraper:
             print(f"[!] Ошибка при навигации по трипам: {e}")
             return None
 
+    def _validate_api_host(self, item: Dict[str, Any]) -> bool:
+        """Проверяет, что запись из сетевого ответа выглядит как валидный профиль хоста."""
+        username = item.get("handle") or item.get("slug") or item.get("username")
+        if not username:
+            return False
+        if username in ["visits", "stays", "feed", "explore", "search", "users"]:
+            return False
+        # Технические объекты без имени — не хосты
+        if not any(k in item for k in ("displayName", "name", "aboutMe", "about_me", "locationSummary", "domicileLocationDescription", "responseRate")):
+            return False
+        return True
+
     def _process_host_from_api(self, item: Dict[str, Any]) -> None:
         """Парсит профиль хоста из полученного JSON API объекта."""
         username = item.get("handle") or item.get("slug") or item.get("username")
@@ -783,80 +807,149 @@ class CouchsurfingScraper:
         """
         Перехватывает и парсит сетевые JSON-ответы от эндпоинтов поиска Couchsurfing
         (tRPC hostSearch.searchHostsV2, GraphQL, REST).
+
+        Устойчивость:
+        - Не полагается на content-type (некоторые CDN/прокси отдают JSON без верного заголовка).
+        - Пытается распарсить тело как JSON независимо от content-type.
+        - Расширен список ключевых слов в URL.
+        - Логирует найденные хосты и ошибки парсинга вместо бес silenzio проглатывания.
         """
         url = response.url.lower()
-        if not any(k in url for k in ("searchhosts", "search_hosts", "graphql", "api/web", "hostsearch")):
+
+        # Ключевые слова эндпоинтов поиска/хостов
+        search_keywords = (
+            "searchhosts", "search_hosts", "graphql", "api/web", "hostsearch",
+            "search-hosts", "searchhost", "host-search", "users/search",
+        )
+        if not any(k in url for k in search_keywords):
             return
-        if any(k in url for k in ("lotties", "mapbox", "analytics", "tracking", "heartbeat", "stats")):
+
+        # Исключаем явный мусор
+        skip_keywords = ("lotties", "mapbox", "analytics", "tracking", "heartbeat", "stats", "static", "assets")
+        if any(k in url for k in skip_keywords):
             return
+
+        print(f"[API] Перехвачен ответ: {response.url} (status={response.status})")
 
         try:
-            content_type = response.headers.get("content-type", "")
-            if "json" not in content_type:
-                return
+            # Пытаемся распарсить как JSON независимо от content-type
+            try:
+                data = response.json()
+            except Exception:
+                # Попробуем прочитать текст и распарсить вручную
+                try:
+                    body = response.body()
+                    import json as _json
+                    data = _json.loads(body)
+                except Exception:
+                    print(f"[API] Не удалось распарсить JSON из {response.url}")
+                    return
 
-            data = response.json()
             items: List[Dict[str, Any]] = []
 
-            # 1. tRPC batch ответ (список объектов с result -> data -> json -> data)
+            def _extract_list_from_value(val: Any) -> List[Dict[str, Any]]:
+                """Рекурсивно ищет списки объектов хостов в произвольной JSON-структуре."""
+                found: List[Dict[str, Any]] = []
+                if isinstance(val, list):
+                    for item in val:
+                        if isinstance(item, dict):
+                            # Вероятно, это уже хост (есть handle/username/slug)
+                            if any(k in item for k in ("handle", "username", "slug", "displayName", "id")):
+                                found.append(item)
+                            found.extend(_extract_list_from_value(item))
+                        elif isinstance(item, list):
+                            found.extend(_extract_list_from_value(item))
+                elif isinstance(val, dict):
+                    for k, v in val.items():
+                        if k in ("hosts", "searchHosts", "users", "items", "results", "data", "edges", "nodes"):
+                            if isinstance(v, list):
+                                for item in v:
+                                    if isinstance(item, dict):
+                                        found.append(item)
+                            found.extend(_extract_list_from_value(v))
+                        else:
+                            found.extend(_extract_list_from_value(v))
+                return found
+
+            # tRPC batch ответ (список объектов с result -> data -> json -> data)
             if isinstance(data, list):
                 for entry in data:
-                    if isinstance(entry, dict):
-                        res = entry.get("result", {}).get("data", {})
-                        if isinstance(res, dict):
-                            json_data = res.get("json", {})
-                            if isinstance(json_data, dict) and "data" in json_data and isinstance(json_data["data"], list):
-                                items.extend(json_data["data"])
-                        elif isinstance(res, list):
-                            items.extend(res)
+                    items.extend(_extract_list_from_value(entry))
 
-            # 2. Обычный объект (GraphQL / REST / одиночный tRPC)
+            # Одиночный объект (GraphQL / REST / tRPC)
             elif isinstance(data, dict):
-                if "result" in data and isinstance(data["result"], dict):
-                    inner = data["result"].get("data", {}).get("json", {})
-                    if isinstance(inner, dict) and "data" in inner and isinstance(inner["data"], list):
-                        items.extend(inner["data"])
-                elif "data" in data:
-                    d = data["data"]
-                    if isinstance(d, list):
-                        items.extend(d)
-                    elif isinstance(d, dict):
-                        for k in ("hosts", "searchHosts", "users", "items", "results"):
-                            if k in d and isinstance(d[k], list):
-                                items.extend(d[k])
+                items.extend(_extract_list_from_value(data))
 
             if items:
                 prev_len = len(self.collected_hosts)
+                valid_count = 0
+                invalid_count = 0
                 for it in items:
-                    if isinstance(it, dict):
-                        self._process_host_from_api(it)
+                    if not isinstance(it, dict):
+                        invalid_count += 1
+                        continue
+                    if not self._validate_api_host(it):
+                        invalid_count += 1
+                        continue
+                    self._process_host_from_api(it)
+                    valid_count += 1
                 added = len(self.collected_hosts) - prev_len
                 if added > 0:
                     print(f"[API] Перехвачено {added} новых хостов через сетевой ответ (Всего: {len(self.collected_hosts)})")
-        except Exception:
-            pass
+                elif len(items) > 0:
+                    print(f"[API] Сетевой ответ содержит {len(items)} записей: валидных={valid_count}, невалидных={invalid_count}, новых={added}")
+            else:
+                print(f"[API] В ответе {response.url} не найдено записей хостов.")
+
+        except Exception as e:
+            print(f"[!] Ошибка обработки сетевого ответа {response.url}: {e}")
 
     def _extract_cards_from_page(self, page) -> None:
-        """Парсит карточки хостов из DOM страницы поиска (fallback при отсутствии API-ответов)."""
-        user_anchors = page.query_selector_all('a[href*="/c/users/"], a[href*="/users/"]')
+        """Парсит карточки хостов из DOM страницы поиска (fallback при отсутствии API-antwortов)."""
+        user_selectors = [
+            'a[href*="/c/users/"]',
+            'a[href*="/users/"]',
+            'a[href*="/people/"]',
+            'a[href*="/member/"]',
+        ]
+        user_anchors = []
+        for sel in user_selectors:
+            try:
+                found = page.query_selector_all(sel)
+                for a in found:
+                    if a not in user_anchors:
+                        user_anchors.append(a)
+            except Exception:
+                continue
 
         for a in user_anchors:
             try:
                 href = a.get_attribute("href") or ""
-                user_match = re.search(r"/(?:c/)?users/([^/?#]+)", href)
+                user_match = re.search(r"/(?:c/)?(?:users|people|members)/([^/?#]+)", href)
                 if not user_match:
                     continue
                 username = user_match.group(1)
-                if username in ["visits", "stays", "feed", "explore", "search", "users"] or username in self.collected_hosts:
+                if username in ["visits", "stays", "feed", "explore", "search", "users", "members", "people"] or username in self.collected_hosts:
                     continue
 
                 parent_text = ""
-                try:
-                    card_el = a.evaluate_handle("el => el.closest('[class*=card], [data-testid], article, li, div')")
-                    if card_el:
-                        parent_text = card_el.as_element().inner_text()
-                except Exception:
-                    pass
+                # Пробуем несколько стратегий поиска контейнера карточки
+                card_strategies = [
+                    "el => el.closest('[class*=card], [data-testid], article, li, div[class*=\"host\"], div[class*=\"user\"], div[class*=\"profile\"]')",
+                    "el => el.closest('div')",
+                    "el => el.parentElement",
+                ]
+                for strategy in card_strategies:
+                    try:
+                        card_el = a.evaluate_handle(strategy)
+                        if card_el:
+                            el = card_el.as_element()
+                            if el:
+                                t = el.inner_text()
+                                if t and len(t.strip()) > len(parent_text.strip()):
+                                    parent_text = t
+                    except Exception:
+                        continue
 
                 if not parent_text:
                     try:
@@ -874,17 +967,24 @@ class CouchsurfingScraper:
                 meta_line = lines[1] if len(lines) > 1 else ""
                 about_me = " ".join(lines[2:]) if len(lines) > 2 else ""
 
-                # Извлечение отзывов
+                # Извлечение отзывов — ищем по всему тексту карточки
                 ref_match = re.search(r"(\d+)\s*References", meta_line, re.I) or re.search(r"(\d+)\s*References", parent_text, re.I)
                 references_count = int(ref_match.group(1)) if ref_match else 0
 
-                # Локация
-                loc_match = re.search(r"Lives in\s*([^\n\r]+)", meta_line, re.I) or re.search(r"Lives in\s*([^\n\r]+)", parent_text, re.I)
+                # Локация — ищем "Lives in" или "Based in"
+                loc_match = (
+                    re.search(r"Lives in\s*([^\n\r]+)", meta_line, re.I)
+                    or re.search(r"Lives in\s*([^\n\r]+)", parent_text, re.I)
+                    or re.search(r"Based in\s*([^\n\r]+)", parent_text, re.I)
+                    or re.search(r"Home:\s*([^\n\r]+)", parent_text, re.I)
+                )
                 raw_loc = loc_match.group(1).strip() if loc_match else self.city
                 location = sanitize_host_location(raw_loc, self.city)
 
-                # Проверка активности
-                is_recently_active = any("Recently Active" in l or "Active" in l for l in lines)
+                # Проверка активности — ищем маркеры активности в любом месте текста
+                is_recently_active = any("Recently Active" in l or "Active" in l for l in lines) or any(
+                    k in parent_text.lower() for k in ("recently active", "active recently", "active")
+                )
                 last_login_raw = "Recently Active" if is_recently_active else "Active recently"
 
                 est_gender, host_type, gender_reason = self.gender_classifier.classify(name, about_me, username)
@@ -980,10 +1080,30 @@ class CouchsurfingScraper:
                 print(f"[*] Загрузка сохраненной сессии из {AUTH_STATE_FILE.name}")
                 context_kwargs["storage_state"] = str(AUTH_STATE_FILE)
             else:
-                print(f"[!] Файл сессии {AUTH_STATE_FILE.name} не найден!")
+                print(f"[ERROR] Файл сессии {AUTH_STATE_FILE.name} не найден!")
+                print(f"       Сначала выполните вход: python3 auth.py")
+                print(f"       Или сохраните куки вручную через веб-интерфейс (/api/set_cookie).")
+                context.close()
+                browser.close()
+                return []
 
             context = browser.new_context(**context_kwargs)
             page = context.new_page()
+
+            # Проверка наличия сессионных cookies в контексте
+            context_cookies = context.cookies()
+            has_session_cookie = any(
+                "session" in c.get("name", "").lower() or "couchsurfing" in c.get("domain", "").lower()
+                for c in context_cookies
+            )
+            if not has_session_cookie:
+                print(f"[ERROR] В auth_state.json нет сессионных cookies Couchsurfing!")
+                print(f"       Файл существует, но сессия пуста или истекла.")
+                print(f"       Сначала выполните вход: python3 auth.py")
+                context.close()
+                browser.close()
+                return []
+            print(f"[*] Найдено сессионных cookies: {len(context_cookies)}")
 
             # Регистрация перехвата сетевых API-ответов
             page.on("response", self._handle_search_response)
@@ -1070,7 +1190,9 @@ class CouchsurfingScraper:
 
             # Проверка редиректа на авторизацию после перехода на поиск
             if "/users/sign_in" in page.url or "/login" in page.url:
-                print("[ERROR] Сессия в auth_state.json недействительна! Запустите auth.py для обновления кук")
+                print("[ERROR] Сессия в auth_state.json недействительна или истекла!")
+                print("        Запустите: python3 auth.py (ручной вход в браузере)")
+                print("        Или обновите куки через веб-интерфейс: POST /api/set_cookie")
                 context.close()
                 browser.close()
                 return []
@@ -1129,8 +1251,19 @@ class CouchsurfingScraper:
                 # Скроллим внутренний scrollable-контейнер списка хостов
                 try:
                     page.evaluate("""() => {
-                        const divs = Array.from(document.querySelectorAll('div'));
-                        const scrollable = divs.find(d => d.scrollHeight > d.clientHeight && d.clientHeight > 300);
+                        const strategies = [
+                            () => {
+                                const divs = Array.from(document.querySelectorAll('div'));
+                                return divs.find(d => d.scrollHeight > d.clientHeight && d.clientHeight > 300);
+                            },
+                            () => document.querySelector('[class*="scroll"], [class*="virtual"], [class*="list"], [class*="results"], [data-testid*="list"]'),
+                            () => document.querySelector('main') || document.querySelector('[role="main"]') || document.body,
+                        ];
+                        let scrollable = null;
+                        for (const strat of strategies) {
+                            try { scrollable = strat(); } catch (e) {}
+                            if (scrollable) break;
+                        }
                         if (scrollable) {
                             scrollable.scrollTop += 1200;
                         } else {
@@ -1142,6 +1275,14 @@ class CouchsurfingScraper:
 
                 self._dismiss_popups(page)
                 random_sleep(1.8, 3.2)
+
+                # Проверка сессии в процессе скроллинга (сессия может истечь по ходу работы)
+                curr_url = page.url.lower()
+                if "/users/sign_in" in curr_url or "/login" in curr_url:
+                    print("[!] Сессия истекла в процессе сбора — перенаправление на логин. Остановка.")
+                    context.close()
+                    browser.close()
+                    return self._filter_and_save()
 
             print(f"[*] Сбор завершен. Всего хостов собрано: {len(self.collected_hosts)}")
             context.close()

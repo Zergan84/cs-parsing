@@ -8,8 +8,10 @@ request_manager.py - Управление очередью персонализ�
 4. Защиту от повторной отправки и некорректных переходов статусов.
 """
 
+import fcntl
 import json
 import logging
+import os
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -464,11 +466,57 @@ class RequestQueueManager:
                 pass
         return []
 
+    def get_ready_dispatch_candidates(self) -> List[Dict[str, Any]]:
+        """
+        Единый канонический список кандидатов, готовых к отправке автопилотом.
+        Используется И в /api/autopilot/status (для отображения списка),
+        И в auto_sender.py (для непосредственной отправки).
+
+        1. Загружает очередь через load_queue(exclude_sent=False).
+        2. Оставляет только кандидатов со статусом 'Approved' или 'Queued'.
+        3. Исключает любых кандидатов, чей username содержится в get_sent_usernames().
+        4. Сортирует строго единообразно:
+           - attempts ASC (0 попыток первыми; хосты с ошибками уходят в конец)
+           - references_count DESC (активные и проверенные хосты выше)
+           - updated_at ASC
+        """
+        all_sent = self.get_sent_usernames()
+        queue = self.load_queue(exclude_sent=False)
+        candidates = []
+        for item in queue:
+            u = (item.get("username") or item.get("id") or "").strip().lower()
+            if not u or u in all_sent:
+                continue
+            st = str(item.get("status") or "").strip().lower()
+            if st in ("approved", "queued"):
+                candidates.append(item)
+
+        candidates.sort(
+            key=lambda x: (
+                int(x.get("attempts") or 0),
+                -int(x.get("references_count") or 0),
+                x.get("updated_at") or "",
+            )
+        )
+        return candidates
+
     def save_queue(self, queue: List[Dict[str, Any]]) -> None:
-        """Сохраняет очередь на диск в JSON (для обратной совместимости)."""
+        """Сохраняет очередь на диск в JSON (для обратной совместимости) с файловым_lock и атомарной записью."""
         self.queue_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.queue_file, "w", encoding="utf-8") as f:
-            json.dump(queue, f, ensure_ascii=False, indent=2)
+        tmp_file = self.queue_file.with_suffix(".json.tmp")
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            except (OSError, ImportError):
+                pass
+            try:
+                json.dump(queue, f, ensure_ascii=False, indent=2)
+            finally:
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                except (OSError, ImportError):
+                    pass
+        os.replace(tmp_file, self.queue_file)
 
     def update_item(
         self,

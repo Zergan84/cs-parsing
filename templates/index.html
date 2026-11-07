@@ -3521,6 +3521,15 @@
           </span>
         </div>
 
+        <div class="telemetry-item" title="LLava Vision model status">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="23 74 1 24 1 1 23 1 23 74"/><path d="M9 18l3 3m0 0l-3 3m3-3H3"/></svg>
+          <span>LLaVA:</span>
+          <span class="telemetry-val" id="llava-telemetry">
+            <span class="live-dot" id="llava-dot"></span>
+            <span id="llava-text">Not installed</span>
+          </span>
+        </div>
+
         <div class="telemetry-item" title="Secure tailscale mesh">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
           <span>Tailscale:</span>
@@ -4360,36 +4369,55 @@
         if (!res.ok) return;
         const data = await res.json();
 
-        // Ollama
+        // Ollama - three states: Checking, Online, Offline
         const llmDot = document.getElementById('llm-dot');
         const llmText = document.getElementById('llm-text');
         if (llmDot && llmText) {
           if (data.ollama && data.ollama.status === 'online') {
             llmDot.className = "live-dot";
-            llmText.textContent = data.ollama.model || "qwen2.5:7b";
+            llmText.textContent = "Online";
+          } else if (data.ollama && data.ollama.status === 'checking') {
+            llmDot.className = "live-dot checking";
+            llmText.textContent = "Checking";
           } else {
             llmDot.className = "live-dot off";
             llmText.textContent = "Offline";
           }
         }
 
+        // LLaVA - three states: Checking, Online, Offline
+        llavaDot = document.getElementById('llava-dot')
+        llavaText = document.getElementById('llava-text')
+        if (llavaDot && llavaText) {
+          if (data.llava && data.llava.status === 'online') {
+            llavaDot.className = "live-dot"
+            llavaText.textContent = "Online"
+          } else if (data.llava && data.llava.status === 'checking') {
+            llavaDot.className = "live-dot checking"
+            llavaText.textContent = "Checking"
+          } else {
+            llavaDot.className = "live-dot off"
+            llavaText.textContent = "Offline"
+          }
+        }
+
         // Tailscale
-        const tsDot = document.getElementById('ts-dot');
-        const tsText = document.getElementById('ts-text');
+        tsDot = document.getElementById('ts-dot')
+        tsText = document.getElementById('ts-text')
         if (tsDot && tsText) {
           if (data.tailscale && data.tailscale.status === 'active') {
-            tsDot.className = "live-dot";
-            tsText.textContent = "Active";
+            tsDot.className = "live-dot"
+            tsText.textContent = "Active"
           } else {
-            tsDot.className = "live-dot off";
-            tsText.textContent = "Off";
+            tsDot.className = "live-dot off"
+            tsText.textContent = "Off"
           }
         }
       } catch (e) {
-        console.warn('System health check warning:', e);
+        console.warn('System health check warning:', e)
       }
     }
-    const checkLlmStatus = checkSystemHealth;
+    const checkLlmStatus = checkSystemHealth
 
     // Emergency Stop / Resume Operations
     function updateEmergencyButtonState() {
@@ -7533,7 +7561,9 @@
       (window.__apPollIntervals || []).forEach(id => clearInterval(id));
       window.__apPollIntervals = [
         setInterval(checkGlobalStatus, 4000),
-        setInterval(checkSystemHealth, 15000),
+        // Auto-update system health every 15 seconds
+    // States cycle: Checking -> Online -> Offline based on real test requests
+    setInterval(checkSystemHealth, 15000),
         setInterval(loadAutopilot, 2500),
         setInterval(loadInbox, 6000),
       ];
