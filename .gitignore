@@ -28,3 +28,17 @@ data/photos/
 output/
 !output/.gitkeep
 .aider*
+
+# Временные скрипты анализа и миграции (не для коммита в репозиторий)
+app_health.py
+final_report.py
+fix_false_sent.py
+fix_queue_names.py
+migrate_profile_system.py
+migrate_profile_system_v2.py
+requeue_missing.py
+test_collect_photos.py
+test_llava_analysis.py
+test_llava_process.py
+test_save_to_db.py
+FINAL_REPORT.md
