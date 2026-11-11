@@ -191,6 +191,9 @@ def init_core_tables(db_file: Optional[Path | str] = None) -> None:
         _ensure_column(cur, "core_hosts", "countries_lived_json", "TEXT")
         _ensure_column(cur, "core_hosts", "priority", "INTEGER NOT NULL DEFAULT 10")
         _ensure_column(cur, "core_hosts", "attempts", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(cur, "core_hosts", "clean_name", "TEXT")
+        _ensure_column(cur, "core_hosts", "references_count", "INTEGER DEFAULT 0")
+        _ensure_column(cur, "core_hosts", "response_rate_pct", "REAL DEFAULT 90.0")
 
         cur.execute("CREATE INDEX IF NOT EXISTS idx_core_hosts_state ON core_hosts(trip_id, state);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_core_hosts_stars ON core_hosts(trip_id, score_stars DESC);")

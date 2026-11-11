@@ -238,6 +238,35 @@ class TestConsolidationDefectFixes(unittest.TestCase):
             self.assertEqual(mock_append_log.call_args[0][0]["status"], "SENT_SUCCESS")
             self.assertFalse(mock_append_log.call_args[1].get("sync_db", True))
 
+    # 8. ТЕСТ: Кнопка исключения из очереди (крестик) /api/autopilot/skip/{username}
+    def test_autopilot_skip_endpoint_marks_host_as_skipped(self):
+        from unittest.mock import patch
+        from fastapi.testclient import TestClient
+        from app import app
+        from core.models import Trip
+
+        client = TestClient(app)
+        mock_trip = Trip(id=TEST_TRIP_ID, url="", city="Sapporo", country="Japan", arrival_date="2026-12-01", departure_date="2026-12-05")
+
+        with patch("app.db_session", side_effect=lambda: get_connection(self.db_path)), \
+             patch("database.db_session", side_effect=lambda: get_connection(self.db_path)), \
+             patch("core.queue.db_session", side_effect=lambda: get_connection(self.db_path)), \
+             patch("core.database.get_active_trip", return_value=mock_trip):
+
+            res = client.post("/api/autopilot/skip/daiki_tester", json={"reason": "Manually messaged by user"})
+            self.assertEqual(res.status_code, 200)
+            data = res.json()
+            self.assertEqual(data["status"], "ok")
+            self.assertEqual(data["state"], "skipped")
+
+            # Проверяем, что в core_hosts статус изменился на 'skipped'
+            with get_connection(self.db_path) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT state, qc_notes FROM core_hosts WHERE host_id = 'h_defect_1';")
+                row = cur.fetchone()
+                self.assertEqual(row["state"], "skipped")
+                self.assertIn("Manually messaged by user", row["qc_notes"])
+
 
 if __name__ == "__main__":
     unittest.main()

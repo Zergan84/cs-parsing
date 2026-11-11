@@ -295,14 +295,17 @@ def verify_migration(db_path: Path, sent_log_path: Optional[Path] = None) -> Dic
             report["per_record_checks"]["sent_state_in_core"]["total"] = len(sent_entries)
 
             cur.execute("SELECT LOWER(username), timestamp, status FROM sending_history;")
-            hist_records = {(r[0], r[1]) for r in cur.fetchall()}
+            raw_hist = cur.fetchall()
+            hist_records = {(r[0], r[1]) for r in raw_hist}
+            hist_records_norm = {(r[0], str(r[1] or "").replace("T", " ").split(".")[0].strip()) for r in raw_hist}
 
             for entry in sent_entries:
                 u = str(entry.get("username") or entry.get("id") or "").strip().lower()
                 ts = str(entry.get("timestamp") or "").strip()
                 status = str(entry.get("status") or "").upper()
+                norm_ts = ts.replace("T", " ").split(".")[0].strip()
 
-                if (u, ts) not in hist_records:
+                if (u, ts) not in hist_records and (u, norm_ts) not in hist_records_norm:
                     _record_discrepancy("sent_log_to_db", "MISSING", {
                         "username": u,
                         "timestamp": ts,

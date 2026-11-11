@@ -2440,6 +2440,37 @@
       border-color: #FBBF24;
     }
 
+    /* Skip / Remove Cross button next to QUEUED pill */
+    .badge-ap-skip-btn {
+      background: rgba(239, 68, 68, 0.12);
+      color: #F87171;
+      border: 1px solid rgba(239, 68, 68, 0.35);
+      font-size: 11px;
+      font-weight: 700;
+      width: 22px;
+      height: 22px;
+      padding: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      user-select: none;
+      flex-shrink: 0;
+      line-height: 1;
+    }
+    .badge-ap-skip-btn:hover {
+      background: rgba(239, 68, 68, 0.28);
+      color: #FFFFFF;
+      border-color: #EF4444;
+      transform: translateY(-1px);
+      box-shadow: 0 2px 6px rgba(239, 68, 68, 0.4);
+    }
+    .badge-ap-skip-btn:active {
+      transform: translateY(0);
+    }
+
     /* 2) SENDING badge: red/coral #EF4444 with pulse animation */
     .badge-ap-sending {
       background: rgba(239, 68, 68, 0.2);
@@ -8587,6 +8618,7 @@
                 </div>
                 <div class="ap-badge-slot">
                   ${badgeHtml}
+                  <button type="button" class="badge-ap-skip-btn" onclick="event.stopPropagation(); skipAutopilotHost('${escapeHtml(c.username)}')" title="Исключить хоста из очереди (SKIPPED)">✕</button>
                 </div>
               </div>
             `;
@@ -8645,6 +8677,57 @@
         }
       }
     }
+
+    async function skipAutopilotHost(username) {
+      if (!username) return;
+      const uKey = String(username).trim().toLowerCase();
+      const rowEl = document.getElementById(`ready-row-${username}`) || document.querySelector(`[data-ready-username="${uKey}"]`);
+      if (rowEl) {
+        rowEl.style.transition = 'all 0.25s ease';
+        rowEl.style.opacity = '0.35';
+        rowEl.style.pointerEvents = 'none';
+      }
+
+      try {
+        const res = await fetch(`/api/autopilot/skip/${encodeURIComponent(username)}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ reason: "Исключен вручную из очереди автопилота" })
+        });
+        const data = await res.json();
+        if (res.ok && data.status === 'ok') {
+          if (rowEl) {
+            rowEl.classList.add('fade-out-item');
+            setTimeout(() => {
+              if (rowEl.parentNode) rowEl.parentNode.removeChild(rowEl);
+            }, 300);
+          }
+          if (window.apCurrentReadyList) {
+            window.apCurrentReadyList = window.apCurrentReadyList.filter(x => (x.username || '').toLowerCase() !== uKey);
+          }
+          if (typeof queueData !== 'undefined' && Array.isArray(queueData)) {
+            queueData = queueData.filter(q => (q.username || q.id || '').toLowerCase() !== uKey);
+            if (typeof renderQueueCards === 'function') {
+              renderQueueCards();
+            }
+          }
+          showToast(`Хост @${username} исключён из очереди (SKIPPED)`);
+        } else {
+          if (rowEl) {
+            rowEl.style.opacity = '1';
+            rowEl.style.pointerEvents = 'auto';
+          }
+          showToast(`Ошибка исключения @${username}: ${data.detail || data.error || 'Сбой запроса'}`, 'error');
+        }
+      } catch (err) {
+        if (rowEl) {
+          rowEl.style.opacity = '1';
+          rowEl.style.pointerEvents = 'auto';
+        }
+        showToast(`Ошибка сети при исключении @${username}: ${err.message}`, 'error');
+      }
+    }
+    window.skipAutopilotHost = skipAutopilotHost;
 
     async function handleStartOrResume() {
       if (autopilotPaused) {

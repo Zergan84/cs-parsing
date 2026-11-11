@@ -2141,12 +2141,21 @@ async def approve_selected_hosts(payload: ApproveSelectedPayload):
     return {"status": "ok", "approved_count": count, "stats": stats, "queue": queue}
 
 
+class SkipHostPayload(BaseModel):
+    reason: Optional[str] = "Manually skipped by user"
+
+
 @app.delete("/api/queue/delete/{username}")
-async def delete_queue_item(username: str):
+@app.post("/api/queue/delete/{username}")
+@app.post("/api/autopilot/skip/{username}")
+@app.delete("/api/autopilot/skip/{username}")
+async def delete_queue_item(username: str, payload: Optional[SkipHostPayload] = None):
     """
     По ТЗ: удаление хоста из очереди НЕ удаляет его из базы данных и НЕ стирает связь с трипом!
     Хост переводится в статус 'skipped' в core_hosts с сохранением всей истории и снимка.
+    Инвариант: если хост уже был отправлен ('sent'), его статус не может быть деградирован.
     """
+    reason = (payload.reason if payload and payload.reason else "Manually skipped by user").strip()
     u_clean = username.strip().lower()
     from core.database import get_active_trip, log_audit
     active_trip = get_active_trip()
@@ -2158,30 +2167,30 @@ async def delete_queue_item(username: str):
         if active_trip_id:
             cur.execute("""
                 UPDATE core_hosts 
-                SET state = 'skipped', updated_at = CURRENT_TIMESTAMP
+                SET state = 'skipped', qc_notes = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE trip_id = ? 
                   AND (LOWER(host_id) = ? OR LOWER(username) = ?)
                   AND state != 'sent';
-            """, (active_trip_id, u_clean, u_clean))
+            """, (f"SKIPPED: {reason}", active_trip_id, u_clean, u_clean))
         else:
             cur.execute("""
                 UPDATE core_hosts 
-                SET state = 'skipped', updated_at = CURRENT_TIMESTAMP
+                SET state = 'skipped', qc_notes = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE (LOWER(host_id) = ? OR LOWER(username) = ?)
                   AND state != 'sent';
-            """, (u_clean, u_clean))
+            """, (f"SKIPPED: {reason}", u_clean, u_clean))
         removed = cur.rowcount
 
     if active_trip_id:
         log_audit(
             trip_id=active_trip_id,
-            module="QUEUE",
-            event="HOST_REMOVED_FROM_QUEUE",
+            module="AUTOPILOT",
+            event="HOST_SKIPPED",
             host_id=username,
-            details={"action": "state_changed_to_skipped", "reason": "user_queue_removal"}
+            details={"action": "state_changed_to_skipped", "reason": reason}
         )
 
-    # 3. Синхронизируем shadow view JSON
+    # 2. Синхронизируем shadow view JSON
     try:
         queue = queue_manager.load_queue(exclude_sent=False, trip_id=active_trip_id)
         queue = [x for x in queue if str(x.get("username", "")).strip().lower() != u_clean and str(x.get("id", "")).strip().lower() != u_clean]
