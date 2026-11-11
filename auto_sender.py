@@ -184,6 +184,7 @@ class AutoSender:
         self.headless = headless
         self.target_username = target_username
         self.test_mode = test_mode
+        self.trip_id = trip_id
         if not self.trip_id:
             from core.database import get_active_trip
             active_trip = get_active_trip()
@@ -277,7 +278,7 @@ class AutoSender:
                     timestamp=entry.get("timestamp"),
                 )
             except Exception as e:
-            log_step("DEBUG", f"SQLite sending_history sync note: {e}")
+                log_step("DEBUG", f"SQLite sending_history sync note: {e}")
 
     def update_queue_status(
         self,
@@ -334,6 +335,10 @@ class AutoSender:
 
                 for item in queue:
                     if item.get("username") == username:
+                        cur_item_st = str(item.get("status") or "").lower()
+                        if cur_item_st in ("sent", "was sent") and status_norm != "sent":
+                            # Необратимость sent: статус sent нельзя перезаписывать
+                            break
                         item["status"] = new_status
                         if notes:
                             item["notes"] = notes
@@ -385,16 +390,18 @@ class AutoSender:
                 }
                 c_st = st_map.get(status_norm)
                 if c_st:
+                    # Инвариант: нельзя перевести уже отправленного хоста из sent в uncertain, skipped и т.д.
                     cur.execute(
                         """
                         UPDATE core_hosts
-                        SET state = ?,
+                        SET state = CASE WHEN state = 'sent' THEN 'sent' ELSE ? END,
                             sent_at = CASE WHEN ? = 'sent' THEN coalesce(sent_at, ?) ELSE sent_at END,
-                            qc_notes = CASE WHEN ? IN ('skipped', 'uncertain') THEN coalesce(?, qc_notes) ELSE qc_notes END,
+                            qc_notes = CASE WHEN state = 'sent' THEN qc_notes WHEN ? IN ('skipped', 'uncertain') THEN coalesce(?, qc_notes) ELSE qc_notes END,
                             updated_at = ?
-                        WHERE (LOWER(username) = LOWER(?) OR LOWER(host_id) = LOWER(?));
+                        WHERE (LOWER(username) = LOWER(?) OR LOWER(host_id) = LOWER(?))
+                          AND (state != 'sent' OR ? = 'sent');
                         """,
-                        (c_st, c_st, effective_sent_at or now_iso, c_st, notes, now_iso, username, username),
+                        (c_st, c_st, effective_sent_at or now_iso, c_st, notes, now_iso, username, username, c_st),
                     )
         except Exception as e:
             log_step("WARN", f"Ошибка синхронизации статуса: {e}")

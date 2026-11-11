@@ -374,10 +374,35 @@ def init_core_tables(db_file: Optional[Path | str] = None) -> None:
             button_selector TEXT,
             notes TEXT,
             error_details TEXT,
-            timestamp TEXT NOT NULL,
-            FOREIGN KEY (host_id) REFERENCES hosts(id) ON DELETE CASCADE
+            timestamp TEXT NOT NULL
         );
         """)
+        # Миграция: отвязка sending_history от устаревшей legacy-таблицы hosts
+        cur.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='sending_history';")
+        sh_row = cur.fetchone()
+        if sh_row and "REFERENCES hosts" in (sh_row[0] or ""):
+            cur.execute("PRAGMA foreign_keys=OFF;")
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS sending_history_canonical (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                host_id TEXT NOT NULL,
+                username TEXT NOT NULL,
+                status TEXT NOT NULL,
+                http_status INTEGER,
+                mode TEXT NOT NULL,
+                proof_screenshot TEXT,
+                before_screenshot TEXT,
+                button_selector TEXT,
+                notes TEXT,
+                error_details TEXT,
+                timestamp TEXT NOT NULL
+            );
+            """)
+            cur.execute("INSERT OR REPLACE INTO sending_history_canonical SELECT id, host_id, username, status, http_status, mode, proof_screenshot, before_screenshot, button_selector, notes, error_details, timestamp FROM sending_history;")
+            cur.execute("DROP TABLE sending_history;")
+            cur.execute("ALTER TABLE sending_history_canonical RENAME TO sending_history;")
+            cur.execute("PRAGMA foreign_keys=ON;")
+
         cur.execute("CREATE INDEX IF NOT EXISTS idx_sh_username ON sending_history(username);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_sh_timestamp ON sending_history(timestamp);")
 

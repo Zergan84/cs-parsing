@@ -7,15 +7,19 @@ scripts/verify_migration.py
 2. PRAGMA integrity_check и PRAGMA foreign_key_check.
 3. Построчная сверка user_trips -> core_trips (каждая запись и ключевые поля).
 4. Построчная сверка hosts -> core_hosts и core_host_snapshots (каждый хост и неизменяемый снимок).
-5. Построчная сверка sent_log.json -> sending_history и core_hosts.state == 'sent'.
-6. Построчная сверка inbox_conversations -> core_hosts.state == 'inbox'.
-7. Категоризация несоответствий по типам:
+5. Верификация содержимого snapshots (raw_data_json валидный и непустой JSON).
+6. Верификация связей (host_id + trip_id) из trip_hosts в core_hosts.
+7. Верификация полей sending_history (status, username, timestamp).
+8. Сверка sent_log.json -> sending_history и core_hosts.state == 'sent'.
+   Если sent_log отсутствует, явно фиксируется статус NOT VERIFIED.
+9. Построчная сверка inbox_conversations -> core_hosts.state == 'inbox'.
+10. Категоризация несоответствий по типам:
    - MISSING
    - EXTRA
    - DUPLICATE
    - FIELD_MISMATCH
    - UNRESOLVED_RELATIONSHIP
-8. Проверка архитектурных инвариантов бизнес-состояний.
+11. Проверка архитектурных инвариантов бизнес-состояний.
 """
 
 import argparse
@@ -51,6 +55,7 @@ def verify_migration(db_path: Path, sent_log_path: Optional[Path] = None) -> Dic
 
     report: Dict[str, Any] = {
         "db_path": str(db_file),
+        "sent_log_path": str(effective_sent_log) if effective_sent_log else None,
         "checks_passed": True,
         "integrity_check": None,
         "category_counts": {
@@ -65,6 +70,9 @@ def verify_migration(db_path: Path, sent_log_path: Optional[Path] = None) -> Dic
             "user_trips": {"total": 0, "verified": 0, "discrepancies": []},
             "hosts_to_core": {"total": 0, "verified": 0, "discrepancies": []},
             "hosts_snapshots": {"total": 0, "verified": 0, "discrepancies": []},
+            "snapshots_content": {"total": 0, "verified": 0, "discrepancies": []},
+            "trip_hosts_relations": {"total": 0, "verified": 0, "discrepancies": []},
+            "sending_history_fields": {"total": 0, "verified": 0, "discrepancies": []},
             "sent_log_to_db": {"total": 0, "verified": 0, "discrepancies": []},
             "sent_state_in_core": {"total": 0, "verified": 0, "discrepancies": []},
             "inbox_conversations": {"total": 0, "verified": 0, "discrepancies": []},
@@ -186,7 +194,7 @@ def verify_migration(db_path: Path, sent_log_path: Optional[Path] = None) -> Dic
                             "actual": ch["username"],
                         })
 
-                # Проверка снимка
+                # Проверка наличия снимка
                 has_snapshot = hid in snapshots_host_ids or uname in snapshots_host_ids
                 if not has_snapshot and matched_core:
                     actual_hids = [c["host_id"].lower() for c in matched_core]
@@ -202,8 +210,81 @@ def verify_migration(db_path: Path, sent_log_path: Optional[Path] = None) -> Dic
                 else:
                     report["per_record_checks"]["hosts_snapshots"]["verified"] += 1
 
-        # 5. Per-Record Check: sent_log.json -> sending_history & core_hosts.state == 'sent'
-        if effective_sent_log and "sending_history" in tables:
+        # 5. Сверка содержимого snapshots (raw_data_json валидный и непустой JSON)
+        if "core_host_snapshots" in tables:
+            cur.execute("SELECT host_id, trip_id, raw_data_json FROM core_host_snapshots;")
+            all_snapshots = cur.fetchall()
+            report["per_record_checks"]["snapshots_content"]["total"] = len(all_snapshots)
+            for sn in all_snapshots:
+                raw_json = sn["raw_data_json"]
+                try:
+                    parsed = json.loads(raw_json)
+                    if not isinstance(parsed, dict) or len(parsed) == 0:
+                        _record_discrepancy("snapshots_content", "FIELD_MISMATCH", {
+                            "host_id": sn["host_id"],
+                            "trip_id": sn["trip_id"],
+                            "error": "Snapshot raw_data_json is empty or not a dict",
+                        })
+                    else:
+                        report["per_record_checks"]["snapshots_content"]["verified"] += 1
+                except Exception as ex:
+                    _record_discrepancy("snapshots_content", "FIELD_MISMATCH", {
+                        "host_id": sn["host_id"],
+                        "trip_id": sn["trip_id"],
+                        "error": f"Snapshot raw_data_json corrupted: {ex}",
+                    })
+
+        # 6. Сверка связей (host_id + trip_id) из trip_hosts в core_hosts
+        if "trip_hosts" in tables and "core_hosts" in tables:
+            cur.execute("SELECT LOWER(trip_id), LOWER(host_id) FROM trip_hosts;")
+            th_rows = cur.fetchall()
+            report["per_record_checks"]["trip_hosts_relations"]["total"] = len(th_rows)
+
+            cur.execute("SELECT LOWER(trip_id), LOWER(host_id), LOWER(username) FROM core_hosts;")
+            ch_pairs = set()
+            ch_uname_pairs = set()
+            for r in cur.fetchall():
+                ch_pairs.add((r[0], r[1]))
+                ch_uname_pairs.add((r[0], r[2]))
+
+            for th in th_rows:
+                t_id, h_id = th[0], th[1]
+                if (t_id, h_id) in ch_pairs or (t_id, h_id) in ch_uname_pairs:
+                    report["per_record_checks"]["trip_hosts_relations"]["verified"] += 1
+                else:
+                    _record_discrepancy("trip_hosts_relations", "UNRESOLVED_RELATIONSHIP", {
+                        "trip_id": t_id,
+                        "host_id": h_id,
+                        "error": "Relationship (trip_id, host_id) from trip_hosts not resolved in core_hosts",
+                    })
+
+        # 7. Сверка полей sending_history (status, username, timestamp)
+        if "sending_history" in tables:
+            cur.execute("SELECT id, host_id, username, status, timestamp, http_status FROM sending_history;")
+            hist_rows = cur.fetchall()
+            report["per_record_checks"]["sending_history_fields"]["total"] = len(hist_rows)
+            for hr in hist_rows:
+                status_val = str(hr["status"] or "").strip()
+                uname_val = str(hr["username"] or hr["host_id"] or "").strip()
+                ts_val = str(hr["timestamp"] or "").strip()
+                if not status_val or not uname_val or not ts_val:
+                    _record_discrepancy("sending_history_fields", "FIELD_MISMATCH", {
+                        "history_id": hr["id"],
+                        "username": uname_val,
+                        "status": status_val,
+                        "timestamp": ts_val,
+                        "error": "Required field in sending_history is empty",
+                    })
+                else:
+                    report["per_record_checks"]["sending_history_fields"]["verified"] += 1
+
+        # 8. Per-Record Check: sent_log.json -> sending_history & core_hosts.state == 'sent'
+        if not effective_sent_log or not effective_sent_log.exists():
+            report["per_record_checks"]["sent_log_to_db"]["status"] = "NOT VERIFIED"
+            report["per_record_checks"]["sent_log_to_db"]["message"] = "sent_log.json not found"
+            report["per_record_checks"]["sent_state_in_core"]["status"] = "NOT VERIFIED"
+            report["per_record_checks"]["sent_state_in_core"]["message"] = "sent_log.json not found"
+        elif "sending_history" in tables:
             try:
                 with open(effective_sent_log, "r", encoding="utf-8") as f:
                     sent_entries = json.load(f)
@@ -242,7 +323,7 @@ def verify_migration(db_path: Path, sent_log_path: Optional[Path] = None) -> Dic
                 else:
                     report["per_record_checks"]["sent_state_in_core"]["verified"] += 1
 
-        # 6. Per-Record Check: inbox_conversations -> core_hosts
+        # 9. Per-Record Check: inbox_conversations -> core_hosts
         if "inbox_conversations" in tables:
             cur.execute("SELECT * FROM inbox_conversations;")
             inbox_rows = cur.fetchall()
@@ -258,7 +339,7 @@ def verify_migration(db_path: Path, sent_log_path: Optional[Path] = None) -> Dic
                 else:
                     report["per_record_checks"]["inbox_conversations"]["verified"] += 1
 
-        # 7. Invariants Checks
+        # 10. Invariants Checks
         # Sent hosts must never be in draft or approved
         if "sending_history" in tables:
             cur.execute("""
@@ -343,11 +424,13 @@ def verify_migration(db_path: Path, sent_log_path: Optional[Path] = None) -> Dic
 def main():
     parser = argparse.ArgumentParser(description="Verify consolidation and migration integrity with per-record checking")
     parser.add_argument("--db-path", type=str, default=None, help="Database file path")
+    parser.add_argument("--sent-log", type=str, default=None, help="Path to sent_log.json")
     args = parser.parse_args()
 
     db_path = Path(args.db_path) if args.db_path else get_db_path()
+    sent_log_path = Path(args.sent_log) if args.sent_log else None
     try:
-        report = verify_migration(db_path)
+        report = verify_migration(db_path, sent_log_path=sent_log_path)
     except Exception as e:
         logger.error(f"Verification script failed: {e}")
         sys.exit(1)
@@ -356,6 +439,7 @@ def main():
     print("  MIGRATION INTEGRITY & PER-RECORD FIDELITY REPORT")
     print("=" * 65)
     print(f"Database:        {report['db_path']}")
+    print(f"Sent Log:        {report['sent_log_path'] or 'NOT PROVIDED'}")
     print(f"Overall Status:  {'PASSED [SUCCESS]' if report['checks_passed'] else 'FAILED [VIOLATIONS]'}")
     print(f"Integrity Check: {report['integrity_check']}")
     print(f"FK Violations:   {len(report['foreign_key_violations'])}")
@@ -367,6 +451,10 @@ def main():
 
     print("\n--- PER-RECORD FIDELITY CHECKS ---")
     for name, stats in report["per_record_checks"].items():
+        if stats.get("status") == "NOT VERIFIED":
+            msg = stats.get("message") or "Source file missing"
+            print(f"  {name:25}: [NOT VERIFIED ({msg})]")
+            continue
         total = stats["total"]
         verified = stats["verified"]
         disc = len(stats["discrepancies"])

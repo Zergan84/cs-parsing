@@ -7,6 +7,7 @@ core/autopilot.py - Модуль АВТОПИЛОТ.
 4. Ротацию проблемных хостов в конец очереди (`move_host_to_end_of_queue`) и защиту от повторной отправки.
 """
 
+import json
 import logging
 import random
 from datetime import date, datetime
@@ -161,6 +162,7 @@ class AutopilotEngine:
     def mark_as_sent(self, host_id: str, http_status: int, notes: Optional[str] = None) -> bool:
         """
         Атомарно и идемпотентно фиксирует успешную отправку запроса в `core_hosts`, `sending_history` и `core_audit_logs`.
+        Все три таблицы обновляются в единой транзакции SQLite.
         Требует обязательного проверенного HTTP-кода (200-299).
         """
         if not (200 <= http_status <= 299):
@@ -169,14 +171,19 @@ class AutopilotEngine:
         now_iso = datetime.now().isoformat()
         with get_connection(self.db_file) as conn:
             cur = conn.cursor()
-            # Проверка идемпотентности: если уже отправлен, повторно не пишем
             cur.execute(
-                "SELECT state FROM core_hosts WHERE trip_id = ? AND (host_id = ? OR LOWER(username) = LOWER(?));",
+                "SELECT state, host_id, username FROM core_hosts WHERE trip_id = ? AND (host_id = ? OR LOWER(username) = LOWER(?));",
                 (self.trip_id, host_id, host_id),
             )
             row = cur.fetchone()
-            if row and row["state"] == "sent":
+            if not row:
+                return False
+            if row["state"] == "sent":
+                # Идемпотентность: хост уже отправлен, повторно не пишем в sending_history и audit log
                 return True
+
+            canon_host_id = row["host_id"]
+            canon_username = row["username"]
 
             cur.execute(
                 """
@@ -186,26 +193,28 @@ class AutopilotEngine:
                 """,
                 (now_iso, now_iso, self.trip_id, host_id, host_id),
             )
-            affected = cur.rowcount > 0
+            if cur.rowcount == 0:
+                return True
 
-        if affected:
-            self.record_sending_attempt(
-                host_id_or_username=host_id,
-                status="SENT_SUCCESS",
-                mode="live",
-                http_status=http_status,
-                notes=notes or "Verified via Autopilot",
-                timestamp=now_iso,
+            # Атомарная запись в sending_history внутри той же транзакции
+            cur.execute(
+                """
+                INSERT INTO sending_history (
+                    host_id, username, status, http_status, mode, notes, timestamp
+                ) VALUES (?, ?, 'SENT_SUCCESS', ?, 'live', ?, ?);
+                """,
+                (canon_host_id, canon_username, http_status, notes or "Verified via Autopilot", now_iso),
             )
-            log_audit(
-                trip_id=self.trip_id,
-                module="AUTOPILOT",
-                event="REQUEST_SENT_VERIFIED",
-                host_id=host_id,
-                details={"http_status": http_status, "notes": notes},
-                db_file=self.db_file,
+
+            # Атомарная запись в core_audit_logs внутри той же транзакции
+            cur.execute(
+                """
+                INSERT INTO core_audit_logs (timestamp, trip_id, module, event, host_id, details_json)
+                VALUES (?, ?, 'AUTOPILOT', 'REQUEST_SENT_VERIFIED', ?, ?);
+                """,
+                (now_iso, self.trip_id, canon_host_id, json.dumps({"http_status": http_status, "notes": notes}, ensure_ascii=False)),
             )
-        return affected
+            return True
 
     def mark_as_uncertain(
         self,
@@ -217,14 +226,30 @@ class AutopilotEngine:
         notes: Optional[str] = None,
     ) -> bool:
         """
-        Фиксирует неизвестный/неподтвержденный исход отправки (таймаут, HTTP 500, сетевой сбой).
+        Атомарно фиксирует неизвестный/неподтвержденный исход отправки (таймаут, HTTP 500, сетевой сбой).
+        Все изменения (core_hosts, sending_history, core_audit_logs) производятся в единой транзакции.
         Переводит host в state = 'uncertain', исключая его из автоматической очереди.
+        Необратимость: если хост уже 'sent', его статус не может быть перезаписан.
         """
         now_iso = datetime.now().isoformat()
         clean_notes = notes or (f"HTTP {http_status}: {error_details}" if http_status else (error_details or "Uncertain outcome"))
 
         with get_connection(self.db_file) as conn:
             cur = conn.cursor()
+            cur.execute(
+                "SELECT state, host_id, username FROM core_hosts WHERE trip_id = ? AND (host_id = ? OR LOWER(username) = LOWER(?));",
+                (self.trip_id, host_id, host_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+            if row["state"] == "sent":
+                # Необратимость sent: уже отправленного хоста нельзя перевести в uncertain!
+                return False
+
+            canon_host_id = row["host_id"]
+            canon_username = row["username"]
+
             cur.execute(
                 """
                 UPDATE core_hosts
@@ -236,35 +261,57 @@ class AutopilotEngine:
                 """,
                 (f"UNCERTAIN: {clean_notes}", now_iso, self.trip_id, host_id, host_id),
             )
-            affected = cur.rowcount > 0
+            if cur.rowcount == 0:
+                return False
 
-        if affected:
-            self.record_sending_attempt(
-                host_id_or_username=host_id,
-                status="UNCERTAIN",
-                mode="live",
-                http_status=http_status,
-                proof_screenshot=proof_screenshot,
-                before_screenshot=before_screenshot,
-                notes=clean_notes,
-                error_details=error_details,
-                timestamp=now_iso,
+            cur.execute(
+                """
+                INSERT INTO sending_history (
+                    host_id, username, status, http_status, mode,
+                    proof_screenshot, before_screenshot, notes, error_details, timestamp
+                ) VALUES (?, ?, 'UNCERTAIN', ?, 'live', ?, ?, ?, ?, ?);
+                """,
+                (
+                    canon_host_id,
+                    canon_username,
+                    http_status,
+                    proof_screenshot,
+                    before_screenshot,
+                    clean_notes,
+                    error_details,
+                    now_iso,
+                ),
             )
-            log_audit(
-                trip_id=self.trip_id,
-                module="AUTOPILOT",
-                event="REQUEST_SEND_UNCERTAIN",
-                host_id=host_id,
-                details={"http_status": http_status, "error_details": error_details, "notes": clean_notes},
-                db_file=self.db_file,
+            cur.execute(
+                """
+                INSERT INTO core_audit_logs (timestamp, trip_id, module, event, host_id, details_json)
+                VALUES (?, ?, 'AUTOPILOT', 'REQUEST_SEND_UNCERTAIN', ?, ?);
+                """,
+                (now_iso, self.trip_id, canon_host_id, json.dumps({"http_status": http_status, "error_details": error_details, "notes": clean_notes}, ensure_ascii=False)),
             )
-        return affected
+            return True
 
     def mark_as_skipped(self, host_id: str, reason: str) -> bool:
-        """Фиксирует пропуск хоста при невозможности отправки с сохранением причины."""
+        """
+        Фиксирует пропуск хоста при невозможности отправки с сохранением причины.
+        Атомарно обновляет core_hosts и core_audit_logs в одной транзакции.
+        Необратимость: если хост уже 'sent', статус 'sent' неприкосновенен.
+        """
         now_iso = datetime.now().isoformat()
         with get_connection(self.db_file) as conn:
             cur = conn.cursor()
+            cur.execute(
+                "SELECT state, host_id, username FROM core_hosts WHERE trip_id = ? AND (host_id = ? OR LOWER(username) = LOWER(?));",
+                (self.trip_id, host_id, host_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+            if row["state"] == "sent":
+                # Необратимость sent: уже отправленного хоста нельзя пропустить!
+                return False
+
+            canon_host_id = row["host_id"]
             cur.execute(
                 """
                 UPDATE core_hosts
@@ -273,18 +320,17 @@ class AutopilotEngine:
                 """,
                 (reason, now_iso, self.trip_id, host_id, host_id),
             )
-            affected = cur.rowcount > 0
+            if cur.rowcount == 0:
+                return False
 
-        if affected:
-            log_audit(
-                trip_id=self.trip_id,
-                module="AUTOPILOT",
-                event="REQUEST_SKIPPED",
-                host_id=host_id,
-                details={"reason": reason},
-                db_file=self.db_file,
+            cur.execute(
+                """
+                INSERT INTO core_audit_logs (timestamp, trip_id, module, event, host_id, details_json)
+                VALUES (?, ?, 'AUTOPILOT', 'REQUEST_SKIPPED', ?, ?);
+                """,
+                (now_iso, self.trip_id, canon_host_id, json.dumps({"reason": reason}, ensure_ascii=False)),
             )
-        return affected
+            return True
 
     def move_host_to_end_of_queue(self, host_id: str, reason: str = "") -> bool:
         """Перемещает проблемного хоста в конец очереди (понижая priority на -100) без остановки автопилота."""
