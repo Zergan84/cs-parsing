@@ -146,6 +146,98 @@ class TestConsolidationDefectFixes(unittest.TestCase):
             cur.execute("SELECT state FROM core_hosts WHERE host_id = 'h_defect_1';")
             self.assertEqual(cur.fetchone()[0], HostState.SENT.value)
 
+    # 5. ТЕСТ: Подтверждённая отправка: сбой mark_as_sent() переводит в UNCERTAIN и не ставит Sent
+    def test_handle_submission_result_mark_as_sent_failure_transitions_to_uncertain(self):
+        from unittest.mock import MagicMock, patch
+        sender = AutoSender(trip_id=TEST_TRIP_ID, test_mode=True)
+        sender.autopilot_engine = MagicMock()
+        sender.autopilot_engine.mark_as_sent.return_value = False  # Сбой фиксации!
+
+        with patch.object(sender, "update_queue_status") as mock_update_queue, \
+             patch.object(sender, "append_sent_log") as mock_append_log:
+
+            result = sender.handle_submission_result(
+                username="daiki_tester",
+                host_name="Daiki",
+                target_city="Sapporo",
+                arrival_date="2026-12-01",
+                departure_date="2026-12-05",
+                message="Hello Daiki",
+                submission_confirmed=True,
+                http_status=200,
+            )
+
+            # 1. Результат отправки не должен считаться успешным
+            self.assertFalse(result)
+
+            # 2. update_queue_status(..., "Sent") НЕ должен вызываться
+            sent_calls = [call for call in mock_update_queue.call_args_list if call[0][1] == "Sent"]
+            self.assertEqual(len(sent_calls), 0)
+
+            # 3. Фиксация в UNCERTAIN во избежание дублирования отправки
+            sender.autopilot_engine.mark_as_uncertain.assert_called_once()
+            mock_update_queue.assert_called_with("daiki_tester", "Uncertain", notes=mock_update_queue.call_args[1].get("notes") or mock_update_queue.call_args[0][2], increment_attempts=True, sync_db=False)
+            mock_append_log.assert_called_once()
+            self.assertEqual(mock_append_log.call_args[0][0]["status"], "UNCERTAIN")
+
+    # 6. ТЕСТ: Отсутствие AutopilotEngine не позволяет зафиксировать Sent и переводит в UNCERTAIN
+    def test_handle_submission_result_missing_autopilot_engine(self):
+        from unittest.mock import patch
+        sender = AutoSender(trip_id=TEST_TRIP_ID, test_mode=True)
+        sender.autopilot_engine = None  # Движок отсутствует!
+
+        with patch.object(sender, "update_queue_status") as mock_update_queue, \
+             patch.object(sender, "append_sent_log") as mock_append_log:
+
+            result = sender.handle_submission_result(
+                username="daiki_tester",
+                host_name="Daiki",
+                target_city="Sapporo",
+                arrival_date="2026-12-01",
+                departure_date="2026-12-05",
+                message="Hello Daiki",
+                submission_confirmed=True,
+                http_status=200,
+            )
+
+            self.assertFalse(result)
+            # update_queue_status(..., "Sent") НЕ вызывается
+            sent_calls = [call for call in mock_update_queue.call_args_list if call[0][1] == "Sent"]
+            self.assertEqual(len(sent_calls), 0)
+
+            # Перевод в Uncertain
+            uncertain_calls = [call for call in mock_update_queue.call_args_list if call[0][1] == "Uncertain"]
+            self.assertEqual(len(uncertain_calls), 1)
+            self.assertEqual(mock_append_log.call_args[0][0]["status"], "UNCERTAIN")
+
+    # 7. ТЕСТ: Успешная фиксация обновляет JSON-очередь с sync_db=False
+    def test_handle_submission_result_success_updates_queue_with_sync_db_false(self):
+        from unittest.mock import MagicMock, patch
+        sender = AutoSender(trip_id=TEST_TRIP_ID, test_mode=True)
+        sender.autopilot_engine = MagicMock()
+        sender.autopilot_engine.mark_as_sent.return_value = True  # Успешная фиксация
+
+        with patch.object(sender, "update_queue_status") as mock_update_queue, \
+             patch.object(sender, "append_sent_log") as mock_append_log:
+
+            result = sender.handle_submission_result(
+                username="daiki_tester",
+                host_name="Daiki",
+                target_city="Sapporo",
+                arrival_date="2026-12-01",
+                departure_date="2026-12-05",
+                message="Hello Daiki",
+                submission_confirmed=True,
+                http_status=200,
+            )
+
+            self.assertTrue(result)
+            # Обновление очереди со статусом Sent и sync_db=False (без дублирующих записей в БД)
+            mock_update_queue.assert_called_once_with("daiki_tester", "Sent", notes=mock_update_queue.call_args[1].get("notes") or mock_update_queue.call_args[0][2], sync_db=False)
+            mock_append_log.assert_called_once()
+            self.assertEqual(mock_append_log.call_args[0][0]["status"], "SENT_SUCCESS")
+            self.assertFalse(mock_append_log.call_args[1].get("sync_db", True))
+
 
 if __name__ == "__main__":
     unittest.main()

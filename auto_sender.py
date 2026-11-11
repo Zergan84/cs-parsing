@@ -222,7 +222,7 @@ class AutoSender:
         except Exception:
             return 0
 
-    def append_sent_log(self, entry: Dict[str, Any]) -> None:
+    def append_sent_log(self, entry: Dict[str, Any], sync_db: bool = True) -> None:
         """Записывает подробный результат отправки в sent_log.json с файловым_lock и атомарной записью."""
         logs = []
         if SENT_LOG_FILE.exists():
@@ -261,7 +261,7 @@ class AutoSender:
         os.replace(tmp_file, SENT_LOG_FILE)
 
         # Каноническая запись попытки отправки в SQLite sending_history через AutopilotEngine
-        if self.trip_id:
+        if sync_db and self.trip_id:
             try:
                 from core.autopilot import AutopilotEngine
                 engine = AutopilotEngine(trip_id=self.trip_id)
@@ -288,6 +288,7 @@ class AutoSender:
         sent_at: Optional[str] = None,
         attempts: Optional[int] = None,
         increment_attempts: bool = False,
+        sync_db: bool = True,
     ) -> None:
         """Обновляет статус карточки хоста в requests_queue.json и SQLite.
 
@@ -370,41 +371,42 @@ class AutoSender:
             except Exception as e:
                 log_step("WARN", f"Ошибка обновления очереди JSON: {e}")
 
-        try:
-            from database import db_session
-            with db_session() as conn:
-                cur = conn.cursor()
-                # Единый источник истины: обновление исключительно core_hosts
-                st_map = {
-                    "sent": "sent",
-                    "was sent": "sent",
-                    "skipped": "skipped",
-                    "failed": "skipped",
-                    "uncertain": "uncertain",
-                    "verification_required": "uncertain",
-                    "declined": "skipped",
-                    "approved": "approved",
-                    "queued": "selected",
-                    "qc_review_required": "drafted",
-                    "draft": "drafted",
-                }
-                c_st = st_map.get(status_norm)
-                if c_st:
-                    # Инвариант: нельзя перевести уже отправленного хоста из sent в uncertain, skipped и т.д.
-                    cur.execute(
-                        """
-                        UPDATE core_hosts
-                        SET state = CASE WHEN state = 'sent' THEN 'sent' ELSE ? END,
-                            sent_at = CASE WHEN ? = 'sent' THEN coalesce(sent_at, ?) ELSE sent_at END,
-                            qc_notes = CASE WHEN state = 'sent' THEN qc_notes WHEN ? IN ('skipped', 'uncertain') THEN coalesce(?, qc_notes) ELSE qc_notes END,
-                            updated_at = ?
-                        WHERE (LOWER(username) = LOWER(?) OR LOWER(host_id) = LOWER(?))
-                          AND (state != 'sent' OR ? = 'sent');
-                        """,
-                        (c_st, c_st, effective_sent_at or now_iso, c_st, notes, now_iso, username, username, c_st),
-                    )
-        except Exception as e:
-            log_step("WARN", f"Ошибка синхронизации статуса: {e}")
+        if sync_db:
+            try:
+                from database import db_session
+                with db_session() as conn:
+                    cur = conn.cursor()
+                    # Единый источник истины: обновление исключительно core_hosts
+                    st_map = {
+                        "sent": "sent",
+                        "was sent": "sent",
+                        "skipped": "skipped",
+                        "failed": "skipped",
+                        "uncertain": "uncertain",
+                        "verification_required": "uncertain",
+                        "declined": "skipped",
+                        "approved": "approved",
+                        "queued": "selected",
+                        "qc_review_required": "drafted",
+                        "draft": "drafted",
+                    }
+                    c_st = st_map.get(status_norm)
+                    if c_st:
+                        # Инвариант: нельзя перевести уже отправленного хоста из sent в uncertain, skipped и т.д.
+                        cur.execute(
+                            """
+                            UPDATE core_hosts
+                            SET state = CASE WHEN state = 'sent' THEN 'sent' ELSE ? END,
+                                sent_at = CASE WHEN ? = 'sent' THEN coalesce(sent_at, ?) ELSE sent_at END,
+                                qc_notes = CASE WHEN state = 'sent' THEN qc_notes WHEN ? IN ('skipped', 'uncertain') THEN coalesce(?, qc_notes) ELSE qc_notes END,
+                                updated_at = ?
+                            WHERE (LOWER(username) = LOWER(?) OR LOWER(host_id) = LOWER(?))
+                              AND (state != 'sent' OR ? = 'sent');
+                            """,
+                            (c_st, c_st, effective_sent_at or now_iso, c_st, notes, now_iso, username, username, c_st),
+                        )
+            except Exception as e:
+                log_step("WARN", f"Ошибка синхронизации статуса: {e}")
 
     def move_host_to_end_of_queue(self, username: str, reason: str = "") -> None:
         """Перемещает проблемного хоста в самый конец очереди (вниз левого стакана) без остановки автопилота."""
@@ -1007,6 +1009,151 @@ class AutoSender:
             "message": message,
         })
 
+    def handle_submission_result(
+        self,
+        username: str,
+        host_name: str,
+        target_city: str,
+        arrival_date: str,
+        departure_date: str,
+        message: str,
+        submission_confirmed: bool,
+        http_status: Optional[int],
+        after_screenshot: Optional[Path] = None,
+        before_screenshot: Optional[Path] = None,
+        error_screenshot: Optional[Path] = None,
+        error_html: Optional[Path] = None,
+        page: Any = None,
+    ) -> bool:
+        """
+        Обрабатывает исход отправки запроса:
+        1. Проверяет подтверждение отправки и HTTP-код ответа сервера (200-299).
+        2. Валидирует фиксацию через AutopilotEngine.mark_as_sent():
+           - Если AutopilotEngine отсутствует -> отправка НЕ считается успешной, фиксируется как UNCERTAIN.
+           - Если mark_as_sent() вернул False или произошла ошибка -> update_queue_status(..., 'Sent') НЕ вызывается!
+           - Статус переводится в UNCERTAIN для предотвращения повторной отправки.
+        3. Если фиксация успешна -> обновляет только JSON-очередь (sync_db=False), не создавая отдельной записи в БД.
+        """
+        if submission_confirmed and http_status and (200 <= http_status <= 299):
+            if not self.test_mode:
+                time.sleep(1.5)
+            if page and after_screenshot:
+                try:
+                    page.screenshot(path=str(after_screenshot), timeout=5000)
+                except Exception:
+                    pass
+            log_step("SUCCESS", f"Отправка верифицирована! Ответ сервера: {http_status} OK. Скриншот: {after_screenshot}")
+
+            sent_notes = f"Stay request sent and verified. Server status: {http_status}."
+            mark_success = False
+
+            # 5. Проверяем, что отсутствие AutopilotEngine не позволяет считать отправку успешно зафиксированной
+            if self.autopilot_engine is not None:
+                try:
+                    # 1. Проверяем результат AutopilotEngine.mark_as_sent()
+                    mark_success = bool(self.autopilot_engine.mark_as_sent(username, http_status=http_status, notes=sent_notes))
+                    if not mark_success:
+                        log_step("WARN", f"AutopilotEngine.mark_as_sent() вернул False для @{username}.")
+                except Exception as e:
+                    log_step("ERROR", f"Ошибка вызова AutopilotEngine.mark_as_sent(): {e}")
+                    mark_success = False
+            else:
+                log_step("ERROR", f"AutopilotEngine отсутствует: отправка для @{username} не может быть зафиксирована как Sent!")
+                mark_success = False
+
+            if mark_success:
+                # 4. Если фиксация успешна — обновляем JSON-очередь, не создавая отдельной записи в БД
+                self.append_sent_log({
+                    "id": username,
+                    "username": username,
+                    "name": host_name,
+                    "target_city": target_city,
+                    "arrival_date": arrival_date,
+                    "departure_date": departure_date,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "status": "SENT_SUCCESS",
+                    "http_status": http_status,
+                    "mode": "live",
+                    "proof_screenshot": str(after_screenshot) if after_screenshot else "",
+                    "before_screenshot": str(before_screenshot) if before_screenshot else "",
+                    "notes": sent_notes,
+                    "message": message,
+                }, sync_db=False)
+                self.update_queue_status(username, "Sent", notes=sent_notes, sync_db=False)
+                return True
+            else:
+                # 2. Если результат False или возникла ошибка — не вызываем update_queue_status(..., "Sent")
+                # 3. Фиксируем результат как UNCERTAIN, чтобы сообщение не отправилось повторно
+                uncert_reason = f"Submission HTTP {http_status} OK, but mark_as_sent failed or AutopilotEngine missing"
+                log_step("WARN", f"Перевод @{username} в статус UNCERTAIN для предотвращения повторной отправки ({uncert_reason})")
+                self.append_sent_log({
+                    "id": username,
+                    "username": username,
+                    "name": host_name,
+                    "target_city": target_city,
+                    "arrival_date": arrival_date,
+                    "departure_date": departure_date,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "status": "UNCERTAIN",
+                    "http_status": http_status,
+                    "mode": "live",
+                    "proof_screenshot": str(after_screenshot) if after_screenshot else "",
+                    "before_screenshot": str(before_screenshot) if before_screenshot else "",
+                    "notes": f"{sent_notes} [Marked UNCERTAIN: {uncert_reason}]",
+                    "message": message,
+                }, sync_db=False)
+                if self.autopilot_engine is not None:
+                    try:
+                        self.autopilot_engine.mark_as_uncertain(
+                            username,
+                            error_details=uncert_reason,
+                            http_status=http_status,
+                            proof_screenshot=str(after_screenshot) if after_screenshot else None,
+                            before_screenshot=str(before_screenshot) if before_screenshot else None,
+                            notes=f"Uncertain: {uncert_reason}",
+                        )
+                    except Exception as ex:
+                        log_step("WARN", f"AutopilotEngine mark_as_uncertain note: {ex}")
+                self.update_queue_status(username, "Uncertain", notes=f"Marked UNCERTAIN: {uncert_reason}", increment_attempts=True, sync_db=False)
+                return False
+        else:
+            if page and error_screenshot:
+                try:
+                    page.screenshot(path=str(error_screenshot), timeout=5000)
+                    if error_html:
+                        error_html.write_text(page.content(), encoding="utf-8")
+                except Exception:
+                    pass
+            err_text = f"HTTP {http_status}" if http_status else "Отправка не подтверждена за отведенное время"
+            log_step("WARN", f"Подтверждение отправки отсутствует: {err_text}. Статус переведен в UNCERTAIN. Скриншот: {error_screenshot}")
+
+            self.append_sent_log({
+                "id": username,
+                "username": username,
+                "name": host_name,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "status": "UNCERTAIN",
+                "http_status": http_status,
+                "mode": "live",
+                "proof_screenshot": str(error_screenshot) if error_screenshot else "",
+                "before_screenshot": str(before_screenshot) if before_screenshot else "",
+                "notes": f"Submission clicked but unverified ({err_text}). Marked as UNCERTAIN.",
+            }, sync_db=False)
+            if self.autopilot_engine:
+                try:
+                    self.autopilot_engine.mark_as_uncertain(
+                        username,
+                        error_details=err_text,
+                        http_status=http_status,
+                        proof_screenshot=str(error_screenshot) if error_screenshot else None,
+                        before_screenshot=str(before_screenshot) if before_screenshot else None,
+                        notes=f"Submission unverified: {err_text}",
+                    )
+                except Exception as ex:
+                    log_step("WARN", f"AutopilotEngine mark_as_uncertain error: {ex}")
+            self.update_queue_status(username, "Uncertain", notes=f"Submission unverified: {err_text}", increment_attempts=True, sync_db=False)
+            return False
+
     def process_host(self, page, host_item: Dict[str, Any]) -> bool:
         """
         Выполняет отправку запроса для одного хоста с расширенной верификацией.
@@ -1498,73 +1645,21 @@ class AutoSender:
                 time.sleep(0.5)
 
             # 10. Фиксация результата в БД и логах
-            if submission_confirmed and http_status and (200 <= http_status <= 299):
-                time.sleep(1.5)
-                try:
-                    page.screenshot(path=str(after_screenshot), timeout=5000)
-                except Exception:
-                    pass
-                log_step("SUCCESS", f"Отправка верифицирована! Ответ сервера: {http_status} OK. Скриншот: {after_screenshot}")
-
-                self.append_sent_log({
-                    "id": username,
-                    "username": username,
-                    "name": host_name,
-                    "target_city": target_city,
-                    "arrival_date": arrival_date,
-                    "departure_date": departure_date,
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "status": "SENT_SUCCESS",
-                    "http_status": http_status,
-                    "mode": "live",
-                    "proof_screenshot": str(after_screenshot),
-                    "before_screenshot": str(before_screenshot),
-                    "notes": f"Stay request sent and verified. Server status: {http_status}.",
-                    "message": message,
-                })
-                sent_notes = f"Stay request sent and verified. Server status: {http_status}."
-                if self.autopilot_engine:
-                    try:
-                        self.autopilot_engine.mark_as_sent(username, http_status=http_status, notes=sent_notes)
-                    except Exception as e:
-                        log_step("WARN", f"AutopilotEngine mark_as_sent note: {e}")
-                self.update_queue_status(username, "Sent", notes=sent_notes)
-                return True
-            else:
-                try:
-                    page.screenshot(path=str(error_screenshot), timeout=5000)
-                    error_html.write_text(page.content(), encoding="utf-8")
-                except Exception:
-                    pass
-                err_text = f"HTTP {http_status}" if http_status else "Отправка не подтверждена за отведенное время"
-                log_step("WARN", f"Подтверждение отправки отсутствует: {err_text}. Статус переведен в UNCERTAIN. Скриншот: {error_screenshot}")
-
-                self.append_sent_log({
-                    "id": username,
-                    "username": username,
-                    "name": host_name,
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "status": "UNCERTAIN",
-                    "http_status": http_status,
-                    "mode": "live",
-                    "proof_screenshot": str(error_screenshot),
-                    "before_screenshot": str(before_screenshot),
-                    "notes": f"Submission clicked but unverified ({err_text}). Marked as UNCERTAIN.",
-                })
-                if self.autopilot_engine:
-                    try:
-                        self.autopilot_engine.mark_as_uncertain(
-                            username,
-                            error_details=err_text,
-                            http_status=http_status,
-                            proof_screenshot=str(error_screenshot),
-                            before_screenshot=str(before_screenshot),
-                            notes=f"Submission unverified: {err_text}",
-                        )
-                    except Exception as ex:
-                        log_step("WARN", f"AutopilotEngine mark_as_uncertain error: {ex}")
-                self.update_queue_status(username, "Uncertain", notes=f"Submission unverified: {err_text}", increment_attempts=True)
-                return False
+            return self.handle_submission_result(
+                username=username,
+                host_name=host_name,
+                target_city=target_city,
+                arrival_date=arrival_date,
+                departure_date=departure_date,
+                message=message,
+                submission_confirmed=submission_confirmed,
+                http_status=http_status,
+                after_screenshot=after_screenshot,
+                before_screenshot=before_screenshot,
+                error_screenshot=error_screenshot,
+                error_html=error_html,
+                page=page,
+            )
 
         except Exception as e:
             log_step("ERROR", f"Исключение при обработке @{username}: {e}. Статус изменён на UNCERTAIN, переход к следующему хосту.")
