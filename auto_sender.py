@@ -194,6 +194,8 @@ class AutoSender:
 
         # Единый источник истины для очереди — RequestQueueManager (SQLite + JSON синхронизация)
         self.queue_manager = RequestQueueManager()
+        from core.autopilot import AutopilotEngine
+        self.autopilot_engine = AutopilotEngine(trip_id=self.trip_id or "default")
 
     def get_sent_today_count(self) -> int:
         """Подсчитывает количество успешно отправленных запросов за сегодняшний день."""
@@ -1541,7 +1543,12 @@ class AutoSender:
                     "notes": f"Stay request sent and verified. Server status: {http_status or 200}.",
                     "message": message,
                 })
-                self.update_queue_status(username, "Sent")
+                sent_notes = f"Stay request sent and verified. Server status: {http_status or 200}."
+                try:
+                    self.autopilot_engine.mark_as_sent(username, http_status=http_status or 200, notes=sent_notes)
+                except Exception as e:
+                    log_step("WARN", f"AutopilotEngine mark_as_sent note: {e}")
+                self.update_queue_status(username, "Sent", notes=sent_notes)
                 return True
             else:
                 try:

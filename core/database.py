@@ -626,14 +626,11 @@ def log_audit(
 
 
 def get_active_trip(db_file: Optional[Path | str] = None) -> Optional[Trip]:
-    """Возвращает текущую активную поездку (Единый корень системы)."""
+    """Возвращает текущую активную поездку (Единый корень системы). Возвращает None, если активная поездка не выбрана."""
     with get_connection(db_file) as conn:
         cur = conn.cursor()
         cur.execute("SELECT * FROM core_trips WHERE is_active = 1 LIMIT 1;")
         row = cur.fetchone()
-        if not row:
-            cur.execute("SELECT * FROM core_trips ORDER BY created_at DESC LIMIT 1;")
-            row = cur.fetchone()
         if row:
             r_keys = row.keys()
             return Trip(

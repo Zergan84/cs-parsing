@@ -121,10 +121,10 @@ def run_migration(db_path: Path, dry_run: bool = False) -> Dict[str, Any]:
                 stats["trips_reconciled"] += 1
         logger.info(f"Синхронизировано поездок: {stats['trips_reconciled']}")
 
-        # Определяем активный trip_id по умолчанию
+        # Определяем активный trip_id (без скрытого дефолтного переключения)
         cur.execute("SELECT id FROM core_trips WHERE is_active = 1 LIMIT 1;")
         act_row = cur.fetchone()
-        default_trip_id = act_row["id"] if act_row else (dict(legacy_trips[0]).get("id") or dict(legacy_trips[0]).get("trip_id") if legacy_trips else "trip_kyoto_2026")
+        active_trip_id = act_row["id"] if act_row else None
 
         # -------------------------------------------------------------
         # ШАГ 2: Догрузка хостов hosts -> core_hosts & core_host_snapshots
@@ -142,7 +142,9 @@ def run_migration(db_path: Path, dry_run: bool = False) -> Dict[str, Any]:
             hr_d = dict(hr)
             h_id = hr_d.get("id") or hr_d.get("host_id")
             u_name = hr_d.get("username")
-            target_trip = hr_d.get("linked_trip_id") or default_trip_id
+            target_trip = hr_d.get("linked_trip_id") or active_trip_id
+            if not target_trip:
+                continue
 
             # Проверяем наличие в core_hosts
             cur.execute("SELECT host_id FROM core_hosts WHERE trip_id = ? AND (host_id = ? OR username = ?);", (target_trip, h_id, u_name))
@@ -205,7 +207,7 @@ def run_migration(db_path: Path, dry_run: bool = False) -> Dict[str, Any]:
                     h_id = rec.get("host_id") or rec.get("id") or u_name
                     sent_at = rec.get("sent_at") or rec.get("timestamp") or now_iso
                     status_code = rec.get("status_code", 200)
-                    t_id = rec.get("trip_id") or default_trip_id
+                    t_id = rec.get("trip_id") or active_trip_id
 
                     # Проверяем реальный host_id в hosts или core_hosts
                     cur.execute("SELECT id FROM hosts WHERE LOWER(username) = LOWER(?) LIMIT 1;", (u_name,))
@@ -223,20 +225,21 @@ def run_migration(db_path: Path, dry_run: bool = False) -> Dict[str, Any]:
                                 """,
                                 (final_h_id, u_name, u_name, u_name, u_name, u_name, now_iso, now_iso),
                             )
-                            cur.execute(
-                                """
-                                INSERT OR IGNORE INTO core_hosts (host_id, trip_id, username, name, location, state, priority, sent_at, created_at, updated_at)
-                                VALUES (?, ?, ?, ?, 'Japan', 'sent', 10, ?, ?, ?);
-                                """,
-                                (final_h_id, default_trip_id, u_name, u_name, sent_at, now_iso, now_iso),
-                            )
-                            cur.execute(
-                                """
-                                INSERT OR IGNORE INTO core_host_snapshots (host_id, trip_id, raw_data_json, captured_at)
-                                VALUES (?, ?, ?, ?);
-                                """,
-                                (final_h_id, default_trip_id, json.dumps(rec, ensure_ascii=False), now_iso),
-                            )
+                            if t_id:
+                                cur.execute(
+                                    """
+                                    INSERT OR IGNORE INTO core_hosts (host_id, trip_id, username, name, location, state, priority, sent_at, created_at, updated_at)
+                                    VALUES (?, ?, ?, ?, 'Japan', 'sent', 10, ?, ?, ?);
+                                    """,
+                                    (final_h_id, t_id, u_name, u_name, sent_at, now_iso, now_iso),
+                                )
+                                cur.execute(
+                                    """
+                                    INSERT OR IGNORE INTO core_host_snapshots (host_id, trip_id, raw_data_json, captured_at)
+                                    VALUES (?, ?, ?, ?);
+                                    """,
+                                    (final_h_id, t_id, json.dumps(rec, ensure_ascii=False), now_iso),
+                                )
 
                     cur.execute(
                         "SELECT id FROM sending_history WHERE LOWER(username) = LOWER(?) AND timestamp = ?;",
@@ -343,22 +346,23 @@ def run_migration(db_path: Path, dry_run: bool = False) -> Dict[str, Any]:
                         """,
                         (h_id, u_name, h_name, h_name, h_loc, h_ava, now_iso, now_iso),
                     )
-                    cur.execute(
-                        """
-                        INSERT OR IGNORE INTO core_hosts (host_id, trip_id, username, name, location, avatar_url, state, priority, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, 'inbox', 10, ?, ?);
-                        """,
-                        (h_id, default_trip_id, u_name, h_name, h_loc, h_ava, now_iso, now_iso),
-                    )
-                    cur.execute(
-                        """
-                        INSERT OR IGNORE INTO core_host_snapshots (host_id, trip_id, raw_data_json, captured_at)
-                        VALUES (?, ?, ?, ?);
-                        """,
-                        (h_id, default_trip_id, json.dumps(ir_d, ensure_ascii=False), now_iso),
-                    )
-                    stats["inbox_synced"] += 1
-                    stats["hosts_backfilled_to_core"] += 1
+                    if active_trip_id:
+                        cur.execute(
+                            """
+                            INSERT OR IGNORE INTO core_hosts (host_id, trip_id, username, name, location, avatar_url, state, priority, created_at, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?, 'inbox', 10, ?, ?);
+                            """,
+                            (h_id, active_trip_id, u_name, h_name, h_loc, h_ava, now_iso, now_iso),
+                        )
+                        cur.execute(
+                            """
+                            INSERT OR IGNORE INTO core_host_snapshots (host_id, trip_id, raw_data_json, captured_at)
+                            VALUES (?, ?, ?, ?);
+                            """,
+                            (h_id, active_trip_id, json.dumps(ir_d, ensure_ascii=False), now_iso),
+                        )
+                        stats["inbox_synced"] += 1
+                        stats["hosts_backfilled_to_core"] += 1
 
         # -------------------------------------------------------------
         # ШАГ 6: Дозаполнение отсутствующих снимков core_host_snapshots

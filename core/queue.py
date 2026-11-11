@@ -86,6 +86,9 @@ def extract_clean_first_name(raw_name: str, username: str) -> str:
 def build_personalized_message(host: Dict[str, Any], trip: Union[Dict[str, Any], Trip]) -> Tuple[str, bool, str]:
     """
     Формирует выверенное персонализированное сообщение на основе совпавших фактов.
+    - Для минимального био (<25 слов): строго 30–70 слов.
+    - Для обычного био (25+ слов): целевой диапазон 60–90 слов (допустимо 50–105).
+    - Защита от роботизированных клише и запрещенных географических галлюцинаций.
     Возвращает (текст, qc_passed, qc_note).
     """
     first_name = extract_clean_first_name(
@@ -93,10 +96,10 @@ def build_personalized_message(host: Dict[str, Any], trip: Union[Dict[str, Any],
         host.get("username", "")
     )
     reasons = host.get("score_reasons") or []
+    about_text = str(host.get("about") or host.get("about_me") or host.get("about_me_clean") or "").strip()
     reasons_str = (
         " ".join(reasons) + " " +
-        str(host.get("about") or "") + " " +
-        str(host.get("about_me") or "") + " " +
+        about_text + " " +
         str(host.get("interests_text") or "") + " " +
         str(host.get("occupation") or "")
     ).lower()
@@ -117,58 +120,92 @@ def build_personalized_message(host: Dict[str, Any], trip: Union[Dict[str, Any],
     else:
         dates_str = "for a couple of nights"
 
-    if any(k in reasons_str for k in ["горы", "лыжи", "ski", "mountain", "hiking", "trekking", "alps"]):
-        hook_sentence = "Your passion for the mountains and outdoor adventures immediately caught my eye."
-        guest_fact = "I'm a professional ski instructor based in Geneva and the French Alps, so spending time in nature is close to my heart."
-    elif any(k in reasons_str for k in ["кино", "фото", "арт", "photo", "cinema", "film", "art", "camera"]):
-        hook_sentence = "Your creative interests in visual culture, film, and photography really resonated with me."
-        guest_fact = "I'm traveling from Geneva (Switzerland) where I studied film directing and practice street photography; visual culture is central to my journey."
-    elif any(k in reasons_str for k in ["музыка", "фортепиано", "music", "piano", "jazz", "concert"]):
-        hook_sentence = "I was delighted to see your appreciation for music and acoustic arts."
-        guest_fact = "I play the piano and deeply appreciate musical traditions, quiet conversations, and cultural exchange."
-    elif any(k in reasons_str for k in ["французский", "french", "france"]):
-        hook_sentence = "It was wonderful to notice your connection with the French language and European culture."
-        guest_fact = "I'm based in Geneva (Switzerland) and Courchevel, so sharing cultural perspectives would be a genuine pleasure."
+    is_minimal = len(about_text.split()) < 25 or about_text.lower().startswith("friendly local resident")
+
+    if is_minimal:
+        hook_sentence = "I appreciate your open hospitality on Couchsurfing."
+        guest_fact = f"I am visiting from Geneva (Switzerland) to explore {city}."
+        lines = [
+            f"Hi {first_name},",
+            "",
+            f"{hook_sentence} {guest_fact} I am an experienced Couchsurfer, quiet, tidy, and respectful of house rules.",
+            "",
+            f"I will be visiting {city} {dates_str}. If your schedule allows hosting, I would be glad to connect and exchange stories!",
+            "",
+            "Warmly,",
+            "Andrey",
+        ]
     else:
-        hook_sentence = "Your welcoming approach to hosting and cultural exchange immediately stood out to me."
-        guest_fact = f"I'm traveling from Geneva (Switzerland) to experience {city}'s local atmosphere, photography, and cultural traditions."
+        if any(k in reasons_str for k in ["горы", "лыжи", "ski", "mountain", "hiking", "trekking", "alps"]):
+            hook_sentence = "Your shared love for the mountains and outdoor adventures really resonated with me."
+            guest_fact = "I'm a ski instructor based in Geneva and the French Alps, so spending time in alpine nature is close to my heart."
+        elif any(k in reasons_str for k in ["кино", "фото", "арт", "photo", "cinema", "film", "art", "camera"]):
+            hook_sentence = "Your creative interests in visual culture, film, and photography really resonated with me."
+            guest_fact = "I'm traveling from Geneva (Switzerland) where I studied film directing and practice street photography; visual culture is central to my journey."
+        elif any(k in reasons_str for k in ["музыка", "фортепиано", "music", "piano", "jazz", "concert"]):
+            hook_sentence = "I was delighted to see your appreciation for acoustic music and piano."
+            guest_fact = "I play the piano and deeply appreciate musical traditions, quiet conversations, and cultural exchange."
+        elif any(k in reasons_str for k in ["французский", "french", "france"]):
+            hook_sentence = "It was wonderful to notice your connection with the French language and European culture."
+            guest_fact = "I'm based in Geneva (Switzerland) and Courchevel, so sharing cultural perspectives would be a genuine pleasure."
+        else:
+            hook_sentence = "Your welcoming approach to hosting and cultural exchange immediately stood out to me."
+            guest_fact = f"I'm traveling from Geneva (Switzerland) to experience {city}'s local atmosphere, photography, and cultural traditions."
 
-    lines = [
-        f"Hi {first_name},",
-        "",
-        hook_sentence,
-        "",
-        f"{guest_fact} I'm a seasoned Couchsurfer, quiet, tidy, and respectful of house rules.",
-        "",
-        f"I will be visiting {city} {dates_str}. If your schedule allows hosting, I'd be glad to connect and exchange stories!",
-        "",
-        "Warmly,",
-        "Andrey"
-    ]
+        lines = [
+            f"Hi {first_name},",
+            "",
+            hook_sentence,
+            "",
+            f"{guest_fact} I'm a seasoned Couchsurfer, quiet, tidy, and respectful of house rules.",
+            "",
+            f"I will be visiting {city} {dates_str}. If your schedule allows hosting, I'd be glad to connect and exchange stories!",
+            "",
+            "Warmly,",
+            "Andrey"
+        ]
+
     message_text = "\n".join(lines)
-
-    qc_ok, qc_issues = validate_message_qc(message_text, trip)
+    qc_ok, qc_issues = validate_message_qc(message_text, trip, is_minimal_bio=is_minimal)
     qc_note = "Strict QC Passed" if qc_ok else "; ".join(qc_issues)
     return message_text, qc_ok, qc_note
 
 
-def validate_message_qc(text: str, trip: Union[Dict[str, Any], Trip], min_words: int = 50, max_words: int = 105) -> Tuple[bool, List[str]]:
+def validate_message_qc(
+    text: str,
+    trip: Union[Dict[str, Any], Trip],
+    min_words: Optional[int] = None,
+    max_words: Optional[int] = None,
+    is_minimal_bio: bool = False,
+) -> Tuple[bool, List[str]]:
     """
     Единый фильтр качества (QC):
-    1. Длина 50–105 слов (целевой диапазон 60–90).
-    2. Присутствие города поездки.
-    3. Отсутствие выдуманных фактов (проверка через validate_text_purity).
+    1. Для минимального био (<25 слов): строго 30–70 слов.
+    2. Для обычного био: 50–105 слов (целевой диапазон 60–90).
+    3. Присутствие города поездки.
+    4. Отсутствие выдуманных фактов и роботизированных клише (validate_text_purity).
     """
     issues: List[str] = []
     if not text or not text.strip():
         return False, ["Empty message draft"]
 
+    if min_words is None or max_words is None:
+        if is_minimal_bio:
+            min_w = 30 if min_words is None else min_words
+            max_w = 70 if max_words is None else max_words
+        else:
+            min_w = 50 if min_words is None else min_words
+            max_w = 105 if max_words is None else max_words
+    else:
+        min_w = min_words
+        max_w = max_words
+
     words = text.strip().split()
     wc = len(words)
-    if wc < min_words:
-        issues.append(f"Too short ({wc} words, min {min_words})")
-    if wc > max_words:
-        issues.append(f"Too long ({wc} words, max {max_words})")
+    if wc < min_w:
+        issues.append(f"Too short ({wc} words, min {min_w})")
+    if wc > max_w:
+        issues.append(f"Too long ({wc} words, max {max_w})")
 
     city = trip.get("city") if isinstance(trip, dict) else (trip.city if trip else "")
     if city and city.lower() not in text.lower():
@@ -281,46 +318,6 @@ class QueueEngine:
                 ),
             )
 
-            # Синхронизируем с generated_messages и sending_queue, если хост есть в hosts
-            cur.execute("SELECT id FROM hosts WHERE LOWER(id) = LOWER(?) OR LOWER(username) = LOWER(?) LIMIT 1;", (actual_host_id, u_name))
-            h_ref = cur.fetchone()
-            if h_ref:
-                fk_id = h_ref["id"]
-                msg_id = f"msg_{fk_id}_{int(datetime.now().timestamp())}"
-                cur.execute("UPDATE generated_messages SET is_active = 0 WHERE host_id = ?;", (fk_id,))
-                cur.execute(
-                    """
-                    INSERT OR REPLACE INTO generated_messages (
-                        id, host_id, check_in, check_out, message_text,
-                        word_count, qc_passed, qc_notes, is_active, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?);
-                    """,
-                    (
-                        msg_id,
-                        fk_id,
-                        trip.arrival_date,
-                        trip.departure_date,
-                        draft_text,
-                        len(draft_text.split()),
-                        1 if qc_ok else 0,
-                        notes,
-                        now,
-                    ),
-                )
-                q_st = "Draft" if qc_ok else "QC_Review_Required"
-                cur.execute(
-                    """
-                    INSERT INTO sending_queue (id, host_id, current_message_id, status, notes, priority, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, 10, ?, ?)
-                    ON CONFLICT(host_id) DO UPDATE SET
-                        current_message_id = excluded.current_message_id,
-                        status = CASE WHEN LOWER(sending_queue.status) = 'sent' THEN sending_queue.status ELSE excluded.status END,
-                        notes = excluded.notes,
-                        updated_at = excluded.updated_at;
-                    """,
-                    (f"q_{fk_id}", fk_id, msg_id, q_st, notes, now, now),
-                )
-
         log_audit(
             trip_id=self.trip_id,
             module="QUEUE",
@@ -378,17 +375,6 @@ class QueueEngine:
             )
             updated = cur.rowcount > 0
 
-            if updated:
-                cur.execute(
-                    """
-                    UPDATE sending_queue
-                    SET status = 'Approved', notes = 'Approved by user', updated_at = ?
-                    WHERE (host_id = ? OR host_id IN (SELECT id FROM hosts WHERE LOWER(username) = LOWER(?)))
-                      AND LOWER(status) != 'sent';
-                    """,
-                    (now, actual_host_id, u_name),
-                )
-
         if updated:
             log_audit(
                 trip_id=self.trip_id,
@@ -427,16 +413,6 @@ class QueueEngine:
                 (HostState.SKIPPED.value, now, self.trip_id, host_id, host_id, HostState.SENT.value),
             )
             updated = cur.rowcount > 0
-            if updated:
-                cur.execute(
-                    """
-                    UPDATE sending_queue
-                    SET status = 'Skipped', updated_at = ?
-                    WHERE (host_id = ? OR host_id IN (SELECT id FROM hosts WHERE LOWER(username) = LOWER(?)))
-                      AND LOWER(status) != 'sent';
-                    """,
-                    (now, host_id, host_id),
-                )
 
         if updated:
             log_audit(
@@ -473,19 +449,6 @@ class QueueEngine:
                 ),
             )
             count = cur.rowcount
-            if count > 0:
-                cur.execute(
-                    """
-                    UPDATE sending_queue
-                    SET status = 'Skipped', updated_at = ?
-                    WHERE host_id IN (
-                        SELECT id FROM hosts WHERE LOWER(username) IN (
-                            SELECT LOWER(username) FROM core_hosts WHERE trip_id = ? AND state = 'skipped'
-                        )
-                    ) AND LOWER(status) NOT IN ('sent', 'skipped');
-                    """,
-                    (now, self.trip_id),
-                )
 
         log_audit(
             trip_id=self.trip_id,
@@ -518,7 +481,7 @@ class RequestQueueManager:
     def deduplicate_queue_against_sent(self) -> int:
         """
         Сверяет очередь (Approved/Queued) со всеми отправленными хостами и диалогами.
-        Переводит отправленных в статус 'Sent' с меткой 'Already Sent (Deduplicated)'.
+        Переводит отправленных в статус 'Sent' с меткой 'Already Sent (Deduplicated)' в core_hosts.
         """
         sent_set = self.get_sent_usernames()
         if not sent_set:
@@ -526,7 +489,6 @@ class RequestQueueManager:
 
         deduped_count = 0
         now_iso = datetime.now().isoformat()
-        historical_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         try:
             with db_session() as conn:
@@ -534,24 +496,15 @@ class RequestQueueManager:
                 for u in sent_set:
                     cur.execute(
                         """
-                        UPDATE sending_queue
-                        SET status = 'Sent', notes = 'Already Sent (Deduplicated)', updated_at = ?
-                        WHERE (LOWER(host_id) = ? OR host_id IN (SELECT id FROM hosts WHERE LOWER(username) = ?))
-                          AND LOWER(status) IN ('approved', 'queued');
-                        """,
-                        (now_iso, u, u),
-                    )
-                    if cur.rowcount > 0:
-                        deduped_count += cur.rowcount
-                    cur.execute(
-                        """
                         UPDATE core_hosts
-                        SET state = 'sent', updated_at = ?
+                        SET state = 'sent', sent_at = COALESCE(sent_at, ?), qc_notes = 'Already Sent (Deduplicated)', updated_at = ?
                         WHERE (LOWER(username) = ? OR LOWER(host_id) = ?)
                           AND state IN ('selected', 'drafted', 'approved');
                         """,
-                        (now_iso, u, u),
+                        (now_iso, now_iso, u, u),
                     )
+                    if cur.rowcount > 0:
+                        deduped_count += cur.rowcount
         except Exception as e:
             logger.warning(f"Ошибка обновления SQLite при дедупликации: {e}")
 
@@ -580,11 +533,11 @@ class RequestQueueManager:
         return deduped_count
 
     def sync_from_json_if_db_empty(self) -> None:
-        """Если база данных пуста, импортирует существующую валидированную очередь из JSON."""
+        """Если база данных пуста, импортирует существующую валидированную очередь из JSON в core_hosts."""
         try:
             with db_session() as conn:
                 cur = conn.cursor()
-                cur.execute("SELECT COUNT(*) FROM sending_queue;")
+                cur.execute("SELECT COUNT(*) FROM core_hosts;")
                 if cur.fetchone()[0] > 0:
                     return
 
@@ -597,88 +550,86 @@ class RequestQueueManager:
             if not queue:
                 return
 
-            logger.info(f"Миграция {len(queue)} анкет из JSON в базу данных SQLite...")
-            analyzer = get_profile_analyzer()
+            logger.info(f"Миграция {len(queue)} анкет из JSON в базу данных core_hosts...")
+            from core.database import get_active_trip
+            active_trip = get_active_trip()
+            target_trip_id = active_trip.id if active_trip else "trip_tokyo"
 
             with db_session() as conn:
                 cur = conn.cursor()
+                cur.execute("SELECT id FROM core_trips WHERE id = ?;", (target_trip_id,))
+                if not cur.fetchone():
+                    now_iso = datetime.now().isoformat()
+                    cur.execute(
+                        """
+                        INSERT INTO core_trips (id, title, city, arrival_date, departure_date, url, is_active, created_at, updated_at)
+                        VALUES (?, ?, 'Tokyo', '2026-11-18', '2026-11-20', 'https://couchsurfing.com/trips/default', 1, ?, ?);
+                        """,
+                        (target_trip_id, "Default Trip", now_iso, now_iso),
+                    )
+
                 now_iso = datetime.now().isoformat()
                 for item in queue:
-                    host_id = item.get("id") or item.get("username")
-                    username = item.get("username") or host_id
+                    host_id = str(item.get("id") or item.get("username") or "")
+                    username = str(item.get("username") or host_id)
                     name = item.get("name", "")
                     clean_name = item.get("clean_name", name)
                     loc = item.get("location", "Tokyo")
                     if isinstance(loc, dict):
                         loc = loc.get("locationDescription", {}).get("description", "Tokyo")
 
+                    st_raw = str(item.get("status") or "Draft").lower()
+                    st_map = {
+                        "approved": "approved",
+                        "sent": "sent",
+                        "was sent": "sent",
+                        "skipped": "skipped",
+                        "rejected": "rejected",
+                        "queued": "selected",
+                        "draft": "drafted",
+                        "qc_review_required": "drafted",
+                        "name_review_required": "discovered",
+                    }
+                    c_state = st_map.get(st_raw, "selected")
+                    msg_text = item.get("generated_message") or ""
+
                     cur.execute(
                         """
-                        INSERT INTO hosts (
-                            id, username, name, clean_name, profile_url, stay_request_url,
-                            location, about_me, about_me_clean, references_count,
-                            response_rate_pct, instagram_handle, instagram_url,
-                            first_scraped_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at;
+                        INSERT INTO core_hosts (
+                            host_id, trip_id, username, name, clean_name, location,
+                            about, references_count, response_rate_pct, state,
+                            score_stars, priority, attempts, message_draft, qc_passed,
+                            qc_notes, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 4, 10, ?, ?, 1, ?, ?, ?)
+                        ON CONFLICT(trip_id, host_id) DO NOTHING;
                         """,
                         (
                             host_id,
+                            target_trip_id,
                             username,
                             name,
                             clean_name,
-                            item.get("profile_url") or f"https://www.couchsurfing.com/c/users/{username}",
-                            item.get("stay_request_url") or f"https://www.couchsurfing.com/c/users/{username}/stay-request",
                             str(loc),
                             item.get("about_me", ""),
-                            item.get("about_me_clean", ""),
                             item.get("references_count", 0),
-                            float(item.get("response_rate_pct", 90.0)),
-                            item.get("instagram_handle", ""),
-                            item.get("instagram_url", ""),
-                            now_iso,
-                            now_iso,
-                        ),
-                    )
-                    analyzer.analyze_host(item, conn=conn)
-
-                    msg_id = f"msg_{host_id}_{int(datetime.now().timestamp())}"
-                    msg_text = item.get("generated_message", "")
-                    cur.execute(
-                        """
-                        INSERT OR REPLACE INTO generated_messages (
-                            id, host_id, check_in, check_out, message_text,
-                            word_count, qc_passed, is_active, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?);
-                        """,
-                        (
-                            msg_id,
-                            host_id,
-                            item.get("check_in", DEFAULT_CHECK_IN),
-                            item.get("check_out", DEFAULT_CHECK_OUT),
+                            float(item.get("response_rate_pct", 90.0) or 90.0),
+                            c_state,
+                            int(item.get("attempts", 0) or 0),
                             msg_text,
-                            len(msg_text.split()),
+                            item.get("notes", ""),
+                            now_iso,
                             now_iso,
                         ),
                     )
                     cur.execute(
                         """
-                        INSERT OR REPLACE INTO sending_queue (
-                            id, host_id, current_message_id, status, priority,
-                            created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, 10, ?, ?);
+                        INSERT OR IGNORE INTO core_host_snapshots (host_id, trip_id, raw_data_json, captured_at)
+                        VALUES (?, ?, ?, ?);
                         """,
-                        (
-                            f"q_{host_id}",
-                            host_id,
-                            msg_id,
-                            item.get("status", "Draft"),
-                            now_iso,
-                            now_iso,
-                        ),
+                        (host_id, target_trip_id, json.dumps(item, ensure_ascii=False), now_iso),
                     )
         except Exception as e:
-            logger.error(f"Ошибка миграции JSON в SQLite: {e}")
+            logger.error(f"Ошибка миграции JSON в SQLite core_hosts: {e}")
 
     @staticmethod
     def _resolve_canonical_trip_id(trip_id: str) -> str:
@@ -691,42 +642,32 @@ class RequestQueueManager:
         return known_aliases.get(t_str.lower(), t_str)
 
     def get_queue_stats(self, trip_id: Optional[str] = None) -> Dict[str, Any]:
-        """Возвращает согласованную статистику очереди из канонической БД."""
+        """Возвращает согласованную статистику очереди из канонической БД (core_hosts)."""
         try:
             with db_session() as conn:
                 cur = conn.cursor()
+                where_clauses = []
+                params = []
                 if trip_id:
                     canon = self._resolve_canonical_trip_id(trip_id)
-                    query = """
-                    SELECT
-                        COUNT(CASE WHEN LOWER(COALESCE(sq.status, '')) IN ('needs_regeneration', 'name_review_required', 'qc_review_required', 'draft', 'generated', 'approved', 'queued') THEN 1 END) as total,
-                        COUNT(CASE WHEN LOWER(COALESCE(sq.status, '')) IN ('needs_regeneration', '') THEN 1 END) as needs_regeneration,
-                        COUNT(CASE WHEN LOWER(COALESCE(sq.status, '')) = 'name_review_required' THEN 1 END) as name_review,
-                        COUNT(CASE WHEN LOWER(COALESCE(sq.status, '')) = 'qc_review_required' THEN 1 END) as qc_review,
-                        COUNT(CASE WHEN LOWER(COALESCE(sq.status, '')) IN ('draft', 'generated') THEN 1 END) as draft,
-                        COUNT(CASE WHEN LOWER(COALESCE(sq.status, '')) IN ('approved', 'queued') THEN 1 END) as approved,
-                        COUNT(CASE WHEN LOWER(COALESCE(sq.status, '')) LIKE 'sent%' THEN 1 END) as sent_lifetime,
-                        COUNT(CASE WHEN LOWER(COALESCE(sq.status, '')) = 'skipped' THEN 1 END) as skipped
-                    FROM sending_queue sq
-                    JOIN trip_hosts th ON (sq.host_id = th.host_id OR LOWER(sq.host_id) = LOWER(th.host_id))
-                    WHERE LOWER(th.trip_id) = LOWER(?);
-                    """
-                    cur.execute(query, (canon,))
-                else:
-                    query = """
-                    SELECT
-                        COUNT(CASE WHEN LOWER(COALESCE(sq.status, '')) IN ('needs_regeneration', 'name_review_required', 'qc_review_required', 'draft', 'generated', 'approved', 'queued') THEN 1 END) as total,
-                        COUNT(CASE WHEN LOWER(COALESCE(sq.status, '')) IN ('needs_regeneration', '') THEN 1 END) as needs_regeneration,
-                        COUNT(CASE WHEN LOWER(COALESCE(sq.status, '')) = 'name_review_required' THEN 1 END) as name_review,
-                        COUNT(CASE WHEN LOWER(COALESCE(sq.status, '')) = 'qc_review_required' THEN 1 END) as qc_review,
-                        COUNT(CASE WHEN LOWER(COALESCE(sq.status, '')) IN ('draft', 'generated') THEN 1 END) as draft,
-                        COUNT(CASE WHEN LOWER(COALESCE(sq.status, '')) IN ('approved', 'queued') THEN 1 END) as approved,
-                        COUNT(CASE WHEN LOWER(COALESCE(sq.status, '')) LIKE 'sent%' THEN 1 END) as sent_lifetime,
-                        COUNT(CASE WHEN LOWER(COALESCE(sq.status, '')) = 'skipped' THEN 1 END) as skipped
-                    FROM sending_queue sq;
-                    """
-                    cur.execute(query)
+                    where_clauses.append("LOWER(trip_id) = LOWER(?)")
+                    params.append(canon)
 
+                where_str = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+                query = f"""
+                SELECT
+                    COUNT(CASE WHEN state IN ('selected', 'drafted', 'approved') THEN 1 END) as total,
+                    COUNT(CASE WHEN state = 'drafted' AND (message_draft IS NULL OR message_draft = '') THEN 1 END) as needs_regeneration,
+                    COUNT(CASE WHEN state = 'discovered' THEN 1 END) as name_review,
+                    COUNT(CASE WHEN state = 'drafted' AND qc_passed = 0 THEN 1 END) as qc_review,
+                    COUNT(CASE WHEN state = 'drafted' AND qc_passed = 1 THEN 1 END) as draft,
+                    COUNT(CASE WHEN state = 'approved' THEN 1 END) as approved,
+                    COUNT(CASE WHEN state = 'sent' THEN 1 END) as sent_lifetime,
+                    COUNT(CASE WHEN state = 'skipped' THEN 1 END) as skipped
+                FROM core_hosts
+                {where_str};
+                """
+                cur.execute(query, params)
                 row = cur.fetchone()
                 total = int(row[0] or 0)
                 needs_regen = int(row[1] or 0)
@@ -754,26 +695,6 @@ class RequestQueueManager:
                 for r in cur.fetchall():
                     if r[0]:
                         today_users.add(r[0])
-
-                sent_log_path = get_output_dir() / "sent_log.json"
-                if sent_log_path.exists():
-                    try:
-                        with open(sent_log_path, "r", encoding="utf-8") as f:
-                            logs = json.load(f)
-                        for x in logs:
-                            if (
-                                str(x.get("timestamp", "")).startswith(today_str)
-                                and x.get("status") in ("SENT_SUCCESS", "success", "dry_run_success", "DRY_RUN_SUCCESS")
-                                and x.get("mode") in ("live", "dry_run")
-                                and "Deduplicated" not in (x.get("notes") or "")
-                                and "Detected as already sent" not in (x.get("notes") or "")
-                                and not str(x.get("timestamp", "")).endswith("19:55:57")
-                            ):
-                                u = str(x.get("username") or x.get("id") or "").strip().lower()
-                                if u:
-                                    today_users.add(u)
-                    except Exception:
-                        pass
 
                 return {
                     "total": total,
@@ -805,81 +726,55 @@ class RequestQueueManager:
             }
 
     def load_queue(self, exclude_sent: bool = True, trip_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Загружает очередь с обогащением данными хоста, анализа и текущего сообщения."""
+        """Загружает очередь исключительно из канонической таблицы core_hosts."""
         try:
             with db_session() as conn:
                 cur = conn.cursor()
+                where_clauses = []
+                params = []
                 if trip_id:
                     canon_trip = self._resolve_canonical_trip_id(trip_id)
-                    query = """
-                    SELECT
-                        h.id, h.username, h.name, h.clean_name, h.location,
-                        h.profile_url, h.stay_request_url, h.references_count,
-                        h.response_rate_pct, h.instagram_handle, h.instagram_url,
-                        COALESCE(h.about_me_clean, h.about_me) as about_me_clean, h.about_me,
-                        pa.estimated_gender, pa.host_type, pa.sleeping_arrangement,
-                        pa.house_rules, pa.secret_code_detected, pa.secret_code_hint,
-                        pa.conversation_hooks_json, pa.compatibility_points_json,
-                        pa.conversation_strategy,
-                        COALESCE(ch.message_draft, gm.message_text) as message_text,
-                        COALESCE(gm.check_in, th.arrival_date) as check_in,
-                        COALESCE(gm.check_out, th.departure_date) as check_out,
-                        gm.anchor_used, gm.host_fact_used, gm.user_fact_used, gm.confidence, gm.fallback_used,
-                        COALESCE(ch.state, sq.status) as status, sq.updated_at,
-                        th.city as trip_city, th.arrival_date as trip_arrival, th.departure_date as trip_departure, th.trip_id as linked_trip_id,
-                        COALESCE(ch.is_verified, 0) as is_verified,
-                        COALESCE(ch.score_stars, 4) as score_stars,
-                        ch.languages_json as languages_json,
-                        ch.created_at as host_created_at,
-                        COALESCE(sq.priority, 0) as priority
-                    FROM sending_queue sq
-                    JOIN hosts h ON sq.host_id = h.id
-                    JOIN trip_hosts th ON (sq.host_id = th.host_id OR LOWER(sq.host_id) = LOWER(th.host_id))
-                    LEFT JOIN core_hosts ch ON (LOWER(ch.host_id) = LOWER(h.id) OR LOWER(ch.username) = LOWER(h.username)) AND LOWER(ch.trip_id) = LOWER(th.trip_id)
-                    LEFT JOIN profile_analyses pa ON h.id = pa.host_id
-                    LEFT JOIN generated_messages gm ON sq.current_message_id = gm.id
-                    WHERE LOWER(th.trip_id) = LOWER(?)
-                    ORDER BY COALESCE(sq.priority, 0) DESC, COALESCE(ch.score_stars, 4) DESC, ch.created_at ASC;
-                    """
-                    cur.execute(query, (canon_trip,))
-                else:
-                    query = """
-                    SELECT
-                        h.id, h.username, h.name, h.clean_name, h.location,
-                        h.profile_url, h.stay_request_url, h.references_count,
-                        h.response_rate_pct, h.instagram_handle, h.instagram_url,
-                        COALESCE(h.about_me_clean, h.about_me) as about_me_clean, h.about_me,
-                        pa.estimated_gender, pa.host_type, pa.sleeping_arrangement,
-                        pa.house_rules, pa.secret_code_detected, pa.secret_code_hint,
-                        pa.conversation_hooks_json, pa.compatibility_points_json,
-                        pa.conversation_strategy,
-                        COALESCE(ch.message_draft, gm.message_text) as message_text,
-                        gm.check_in, gm.check_out,
-                        gm.anchor_used, gm.host_fact_used, gm.user_fact_used, gm.confidence, gm.fallback_used,
-                        COALESCE(ch.state, sq.status) as status, sq.updated_at,
-                        th.trip_city, th.trip_arrival, th.trip_departure, th.linked_trip_id,
-                        COALESCE(ch.is_verified, 0) as is_verified,
-                        COALESCE(ch.score_stars, 4) as score_stars,
-                        ch.languages_json as languages_json,
-                        ch.created_at as host_created_at,
-                        COALESCE(sq.priority, 0) as priority
-                    FROM sending_queue sq
-                    JOIN hosts h ON sq.host_id = h.id
-                    LEFT JOIN core_hosts ch ON (LOWER(ch.host_id) = LOWER(h.id) OR LOWER(ch.username) = LOWER(h.username))
-                    LEFT JOIN (
-                        SELECT LOWER(host_id) as h_key,
-                               MAX(city) as trip_city,
-                               MAX(arrival_date) as trip_arrival,
-                               MAX(departure_date) as trip_departure,
-                               MAX(trip_id) as linked_trip_id
-                        FROM trip_hosts
-                        GROUP BY LOWER(host_id)
-                    ) th ON LOWER(sq.host_id) = th.h_key
-                    LEFT JOIN profile_analyses pa ON h.id = pa.host_id
-                    LEFT JOIN generated_messages gm ON sq.current_message_id = gm.id
-                    ORDER BY sq.priority DESC, h.references_count DESC;
-                    """
-                    cur.execute(query)
+                    where_clauses.append("LOWER(ch.trip_id) = LOWER(?)")
+                    params.append(canon_trip)
+                if exclude_sent:
+                    where_clauses.append("ch.state != 'sent'")
+
+                where_str = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+                query = f"""
+                SELECT
+                    ch.host_id as id,
+                    ch.username,
+                    ch.name,
+                    ch.clean_name,
+                    ch.location,
+                    ch.about as about_me,
+                    ch.about as about_me_clean,
+                    ch.references_count,
+                    ch.response_rate_pct,
+                    ch.languages_json,
+                    ch.state,
+                    ch.score_stars,
+                    ch.score_reasons_json,
+                    ch.priority,
+                    ch.attempts,
+                    ch.message_draft as message_text,
+                    ch.qc_passed,
+                    ch.qc_notes,
+                    ch.is_verified,
+                    ch.created_at as host_created_at,
+                    ch.updated_at,
+                    ch.sent_at,
+                    ch.trip_id as linked_trip_id,
+                    ct.city as trip_city,
+                    ct.arrival_date as trip_arrival,
+                    ct.departure_date as trip_departure
+                FROM core_hosts ch
+                LEFT JOIN core_trips ct ON ch.trip_id = ct.id
+                {where_str}
+                ORDER BY COALESCE(ch.priority, 10) DESC, COALESCE(ch.score_stars, 4) DESC, ch.created_at ASC;
+                """
+                cur.execute(query, params)
                 rows = cur.fetchall()
 
                 all_sent_set = self.get_sent_usernames()
@@ -892,104 +787,95 @@ class RequestQueueManager:
                         continue
                     seen_usernames.add(u_low)
 
-                    is_sent = u_low in all_sent_set
+                    is_sent = u_low in all_sent_set or r["state"] == "sent"
                     if exclude_sent and is_sent:
                         continue
 
-                    hooks = []
-                    if r["conversation_hooks_json"]:
-                        try:
-                            hooks = json.loads(r["conversation_hooks_json"])
-                        except Exception:
-                            pass
-
-                    compat = []
-                    if r["compatibility_points_json"]:
-                        try:
-                            compat = json.loads(r["compatibility_points_json"])
-                        except Exception:
-                            pass
-
-                    r_keys = r.keys()
-                    t_city = r["trip_city"] if ("trip_city" in r_keys and r["trip_city"]) else None
-                    t_arr = r["trip_arrival"] if ("trip_arrival" in r_keys and r["trip_arrival"]) else None
-                    t_dep = r["trip_departure"] if ("trip_departure" in r_keys and r["trip_departure"]) else None
-                    t_linked = r["linked_trip_id"] if ("linked_trip_id" in r_keys and r["linked_trip_id"]) else None
-                    eff_loc = r["location"] or t_city or ""
-                    eff_city = t_city or (str(eff_loc).split(",")[0].strip() if eff_loc else "")
-
                     langs = []
-                    if "languages_json" in r_keys and r["languages_json"]:
+                    if r["languages_json"]:
                         try:
                             langs = json.loads(r["languages_json"])
                         except Exception:
                             pass
                     langs_str = ", ".join(langs[:2]) if langs else "Not specified"
 
-                    raw_st = str(r["status"] or "Draft").strip().lower()
+                    raw_st = str(r["state"] or "drafted").strip().lower()
                     st_map = {
                         "approved": "Approved",
                         "sent": "Sent",
-                        "was sent": "Sent",
                         "skipped": "Skipped",
-                        "failed": "Skipped",
                         "rejected": "Rejected",
                         "selected": "Queued",
-                        "queued": "Queued",
-                        "drafted": "Draft",
-                        "draft": "Draft",
+                        "discovered": "Name_Review_Required",
+                        "inbox": "Inbox",
                     }
-                    mapped_status = "Sent" if is_sent else st_map.get(raw_st, r["status"] or "Draft")
+                    if is_sent:
+                        mapped_status = "Sent"
+                    elif raw_st in st_map:
+                        mapped_status = st_map[raw_st]
+                    elif raw_st == "drafted":
+                        mapped_status = "Draft" if r["qc_passed"] else "QC_Review_Required"
+                    else:
+                        mapped_status = "Draft"
+
+                    t_city = r["trip_city"]
+                    t_arr = r["trip_arrival"]
+                    t_dep = r["trip_departure"]
+                    eff_loc = r["location"] or t_city or ""
+                    eff_city = t_city or (str(eff_loc).split(",")[0].strip() if eff_loc else "")
 
                     item = {
                         "id": r["id"],
                         "username": u,
-                        "name": r["name"],
-                        "clean_name": r["clean_name"],
-                        "estimated_gender": r["estimated_gender"] or "Unknown",
-                        "host_type": r["host_type"] or "solo",
+                        "name": r["name"] or u,
+                        "clean_name": r["clean_name"] or r["name"] or u,
+                        "estimated_gender": "Unknown",
+                        "host_type": "solo",
                         "location": eff_loc,
                         "city": eff_city,
-                        "trip_id": t_linked,
-                        "sleeping_arrangement": r["sleeping_arrangement"] or "Not specified",
-                        "house_rules": r["house_rules"] or "Standard house rules",
-                        "profile_url": r["profile_url"],
-                        "stay_request_url": r["stay_request_url"],
-                        "instagram_handle": r["instagram_handle"] or "",
-                        "instagram_url": r["instagram_url"] or "",
+                        "trip_id": r["linked_trip_id"],
+                        "sleeping_arrangement": "Not specified",
+                        "house_rules": "Standard house rules",
+                        "profile_url": f"https://www.couchsurfing.com/people/{u}",
+                        "stay_request_url": f"https://www.couchsurfing.com/people/{u}",
+                        "instagram_handle": "",
+                        "instagram_url": "",
                         "references_count": r["references_count"] or 0,
                         "response_rate_pct": r["response_rate_pct"] or 90.0,
-                        "secret_code_detected": bool(r["secret_code_detected"]),
-                        "secret_code_hint": r["secret_code_hint"] or "",
-                        "about_me": r["about_me"] or r["about_me_clean"] or "",
-                        "about_me_clean": r["about_me_clean"] or r["about_me"] or "",
-                        "check_in": t_arr or r["check_in"] or DEFAULT_CHECK_IN,
-                        "check_out": t_dep or r["check_out"] or DEFAULT_CHECK_OUT,
+                        "secret_code_detected": False,
+                        "secret_code_hint": "",
+                        "about_me": r["about_me"] or "",
+                        "about_me_clean": r["about_me_clean"] or "",
+                        "check_in": t_arr or DEFAULT_CHECK_IN,
+                        "check_out": t_dep or DEFAULT_CHECK_OUT,
                         "guest_context": DEFAULT_CONTEXT,
                         "generated_message": r["message_text"] or "",
                         "word_count": len((r["message_text"] or "").split()),
-                        "anchor": r["anchor_used"] if ("anchor_used" in r_keys and r["anchor_used"]) else None,
-                        "anchor_used": r["anchor_used"] if ("anchor_used" in r_keys and r["anchor_used"]) else None,
-                        "host_fact_used": r["host_fact_used"] if ("host_fact_used" in r_keys and r["host_fact_used"]) else None,
-                        "user_fact_used": r["user_fact_used"] if ("user_fact_used" in r_keys and r["user_fact_used"]) else None,
-                        "confidence": r["confidence"] if ("confidence" in r_keys and r["confidence"] is not None) else None,
-                        "fallback_used": bool(r["fallback_used"]) if ("fallback_used" in r_keys and r["fallback_used"] is not None) else False,
+                        "anchor": "Warm & Respectful Introduction",
+                        "anchor_used": "Warm & Respectful Introduction",
+                        "host_fact_used": "Considerate guest note",
+                        "user_fact_used": "Respectful guest",
+                        "confidence": 0.9,
+                        "fallback_used": False,
                         "status": mapped_status,
                         "updated_at": r["updated_at"],
-                        "score_stars": r["score_stars"] if ("score_stars" in r_keys and r["score_stars"]) else 4,
-                        "is_verified": bool(r["is_verified"]) if ("is_verified" in r_keys and r["is_verified"]) else False,
+                        "score_stars": r["score_stars"] or 4,
+                        "is_verified": bool(r["is_verified"]),
                         "languages": langs_str,
-                        "created_at": r["host_created_at"] if "host_created_at" in r_keys else (r["updated_at"] or ""),
-                        "priority": int(r["priority"]) if ("priority" in r_keys and r["priority"] is not None) else 0,
-                        "conversation_hooks": hooks,
-                        "compatibility_points": compat,
-                        "conversation_strategy": r["conversation_strategy"] or "Grounded CS connection",
+                        "created_at": r["host_created_at"] or r["updated_at"],
+                        "priority": int(r["priority"] or 10),
+                        "attempts": int(r["attempts"] or 0),
+                        "qc_passed": bool(r["qc_passed"]),
+                        "notes": r["qc_notes"] or "",
+                        "conversation_hooks": [],
+                        "compatibility_points": [],
+                        "conversation_strategy": "Grounded CS connection",
                     }
                     result.append(item)
 
                 return result
         except Exception as e:
-            logger.warning(f"Ошибка загрузки очереди из SQLite: {e}, фолбэк на JSON")
+            logger.warning(f"Ошибка загрузки очереди из SQLite core_hosts: {e}, фолбэк на JSON")
 
         if self.queue_file.exists():
             try:
@@ -1088,7 +974,7 @@ class RequestQueueManager:
 
     def update_status(self, username: str, status: str, notes: Optional[str] = None) -> None:
         """
-        Обновляет статус и заметки в `sending_queue` и синхронизирует в `core_hosts`.
+        Обновляет статус и заметки в core_hosts.
         Инвариант: никогда не перезаписывает статус уже отправленного ('sent') хоста на неотправленный.
         """
         now_iso = datetime.now().isoformat()
@@ -1096,51 +982,41 @@ class RequestQueueManager:
         status_lower = str(status or "").strip().lower()
         is_target_sent = status_lower in ("sent", "was sent")
 
+        st_map = {
+            "approved": "approved",
+            "sent": "sent",
+            "was sent": "sent",
+            "skipped": "skipped",
+            "failed": "skipped",
+            "rejected": "rejected",
+            "queued": "selected",
+            "draft": "drafted",
+            "qc_review_required": "drafted",
+            "name_review_required": "discovered",
+        }
+        c_st = st_map.get(status_lower, "selected")
+
         try:
             with db_session() as conn:
                 cur = conn.cursor()
-                sent_guard_sq = "" if is_target_sent else " AND LOWER(COALESCE(status, '')) != 'sent'"
-                if notes is not None:
-                    cur.execute(
-                        f"""
-                        UPDATE sending_queue
-                        SET status = ?, notes = ?, updated_at = ?
-                        WHERE (host_id IN (SELECT id FROM hosts WHERE username = ? COLLATE NOCASE OR id = ? COLLATE NOCASE) OR host_id = ? COLLATE NOCASE){sent_guard_sq};
-                        """,
-                        (status, notes, now_iso, u_clean, u_clean, u_clean),
-                    )
-                else:
-                    cur.execute(
-                        f"""
-                        UPDATE sending_queue
-                        SET status = ?, updated_at = ?
-                        WHERE (host_id IN (SELECT id FROM hosts WHERE username = ? COLLATE NOCASE OR id = ? COLLATE NOCASE) OR host_id = ? COLLATE NOCASE){sent_guard_sq};
-                        """,
-                        (status, now_iso, u_clean, u_clean, u_clean),
-                    )
-
-                st_map = {
-                    "approved": "approved",
-                    "sent": "sent",
-                    "was sent": "sent",
-                    "skipped": "skipped",
-                    "failed": "skipped",
-                    "rejected": "rejected",
-                    "queued": "selected",
-                    "draft": "drafted",
-                    "qc_review_required": "drafted",
-                    "name_review_required": "discovered",
-                }
-                c_st = st_map.get(status_lower)
-                if c_st:
+                if is_target_sent:
                     cur.execute(
                         """
                         UPDATE core_hosts
-                        SET state = ?, updated_at = ?
+                        SET state = 'sent', sent_at = COALESCE(sent_at, ?), qc_notes = COALESCE(?, qc_notes), updated_at = ?
+                        WHERE LOWER(username) = LOWER(?) OR LOWER(host_id) = LOWER(?);
+                        """,
+                        (now_iso, notes, now_iso, u_clean, u_clean),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE core_hosts
+                        SET state = ?, qc_notes = COALESCE(?, qc_notes), updated_at = ?
                         WHERE (LOWER(username) = LOWER(?) OR LOWER(host_id) = LOWER(?))
                           AND state != 'sent';
                         """,
-                        (c_st, now_iso, u_clean, u_clean),
+                        (c_st, notes, now_iso, u_clean, u_clean),
                     )
         except Exception as e:
             logger.error(f"Ошибка обновления статуса в SQLite: {e}")
@@ -1151,7 +1027,7 @@ class RequestQueueManager:
         message: Optional[str] = None,
         status: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Обновляет статус и/или текст сообщения в `sending_queue`, `generated_messages`, `core_hosts` и JSON."""
+        """Обновляет статус и/или текст сообщения в core_hosts и JSON."""
         now_iso = datetime.now().isoformat()
         u_clean = str(username or "").strip()
         try:
@@ -1160,16 +1036,6 @@ class RequestQueueManager:
                 if status is not None:
                     status_lower = str(status).strip().lower()
                     is_target_sent = status_lower in ("sent", "was sent")
-                    sent_guard = "" if is_target_sent else " AND LOWER(COALESCE(status, '')) != 'sent'"
-                    cur.execute(
-                        f"""
-                        UPDATE sending_queue
-                        SET status = ?, updated_at = ?
-                        WHERE (host_id IN (SELECT id FROM hosts WHERE LOWER(username) = LOWER(?) OR LOWER(id) = LOWER(?))
-                           OR LOWER(host_id) = LOWER(?)){sent_guard};
-                        """,
-                        (status, now_iso, u_clean, u_clean, u_clean),
-                    )
                     st_map = {
                         "approved": "approved",
                         "sent": "sent",
@@ -1180,8 +1046,17 @@ class RequestQueueManager:
                         "queued": "selected",
                         "draft": "drafted",
                     }
-                    c_st = st_map.get(status_lower)
-                    if c_st:
+                    c_st = st_map.get(status_lower, "drafted")
+                    if is_target_sent:
+                        cur.execute(
+                            """
+                            UPDATE core_hosts
+                            SET state = 'sent', sent_at = COALESCE(sent_at, ?), updated_at = ?
+                            WHERE LOWER(username) = LOWER(?) OR LOWER(host_id) = LOWER(?);
+                            """,
+                            (now_iso, now_iso, u_clean, u_clean),
+                        )
+                    else:
                         cur.execute(
                             """
                             UPDATE core_hosts
@@ -1193,7 +1068,6 @@ class RequestQueueManager:
                         )
 
                 if message is not None:
-                    words = len(message.split())
                     cur.execute(
                         """
                         UPDATE core_hosts
@@ -1202,61 +1076,6 @@ class RequestQueueManager:
                         """,
                         (message, now_iso, u_clean, u_clean),
                     )
-                    cur.execute(
-                        """
-                        UPDATE generated_messages
-                        SET message_text = ?, word_count = ?, qc_passed = 1
-                        WHERE id IN (
-                            SELECT current_message_id FROM sending_queue sq
-                            LEFT JOIN hosts h ON sq.host_id = h.id
-                            WHERE LOWER(h.username) = LOWER(?) OR LOWER(h.id) = LOWER(?) OR LOWER(sq.host_id) = LOWER(?)
-                        );
-                        """,
-                        (message, words, u_clean, u_clean, u_clean),
-                    )
-                    if cur.rowcount == 0:
-                        cur.execute(
-                            """
-                            SELECT sq.host_id, COALESCE(th.arrival_date, ?), COALESCE(th.departure_date, ?)
-                            FROM sending_queue sq
-                            LEFT JOIN hosts h ON sq.host_id = h.id
-                            LEFT JOIN trip_hosts th ON LOWER(sq.host_id) = LOWER(th.host_id)
-                            WHERE LOWER(h.username) = LOWER(?) OR LOWER(h.id) = LOWER(?) OR LOWER(sq.host_id) = LOWER(?)
-                            LIMIT 1;
-                            """,
-                            (DEFAULT_CHECK_IN, DEFAULT_CHECK_OUT, u_clean, u_clean, u_clean),
-                        )
-                        sq_row = cur.fetchone()
-                        if sq_row:
-                            actual_host_id, c_in, c_out = sq_row[0], sq_row[1], sq_row[2]
-                            new_msg_id = f"msg_{actual_host_id}_{int(datetime.now().timestamp())}"
-                            cur.execute(
-                                """
-                                INSERT OR REPLACE INTO generated_messages (
-                                    id, host_id, check_in, check_out, message_text,
-                                    word_count, qc_passed, is_active, created_at
-                                ) VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?);
-                                """,
-                                (new_msg_id, actual_host_id, c_in, c_out, message, words, now_iso),
-                            )
-                            cur.execute(
-                                """
-                                UPDATE sending_queue
-                                SET current_message_id = ?, updated_at = ?
-                                WHERE host_id = ?;
-                                """,
-                                (new_msg_id, now_iso, actual_host_id),
-                            )
-                    else:
-                        cur.execute(
-                            """
-                            UPDATE sending_queue
-                            SET updated_at = ?
-                            WHERE host_id IN (SELECT id FROM hosts WHERE LOWER(username) = LOWER(?) OR LOWER(id) = LOWER(?))
-                               OR LOWER(host_id) = LOWER(?);
-                            """,
-                            (now_iso, u_clean, u_clean, u_clean),
-                        )
         except Exception as e:
             logger.error(f"Ошибка обновления карточки в SQLite: {e}")
 
@@ -1470,115 +1289,6 @@ class RequestQueueManager:
         try:
             with db_session() as conn:
                 cur = conn.cursor()
-                cur.execute("SELECT id FROM hosts WHERE LOWER(id) = LOWER(?) OR LOWER(username) = LOWER(?) LIMIT 1;", (host_id, username))
-                existing_host = cur.fetchone()
-                if existing_host:
-                    actual_host_id = existing_host[0]
-                    cur.execute(
-                        """
-                        UPDATE hosts SET
-                            name = COALESCE(?, name),
-                            clean_name = COALESCE(?, clean_name),
-                            profile_url = COALESCE(?, profile_url),
-                            stay_request_url = COALESCE(?, stay_request_url),
-                            location = COALESCE(?, location),
-                            about_me = COALESCE(NULLIF(?, ''), about_me),
-                            references_count = COALESCE(?, references_count),
-                            response_rate_pct = COALESCE(?, response_rate_pct),
-                            updated_at = ?
-                        WHERE id = ?;
-                        """,
-                        (
-                            target_item.get("name"),
-                            target_item.get("clean_name"),
-                            target_item.get("profile_url") or f"https://www.couchsurfing.com/c/users/{username}",
-                            target_item.get("stay_request_url") or f"https://www.couchsurfing.com/c/users/{username}/stay-request",
-                            target_item.get("location"),
-                            target_item.get("about_me", ""),
-                            target_item.get("references_count", 0),
-                            float(target_item.get("response_rate_pct", 90.0)),
-                            now_iso,
-                            actual_host_id,
-                        ),
-                    )
-                    host_id = actual_host_id
-                else:
-                    cur.execute(
-                        """
-                        INSERT INTO hosts (
-                            id, username, name, clean_name, profile_url, stay_request_url,
-                            location, about_me, references_count, response_rate_pct,
-                            first_scraped_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                        """,
-                        (
-                            host_id,
-                            target_item.get("username", username),
-                            target_item["name"],
-                            target_item["clean_name"],
-                            target_item.get("profile_url") or f"https://www.couchsurfing.com/c/users/{username}",
-                            target_item.get("stay_request_url") or f"https://www.couchsurfing.com/c/users/{username}/stay-request",
-                            target_item["location"],
-                            target_item.get("about_me", ""),
-                            target_item.get("references_count", 0),
-                            float(target_item.get("response_rate_pct", 90.0)),
-                            now_iso,
-                            now_iso,
-                        ),
-                    )
-
-                msg_id = f"msg_{host_id}_{int(datetime.now().timestamp())}"
-                cur.execute("UPDATE generated_messages SET is_active = 0 WHERE host_id = ?;", (host_id,))
-                cur.execute(
-                    """
-                    INSERT OR REPLACE INTO generated_messages (
-                        id, host_id, check_in, check_out, message_text,
-                        word_count, hook_used, context_facts_used_json,
-                        anchor_used, host_fact_used, user_fact_used, confidence, fallback_used,
-                        qc_passed, is_active, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?);
-                    """,
-                    (
-                        msg_id,
-                        host_id,
-                        check_in,
-                        check_out,
-                        msg_text,
-                        words,
-                        anchor_used,
-                        json.dumps([user_fact_used] if user_fact_used else []),
-                        anchor_used,
-                        host_fact_used,
-                        user_fact_used,
-                        conf,
-                        fallback_val,
-                        1 if qc_passed else 0,
-                        now_iso,
-                    ),
-                )
-
-                cur.execute(
-                    """
-                    INSERT INTO sending_queue (id, host_id, current_message_id, status, notes, priority, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, 10, ?, ?)
-                    ON CONFLICT(host_id) DO UPDATE SET
-                        current_message_id = excluded.current_message_id,
-                        status = CASE WHEN LOWER(sending_queue.status) = 'sent' THEN sending_queue.status ELSE excluded.status END,
-                        notes = excluded.notes,
-                        updated_at = excluded.updated_at;
-                    """,
-                    (
-                        f"q_{host_id}",
-                        host_id,
-                        msg_id,
-                        item_status,
-                        item_notes,
-                        now_iso,
-                        now_iso,
-                    ),
-                )
-
-                # Синхронизируем с core_hosts
                 cur.execute(
                     """
                     UPDATE core_hosts
@@ -1592,7 +1302,7 @@ class RequestQueueManager:
                     (msg_text, 1 if qc_passed else 0, item_notes, now_iso, username, host_id),
                 )
         except Exception as e:
-            logger.error(f"Ошибка сохранения регенерации в SQLite: {e}")
+            logger.error(f"Ошибка сохранения регенерации в SQLite core_hosts: {e}")
 
         queue_replaced = False
         for i, q in enumerate(items):
@@ -1634,24 +1344,14 @@ class RequestQueueManager:
                 cur = conn.cursor()
                 cur.execute(
                     """
-                    SELECT sq.host_id, h.username, h.about_me, h.about_me_clean
-                    FROM sending_queue sq
-                    LEFT JOIN hosts h ON h.id = sq.host_id
-                    WHERE LOWER(sq.status) IN ('approved', 'queued');
+                    SELECT host_id, username, about
+                    FROM core_hosts
+                    WHERE state IN ('selected', 'drafted', 'approved');
                     """
                 )
-                for host_id, username, about_me, about_me_clean in cur.fetchall():
-                    bio = about_me_clean or about_me or ""
-                    blacklisted_phrase = is_blacklisted(bio)
+                for host_id, username, about in cur.fetchall():
+                    blacklisted_phrase = is_blacklisted(about or "")
                     if blacklisted_phrase:
-                        cur.execute(
-                            """
-                            UPDATE sending_queue
-                            SET status = 'Skipped', notes = ?, updated_at = ?
-                            WHERE host_id = ? AND LOWER(status) IN ('approved', 'queued');
-                            """,
-                            (f"Not open to hosting: '{blacklisted_phrase}'", now_iso, host_id),
-                        )
                         cur.execute(
                             """
                             UPDATE core_hosts
@@ -1673,15 +1373,21 @@ class RequestQueueManager:
         trip_id: Optional[str] = None,
         return_details: bool = False,
     ) -> Union[int, Tuple[int, List[str]]]:
-        """Массовое добавление хостов в очередь (`hosts`, `trip_hosts`, `core_hosts`, `generated_messages`, `sending_queue`)."""
+        """Массовое добавление хостов в очередь (core_hosts, core_host_snapshots)."""
         if not hosts_list:
             return (0, []) if return_details else 0
 
-        existing = self.load_queue(exclude_sent=False, trip_id=trip_id)
+        from core.database import get_active_trip
+        active_trip = get_active_trip()
+        target_trip_id = trip_id or (active_trip.id if active_trip else None)
+        if not target_trip_id:
+            logger.warning("enqueue_hosts: нет активной поездки, невозможно добавить хостов в очередь.")
+            return (0, []) if return_details else 0
+
+        existing = self.load_queue(exclude_sent=False, trip_id=target_trip_id)
         existing_users = {
             str(x.get("username", "")).strip().lower()
             for x in existing
-            if str(x.get("status", "")).strip().lower() in ("draft", "approved", "queued", "name_review_required", "qc_review_required", "needs_regeneration", "sent")
         }
         sent_users = self.get_sent_usernames()
 
@@ -1691,26 +1397,11 @@ class RequestQueueManager:
         try:
             with db_session() as conn:
                 cur = conn.cursor()
-                db_trip_city = None
-                db_trip_arr = None
-                db_trip_dep = None
-                if trip_id:
-                    canon_t = self._resolve_canonical_trip_id(trip_id)
-                    cur.execute(
-                        "SELECT city, arrival_date, departure_date FROM core_trips WHERE LOWER(id) = LOWER(?) LIMIT 1;",
-                        (canon_t,),
-                    )
-                    t_row = cur.fetchone()
-                    if not t_row:
-                        cur.execute(
-                            "SELECT city, arrival_date, departure_date FROM user_trips WHERE LOWER(trip_id) = LOWER(?) LIMIT 1;",
-                            (canon_t,),
-                        )
-                        t_row = cur.fetchone()
-                    if t_row and (t_row[0] or t_row[1]):
-                        db_trip_city, db_trip_arr, db_trip_dep = t_row[0], t_row[1], t_row[2]
-
-                from message_generator import generate_stay_request, select_primary_hook
+                cur.execute("SELECT id, city, arrival_date, departure_date FROM core_trips WHERE id = ?;", (target_trip_id,))
+                t_row = cur.fetchone()
+                t_city = t_row["city"] if t_row else "City"
+                t_arr = t_row["arrival_date"] if t_row else DEFAULT_CHECK_IN
+                t_dep = t_row["departure_date"] if t_row else DEFAULT_CHECK_OUT
 
                 for h in hosts_list:
                     host_id = str(h.get("id") or h.get("username") or "").strip()
@@ -1719,201 +1410,102 @@ class RequestQueueManager:
                     if not u or u.lower() in existing_users or host_id.lower() in existing_users or u.lower() in sent_users or host_id.lower() in sent_users:
                         continue
 
-                    blacklisted_phrase = is_blacklisted(h.get("about_me", "") or h.get("about_me_clean", ""))
+                    blacklisted_phrase = is_blacklisted(h.get("about_me", "") or h.get("about", "") or h.get("about_me_clean", ""))
                     if blacklisted_phrase:
                         continue
 
                     clean_name = h.get("clean_name") or h.get("name") or host_username
                     first_name = clean_name.split()[0] if clean_name else host_username
-                    loc = h.get("location") or db_trip_city or "Kyoto, Japan"
+                    loc = h.get("location") or t_city
                     if isinstance(loc, dict):
-                        loc = loc.get("locationDescription", {}).get("description", db_trip_city or "Kyoto")
-                    eff_city = h.get("city") or db_trip_city or str(loc).split(",")[0].strip() or "Kyoto"
-                    h["city"] = eff_city
+                        loc = loc.get("locationDescription", {}).get("description", t_city)
+                    about_text = h.get("about_me") or h.get("about") or h.get("about_me_clean") or ""
 
-                    msg_id = f"msg_{host_username}_{uuid.uuid4().hex[:6]}"
-                    check_in = str(h.get("arrival_date") or h.get("check_in") or db_trip_arr or DEFAULT_CHECK_IN).strip()
-                    check_out = str(h.get("departure_date") or h.get("check_out") or db_trip_dep or DEFAULT_CHECK_OUT).strip()
-
-                    primary = select_primary_hook(h)
-                    if primary["type"] != "empty_bio":
-                        anchor_used = primary["type"].replace("_", " ").title()
-                        host_fact_used = primary["hook_detail"]
-                        user_fact_used = primary["andrey_fact"]
-                        conf = 0.92
-                        fb_val = 0
-                    else:
-                        anchor_used = "Warm & Respectful Introduction"
-                        host_fact_used = "Considerate guest note for minimal bio"
-                        user_fact_used = "Respectful guest (quiet hours, self-sufficient)"
-                        conf = 0.6
-                        fb_val = 1
-
-                    default_msg = generate_stay_request(h, check_in=check_in, check_out=check_out, include_dates=False)
-
-                    cur.execute("SELECT id FROM hosts WHERE LOWER(username) = LOWER(?) OR LOWER(id) = LOWER(?) LIMIT 1;", (host_username, host_id))
-                    existing_h = cur.fetchone()
-                    canonical_h_id = existing_h["id"] if existing_h else host_id
-                    if not existing_h:
-                        cur.execute(
-                            """
-                            INSERT OR IGNORE INTO hosts (
-                                id, username, name, clean_name, profile_url, stay_request_url,
-                                location, about_me, about_me_clean, references_count,
-                                response_rate_pct, instagram_handle, instagram_url,
-                                first_scraped_at, updated_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                            """,
-                            (
-                                canonical_h_id,
-                                host_username,
-                                h.get("name") or host_username,
-                                first_name,
-                                h.get("profile_url") or f"https://www.couchsurfing.com/c/users/{host_username}",
-                                h.get("stay_request_url") or f"https://www.couchsurfing.com/c/users/{host_username}/stay-request",
-                                str(loc),
-                                h.get("about_me", ""),
-                                h.get("about_me_clean", ""),
-                                h.get("references_count", 0),
-                                float(h.get("response_rate_pct", 90.0) or 90.0),
-                                h.get("instagram_handle", ""),
-                                h.get("instagram_url", ""),
-                                now_iso,
-                                now_iso,
-                            ),
-                        )
-
-                    if trip_id:
-                        cur.execute(
-                            """
-                            INSERT INTO trip_hosts (trip_id, host_id, city, arrival_date, departure_date, created_at)
-                            VALUES (?, ?, ?, ?, ?, ?)
-                            ON CONFLICT(trip_id, host_id) DO NOTHING;
-                            """,
-                            (trip_id, canonical_h_id, str(loc), check_in, check_out, now_iso),
-                        )
+                    draft_text, qc_ok, qc_note = build_personalized_message(h, {"city": t_city, "arrival_date": t_arr, "departure_date": t_dep})
 
                     cur.execute(
                         """
-                        INSERT OR REPLACE INTO generated_messages (
-                            id, host_id, check_in, check_out, message_text,
-                            word_count, hook_used, context_facts_used_json,
-                            anchor_used, host_fact_used, user_fact_used, confidence, fallback_used,
-                            qc_passed, is_active, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?);
+                        INSERT INTO core_hosts (
+                            host_id, trip_id, username, name, clean_name, location,
+                            about, references_count, response_rate_pct, languages_json,
+                            state, score_stars, score_reasons_json, priority, attempts,
+                            message_draft, qc_passed, qc_notes, is_verified, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 10, 0, ?, ?, ?, 0, ?, ?)
+                        ON CONFLICT(trip_id, host_id) DO UPDATE SET
+                            message_draft = COALESCE(excluded.message_draft, core_hosts.message_draft),
+                            updated_at = excluded.updated_at;
                         """,
                         (
-                            msg_id,
-                            canonical_h_id,
-                            check_in,
-                            check_out,
-                            default_msg,
-                            len(default_msg.split()),
-                            anchor_used,
-                            json.dumps([user_fact_used] if user_fact_used else []),
-                            anchor_used,
-                            host_fact_used,
-                            user_fact_used,
-                            conf,
-                            fb_val,
+                            host_id,
+                            target_trip_id,
+                            host_username,
+                            h.get("name") or host_username,
+                            first_name,
+                            str(loc),
+                            about_text,
+                            h.get("references_count", 0),
+                            float(h.get("response_rate_pct", 90.0) or 90.0),
+                            json.dumps(h.get("languages") or []),
+                            "selected",
+                            h.get("score_stars", 4),
+                            json.dumps(h.get("score_reasons") or []),
+                            draft_text,
+                            1 if qc_ok else 0,
+                            qc_note,
+                            now_iso,
                             now_iso,
                         ),
                     )
 
                     cur.execute(
                         """
-                        INSERT INTO sending_queue (
-                            id, host_id, current_message_id, status, priority,
-                            created_at, updated_at
-                        ) VALUES (?, ?, ?, 'Draft', 10, ?, ?)
-                        ON CONFLICT(host_id) DO UPDATE SET
-                            current_message_id = COALESCE(excluded.current_message_id, sending_queue.current_message_id),
-                            status = CASE
-                                WHEN LOWER(sending_queue.status) IN ('sent', 'approved', 'qc_review_required', 'name_review_required')
-                                THEN sending_queue.status
-                                ELSE 'Draft'
-                            END,
-                            updated_at = excluded.updated_at;
+                        INSERT OR IGNORE INTO core_host_snapshots (host_id, trip_id, raw_data_json, captured_at)
+                        VALUES (?, ?, ?, ?);
                         """,
-                        (f"q_{canonical_h_id}", canonical_h_id, msg_id, now_iso, now_iso),
+                        (host_id, target_trip_id, json.dumps(h, ensure_ascii=False), now_iso),
                     )
 
-                    item = {
-                        "id": canonical_h_id,
-                        "username": host_username,
-                        "name": h.get("name") or host_username,
-                        "clean_name": first_name,
-                        "profile_url": h.get("profile_url") or f"https://www.couchsurfing.com/c/users/{host_username}",
-                        "stay_request_url": h.get("stay_request_url") or f"https://www.couchsurfing.com/c/users/{host_username}/stay-request",
-                        "location": str(loc),
-                        "references_count": h.get("references_count", 0),
-                        "response_rate_pct": float(h.get("response_rate_pct", 90.0) or 90.0),
-                        "estimated_gender": h.get("estimated_gender") or h.get("gender") or "unknown",
-                        "host_type": h.get("host_type", "solo"),
-                        "instagram_handle": h.get("instagram_handle"),
-                        "instagram_url": h.get("instagram_url"),
-                        "status": "Draft",
-                        "check_in": check_in,
-                        "check_out": check_out,
-                        "message": default_msg,
-                        "generated_message": default_msg,
-                        "word_count": len(default_msg.split()),
-                        "anchor": anchor_used,
-                        "anchor_used": anchor_used,
-                        "host_fact_used": host_fact_used,
-                        "user_fact_used": user_fact_used,
-                        "confidence": conf,
-                        "fallback_used": bool(fb_val),
-                        "qc_passed": True,
-                        "created_at": now_iso,
-                        "updated_at": now_iso,
-                    }
-                    added_items.append(item)
+                    added_items.append(host_username)
                     existing_users.add(host_username.lower())
-                    existing_users.add(canonical_h_id.lower())
+                    existing_users.add(host_id.lower())
         except Exception as e:
-            logger.error(f"Ошибка массового добавления хостов в БД: {e}")
+            logger.error(f"Ошибка массового добавления хостов в core_hosts: {e}")
 
-        if added_items:
-            full_queue = added_items + existing
-            self.save_queue(full_queue)
-
+        self.save_queue(self.load_queue(exclude_sent=False, trip_id=target_trip_id))
         if return_details:
-            return len(added_items), [x.get("username") or x.get("id") for x in added_items]
+            return len(added_items), added_items
         return len(added_items)
 
     def set_status_for_selected(self, usernames: List[str], status: str) -> int:
-        """Массовая установка статуса для выбранных хостов и синхронизация в `core_hosts`."""
+        """Массовая установка статуса для выбранных хостов в core_hosts."""
         now_iso = datetime.now().isoformat()
         status_lower = str(status).strip().lower()
         is_target_sent = status_lower in ("sent", "was sent")
-        sent_guard = "" if is_target_sent else " AND LOWER(COALESCE(status, '')) != 'sent'"
+
+        st_map = {
+            "approved": "approved",
+            "sent": "sent",
+            "was sent": "sent",
+            "skipped": "skipped",
+            "failed": "skipped",
+            "rejected": "rejected",
+            "queued": "selected",
+            "draft": "drafted",
+        }
+        c_st = st_map.get(status_lower, "selected")
 
         with db_session() as conn:
             cur = conn.cursor()
-            cur.executemany(
-                f"""
-                UPDATE sending_queue
-                SET status = ?, updated_at = ?
-                WHERE ((host_id IN (SELECT id FROM hosts WHERE LOWER(username) = LOWER(?) OR LOWER(id) = LOWER(?)))
-                   OR LOWER(host_id) = LOWER(?)){sent_guard};
-                """,
-                [(status, now_iso, u, u, u) for u in usernames],
-            )
-            count = cur.rowcount
-
-            st_map = {
-                "approved": "approved",
-                "sent": "sent",
-                "was sent": "sent",
-                "skipped": "skipped",
-                "failed": "skipped",
-                "rejected": "rejected",
-                "queued": "selected",
-                "draft": "drafted",
-            }
-            c_st = st_map.get(status_lower)
-            if c_st:
+            if is_target_sent:
+                cur.executemany(
+                    """
+                    UPDATE core_hosts
+                    SET state = 'sent', sent_at = COALESCE(sent_at, ?), updated_at = ?
+                    WHERE LOWER(username) = LOWER(?) OR LOWER(host_id) = LOWER(?);
+                    """,
+                    [(now_iso, now_iso, u, u) for u in usernames],
+                )
+            else:
                 cur.executemany(
                     """
                     UPDATE core_hosts
@@ -1923,8 +1515,33 @@ class RequestQueueManager:
                     """,
                     [(c_st, now_iso, u, u) for u in usernames],
                 )
+            count = cur.rowcount
+
         self.save_queue(self.load_queue(exclude_sent=False))
         return count
+
+    def skip_item(self, username: str, reason: str = "User skipped") -> bool:
+        """Переводит хоста в статус 'skipped' в core_hosts."""
+        now_iso = datetime.now().isoformat()
+        with db_session() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE core_hosts
+                SET state = 'skipped', qc_notes = ?, updated_at = ?
+                WHERE (LOWER(username) = LOWER(?) OR LOWER(host_id) = LOWER(?))
+                  AND state != 'sent';
+                """,
+                (reason, now_iso, username, username),
+            )
+            ok = cur.rowcount > 0
+        if ok:
+            self.save_queue(self.load_queue(exclude_sent=False))
+        return ok
+
+    def delete_item(self, username: str) -> bool:
+        """Переводит хоста в статус 'skipped' (не удаляя физически)."""
+        return self.skip_item(username)
 
 
 _rqm_instance: Optional[RequestQueueManager] = None

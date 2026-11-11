@@ -74,6 +74,16 @@ class GuestProfile(BaseModel):
     ]
 
 
+ROBOTIC_CLICHES: List[str] = [
+    "won't crowd your space",
+    "wont crowd your space",
+    "traveling light with a daypack",
+    "55+ countries",
+    "10+ years on cs",
+    "club med tomamu",
+]
+
+
 GUEST = GuestProfile()
 
 
@@ -87,9 +97,17 @@ class Tuple_Validation:
 
 
 def validate_text_purity(text: str) -> Tuple[bool, List[str]]:
-    """Проверяет текст на отсутствие запрещенных географических галлюцинаций."""
+    """Проверяет текст на отсутствие запрещенных географических галлюцинаций и роботизированных клише."""
+    if not text:
+        return True, []
     text_lower = text.lower()
-    violations = [term for term in GUEST.forbidden_terms if term in text_lower]
+    violations = []
+    for term in GUEST.forbidden_terms:
+        if term in text_lower:
+            violations.append(f"Forbidden term: '{term}'")
+    for phrase in ROBOTIC_CLICHES:
+        if phrase in text_lower:
+            violations.append(f"Robotic cliché: '{phrase}'")
     return len(violations) == 0, violations
 
 

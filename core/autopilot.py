@@ -159,7 +159,7 @@ class AutopilotEngine:
             return cur.lastrowid or 0
 
     def mark_as_sent(self, host_id: str, http_status: int = 200, notes: Optional[str] = None) -> bool:
-        """Фиксирует успешную отправку запроса в `core_hosts`, `sending_queue`, `sending_history` и `core_audit_logs`."""
+        """Фиксирует успешную отправку запроса в `core_hosts`, `sending_history` и `core_audit_logs`."""
         now_iso = datetime.now().isoformat()
         with get_connection(self.db_file) as conn:
             cur = conn.cursor()
@@ -172,17 +172,6 @@ class AutopilotEngine:
                 (now_iso, now_iso, self.trip_id, host_id, host_id),
             )
             affected = cur.rowcount > 0
-            if affected:
-                cur.execute(
-                    """
-                    UPDATE sending_queue
-                    SET status = 'Sent', sent_at = ?, notes = COALESCE(?, notes), updated_at = ?
-                    WHERE host_id = ? OR host_id IN (
-                        SELECT id FROM hosts WHERE LOWER(username) = LOWER(?) OR LOWER(id) = LOWER(?)
-                    );
-                    """,
-                    (now_iso, notes, now_iso, host_id, host_id, host_id),
-                )
 
         if affected:
             self.record_sending_attempt(
@@ -247,21 +236,8 @@ class AutopilotEngine:
                 (f"Moved to bottom: {reason}", now_iso, host_id, host_id),
             )
             ch_ok = cur.rowcount > 0
-            cur.execute(
-                """
-                UPDATE sending_queue
-                SET priority = COALESCE(priority, 10) - 100,
-                    notes = ?,
-                    updated_at = ?
-                WHERE (LOWER(host_id) = LOWER(?) OR host_id IN (
-                    SELECT id FROM hosts WHERE LOWER(username) = LOWER(?) OR LOWER(id) = LOWER(?)
-                )) AND LOWER(status) != 'sent';
-                """,
-                (f"Moved to bottom of queue: {reason}", now_iso, host_id, host_id, host_id),
-            )
-            sq_ok = cur.rowcount > 0
 
-        if ch_ok or sq_ok:
+        if ch_ok:
             log_audit(
                 trip_id=self.trip_id,
                 module="AUTOPILOT",
@@ -270,4 +246,4 @@ class AutopilotEngine:
                 details={"reason": reason},
                 db_file=self.db_file,
             )
-        return ch_ok or sq_ok
+        return ch_ok

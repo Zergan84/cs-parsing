@@ -350,13 +350,14 @@ async def get_status(city: Optional[str] = None):
     try:
         with db_session() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT status, count(*) FROM sending_queue GROUP BY status;")
+            cur.execute("SELECT state, count(*) FROM core_hosts GROUP BY state;")
             for row in cur.fetchall():
                 st, cnt = row[0], row[1]
-                queue_total += cnt
-                if st == "Approved":
+                if st in ("selected", "drafted", "approved"):
+                    queue_total += cnt
+                if st == "approved":
                     approved_count += cnt
-                elif st == "Draft":
+                elif st == "drafted":
                     draft_count += cnt
     except Exception:
         pass
@@ -1215,17 +1216,7 @@ async def get_travel_context():
             }
         }
 
-    return {
-        "travel_context": {
-            "trip_id": "kyoto-trip-3lhdfema5epclndo82mclxklzfytp-3LhDfEmA5Epclndo82MclXkLzFy_tp",
-            "city": "Kyoto",
-            "country": "Japan",
-            "dates_text": "Nov 19–21, 2026",
-            "arrival_date": "2026-11-19",
-            "departure_date": "2026-11-21",
-            "purpose": "Exploring historic neighborhoods, photography, and cultural exchange before the winter season",
-        }
-    }
+    return {"travel_context": None}
 
 
 @app.post("/api/context/travel")
@@ -1417,31 +1408,40 @@ async def get_host_analysis(username: str, trip_id: Optional[str] = None, city: 
             "departure_date": eff_dep,
         }
 
-        # Проверяем наличие хоста в очереди (sending_queue + generated_messages)
+        # Проверяем наличие хоста в очереди (core_hosts)
         cur.execute(
             """
-            SELECT sq.status, sq.notes, sq.updated_at,
-                   gm.message_text, gm.word_count, gm.qc_passed,
-                   gm.anchor_used, gm.host_fact_used, gm.user_fact_used,
-                   gm.check_in, gm.check_out
-            FROM sending_queue sq
-            LEFT JOIN generated_messages gm ON sq.current_message_id = gm.id
-            WHERE LOWER(sq.host_id) = LOWER(?) OR LOWER(sq.host_id) = LOWER(?);
+            SELECT state, qc_notes, updated_at, message_draft, qc_passed
+            FROM core_hosts
+            WHERE LOWER(host_id) = LOWER(?) OR LOWER(username) = LOWER(?);
             """,
             (host_id, u_clean),
         )
-        sq_row = cur.fetchone()
-        if sq_row:
+        ch_row = cur.fetchone()
+        if ch_row and ch_row["state"] in ("selected", "drafted", "approved", "sent", "skipped"):
+            st_map = {
+                "approved": "Approved",
+                "sent": "Sent",
+                "skipped": "Skipped",
+                "rejected": "Rejected",
+                "selected": "Queued",
+                "discovered": "Name_Review_Required",
+            }
+            raw_st = ch_row["state"]
+            if raw_st in st_map:
+                q_status = st_map[raw_st]
+            elif raw_st == "drafted":
+                q_status = "Draft" if ch_row["qc_passed"] else "QC_Review_Required"
+            else:
+                q_status = "Draft"
+
             data["in_queue"] = True
-            data["queue_status"] = sq_row["status"] or "Draft"
-            data["generated_message"] = sq_row["message_text"] or ""
-            data["word_count"] = sq_row["word_count"] or len((sq_row["message_text"] or "").split())
-            data["qc_passed"] = bool(sq_row["qc_passed"]) if sq_row["qc_passed"] is not None else True
-            data["anchor_used"] = sq_row["anchor_used"]
-            data["host_fact_used"] = sq_row["host_fact_used"]
-            data["user_fact_used"] = sq_row["user_fact_used"]
-            data["check_in"] = sq_row["check_in"] or eff_arr
-            data["check_out"] = sq_row["check_out"] or eff_dep
+            data["queue_status"] = q_status
+            data["generated_message"] = ch_row["message_draft"] or ""
+            data["word_count"] = len((ch_row["message_draft"] or "").split())
+            data["qc_passed"] = bool(ch_row["qc_passed"])
+            data["check_in"] = eff_arr
+            data["check_out"] = eff_dep
         else:
             data["in_queue"] = False
             data["queue_status"] = None
@@ -1506,30 +1506,22 @@ def resolve_trip_alias(trip_id: Optional[str]) -> Optional[str]:
 
 
 def get_queued_identifiers(trip_id: Optional[str] = None) -> Set[str]:
-    """Возвращает полный набор lowercase-идентификаторов (username и id) хостов, находящихся в очереди (с учетом trip_id)."""
+    """Возвращает полный набор lowercase-идентификаторов (username и host_id) хостов из core_hosts (с учетом trip_id)."""
     with db_session() as conn:
         cur = conn.cursor()
         if trip_id:
             canon = resolve_trip_alias(trip_id)
             cur.execute("""
-                SELECT DISTINCT LOWER(COALESCE(h.username, sq.host_id)), LOWER(sq.host_id), LOWER(COALESCE(h.id, sq.host_id))
-                FROM sending_queue sq
-                LEFT JOIN hosts h ON (sq.host_id = h.id OR LOWER(sq.host_id) = LOWER(h.username))
-                JOIN trip_hosts th ON (
-                    sq.host_id = th.host_id 
-                    OR LOWER(sq.host_id) = LOWER(th.host_id)
-                    OR (h.id IS NOT NULL AND LOWER(h.id) = LOWER(th.host_id))
-                    OR (h.username IS NOT NULL AND LOWER(h.username) = LOWER(th.host_id))
-                )
-                WHERE LOWER(th.trip_id) = LOWER(?)
-                  AND LOWER(COALESCE(sq.status, '')) IN ('draft', 'approved', 'queued', 'name_review_required', 'qc_review_required', 'needs_regeneration', 'sent', 'skipped');
+                SELECT DISTINCT LOWER(username), LOWER(host_id)
+                FROM core_hosts
+                WHERE LOWER(trip_id) = LOWER(?)
+                  AND state IN ('selected', 'drafted', 'approved', 'sent', 'skipped', 'discovered', 'inbox');
             """, (canon,))
         else:
             cur.execute("""
-                SELECT DISTINCT LOWER(COALESCE(h.username, sq.host_id)), LOWER(sq.host_id), LOWER(COALESCE(h.id, sq.host_id))
-                FROM sending_queue sq
-                LEFT JOIN hosts h ON (sq.host_id = h.id OR LOWER(sq.host_id) = LOWER(h.username))
-                WHERE LOWER(COALESCE(sq.status, '')) IN ('draft', 'approved', 'queued', 'name_review_required', 'qc_review_required', 'needs_regeneration', 'sent', 'skipped');
+                SELECT DISTINCT LOWER(username), LOWER(host_id)
+                FROM core_hosts
+                WHERE state IN ('selected', 'drafted', 'approved', 'sent', 'skipped', 'discovered', 'inbox');
             """)
         queued = set()
         for r in cur.fetchall():
@@ -1633,8 +1625,8 @@ async def get_results(
                                pa.secret_code_detected, pa.secret_code_hint
                         FROM hosts h
                         LEFT JOIN profile_analyses pa ON h.id = pa.host_id
-                        WHERE LOWER(h.id) NOT IN (SELECT LOWER(host_id) FROM sending_queue WHERE LOWER(COALESCE(status, '')) IN ('draft', 'approved', 'queued', 'name_review_required', 'sent', 'skipped'))
-                          AND LOWER(h.username) NOT IN (SELECT LOWER(COALESCE(h2.username, sq.host_id)) FROM sending_queue sq LEFT JOIN hosts h2 ON sq.host_id = h2.id WHERE LOWER(COALESCE(sq.status, '')) IN ('draft', 'approved', 'queued', 'name_review_required', 'sent', 'skipped'))
+                        WHERE LOWER(h.id) NOT IN (SELECT LOWER(host_id) FROM core_hosts WHERE state IN ('drafted', 'approved', 'selected', 'discovered', 'sent', 'skipped'))
+                          AND LOWER(h.username) NOT IN (SELECT LOWER(username) FROM core_hosts WHERE state IN ('drafted', 'approved', 'selected', 'discovered', 'sent', 'skipped'))
                         ORDER BY h.updated_at DESC;
                     """)
                 else:
@@ -1647,8 +1639,8 @@ async def get_results(
                         FROM hosts h
                         LEFT JOIN profile_analyses pa ON h.id = pa.host_id
                         WHERE (LOWER(h.location) LIKE ? OR LOWER(h.location) LIKE ?)
-                          AND LOWER(h.id) NOT IN (SELECT LOWER(host_id) FROM sending_queue WHERE LOWER(COALESCE(status, '')) IN ('draft', 'approved', 'queued', 'name_review_required', 'sent', 'skipped'))
-                          AND LOWER(h.username) NOT IN (SELECT LOWER(COALESCE(h2.username, sq.host_id)) FROM sending_queue sq LEFT JOIN hosts h2 ON sq.host_id = h2.id WHERE LOWER(COALESCE(sq.status, '')) IN ('draft', 'approved', 'queued', 'name_review_required', 'sent', 'skipped'))
+                          AND LOWER(h.id) NOT IN (SELECT LOWER(host_id) FROM core_hosts WHERE state IN ('drafted', 'approved', 'selected', 'discovered', 'sent', 'skipped'))
+                          AND LOWER(h.username) NOT IN (SELECT LOWER(username) FROM core_hosts WHERE state IN ('drafted', 'approved', 'selected', 'discovered', 'sent', 'skipped'))
                         ORDER BY h.updated_at DESC;
                     """, (f"%{clean_city.lower()}%", f"%{slug}%"))
                 for row in cur.fetchall():
@@ -1815,15 +1807,6 @@ async def delete_selected_hosts(payload: DeleteHostsPayload):
                       AND state != 'sent';
                 """, u_list + u_list)
                 marked_rejected_count = cur.rowcount
-
-            # 3. Помечаем в sending_queue как Skipped
-            cur.execute(f"""
-                UPDATE sending_queue 
-                SET status = 'Skipped', updated_at = CURRENT_TIMESTAMP
-                WHERE (LOWER(host_id) IN ({placeholders}) 
-                       OR host_id IN (SELECT id FROM hosts WHERE LOWER(username) IN ({placeholders}) OR LOWER(id) IN ({placeholders})))
-                  AND LOWER(status) != 'sent';
-            """, u_list + u_list + u_list)
 
             if target_trip_id:
                 log_audit(
@@ -2832,10 +2815,9 @@ async def api_queue_generate_batch_auto(count: int = 5):
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT h.username, h.id FROM sending_queue sq
-            JOIN hosts h ON sq.host_id = h.id
-            WHERE sq.status IN ('Needs_Regeneration', 'QC_Review_Required', 'Draft')
-            ORDER BY sq.priority DESC, h.references_count DESC
+            SELECT username, host_id FROM core_hosts
+            WHERE state IN ('selected', 'drafted')
+            ORDER BY COALESCE(priority, 10) DESC, updated_at ASC
             LIMIT ?;
             """,
             (limit,)
@@ -3623,16 +3605,22 @@ async def api_sync_dispatcher_queue(trip_id: Optional[str] = None):
 
     # Синхронизация core_hosts со всеми подтвержденными отправками
     try:
-        from database import db_session
-        with db_session() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                UPDATE core_hosts
-                SET state = 'sent'
-                WHERE state != 'sent'
-                  AND (LOWER(username) IN (SELECT LOWER(h.username) FROM sending_queue sq JOIN hosts h ON sq.host_id = h.id WHERE sq.status = 'Sent')
-                    OR LOWER(host_id) IN (SELECT LOWER(sq.host_id) FROM sending_queue sq WHERE sq.status = 'Sent'));
-            """)
+        from core.database import db_session, get_sent_usernames
+        sent_set = get_sent_usernames()
+        if sent_set:
+            now_iso = datetime.now().isoformat()
+            with db_session() as conn:
+                cur = conn.cursor()
+                for u in sent_set:
+                    cur.execute(
+                        """
+                        UPDATE core_hosts
+                        SET state = 'sent', sent_at = COALESCE(sent_at, ?), updated_at = ?
+                        WHERE (LOWER(username) = LOWER(?) OR LOWER(host_id) = LOWER(?))
+                          AND state != 'sent';
+                        """,
+                        (now_iso, now_iso, u, u),
+                    )
     except Exception as e:
         logger.warning(f"Ошибка синхронизации core_hosts при sync-queue: {e}")
 
