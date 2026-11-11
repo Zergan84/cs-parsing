@@ -20,7 +20,6 @@ import os
 import random
 import re
 import signal
-import sqlite3
 import sys
 import time
 
@@ -254,6 +253,25 @@ class AutoSender:
                 except (OSError, ImportError):
                     pass
         os.replace(tmp_file, SENT_LOG_FILE)
+
+        # Каноническая запись попытки отправки в SQLite sending_history через AutopilotEngine
+        try:
+            from core.autopilot import AutopilotEngine
+            engine = AutopilotEngine(trip_id=self.trip_id or "default")
+            engine.record_sending_attempt(
+                host_id_or_username=str(entry.get("username") or entry.get("id") or ""),
+                status=str(entry.get("status") or "UNKNOWN"),
+                mode=str(entry.get("mode") or ("dry_run" if self.dry_run else "live")),
+                http_status=entry.get("http_status"),
+                proof_screenshot=entry.get("proof_screenshot"),
+                before_screenshot=entry.get("before_screenshot"),
+                button_selector=entry.get("button_selector"),
+                notes=entry.get("notes"),
+                error_details=entry.get("error"),
+                timestamp=entry.get("timestamp"),
+            )
+        except Exception as e:
+            log_step("DEBUG", f"SQLite sending_history sync note: {e}")
 
     def update_queue_status(
         self,
@@ -641,39 +659,36 @@ class AutoSender:
             or host_item.get("target_city")
         )
 
-        # Синхронизация с базой данных output/couchsurfing_platform.db
-        db_path = Path(os.environ.get("CS_DB_PATH", str(OUTPUT_DIR / "couchsurfing_platform.db"))).resolve()
-        if db_path.exists() and username:
-            conn = None
+        # Синхронизация с канонической базой данных через core.database
+        if username:
             try:
-                conn = sqlite3.connect(db_path)
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT 
-                        COALESCE(ut.city, th.city, gm.target_city, h.location) as trip_city,
-                        COALESCE(gm.check_in, th.arrival_date, ut.arrival_date) as cin,
-                        COALESCE(gm.check_out, th.departure_date, ut.departure_date) as cout
-                    FROM hosts h
-                    LEFT JOIN trip_hosts th ON (th.host_id = h.id OR LOWER(th.host_id) = LOWER(h.username))
-                    LEFT JOIN user_trips ut ON th.trip_id = ut.trip_id
-                    LEFT JOIN generated_messages gm ON gm.host_id = h.id AND gm.is_active = 1
-                    WHERE h.username = ? OR h.id = ?
-                    ORDER BY th.created_at DESC, gm.id DESC LIMIT 1
-                """, (username, username))
-                row = cursor.fetchone()
-                if row:
-                    db_city, db_cin, db_cout = row
-                    if db_city and not target_city:
-                        target_city = db_city
-                    if db_cin and not arrival_date:
-                        arrival_date = db_cin
-                    if db_cout and not departure_date:
-                        departure_date = db_cout
+                from core.database import get_connection
+                with get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        SELECT 
+                            COALESCE(ct.city, ut.city, th.city, h.location) as trip_city,
+                            COALESCE(gm.check_in, th.arrival_date, ct.arrival_date, ut.arrival_date) as cin,
+                            COALESCE(gm.check_out, th.departure_date, ct.departure_date, ut.departure_date) as cout
+                        FROM hosts h
+                        LEFT JOIN trip_hosts th ON (th.host_id = h.id OR LOWER(th.host_id) = LOWER(h.username))
+                        LEFT JOIN core_trips ct ON th.trip_id = ct.id
+                        LEFT JOIN user_trips ut ON th.trip_id = ut.trip_id
+                        LEFT JOIN generated_messages gm ON gm.host_id = h.id AND gm.is_active = 1
+                        WHERE LOWER(h.username) = LOWER(?) OR LOWER(h.id) = LOWER(?)
+                        ORDER BY th.created_at DESC, gm.id DESC LIMIT 1
+                    """, (username, username))
+                    row = cursor.fetchone()
+                    if row:
+                        db_city, db_cin, db_cout = row
+                        if db_city and not target_city:
+                            target_city = db_city
+                        if db_cin and not arrival_date:
+                            arrival_date = db_cin
+                        if db_cout and not departure_date:
+                            departure_date = db_cout
             except Exception:
                 pass
-            finally:
-                if conn:
-                    conn.close()
 
         arrival_date = arrival_date or "2026-11-16"
         departure_date = departure_date or "2026-11-19"

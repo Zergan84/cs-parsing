@@ -1,17 +1,26 @@
 """
 core/inbox.py - Модуль INBOX (Ответы хостов + Автоответ).
 Отвечает за:
-1. Фиксацию входящих ответов от хостов (state = 'inbox').
+1. Фиксацию входящих ответов от хостов (state = 'inbox') и синхронизацию с `inbox_conversations`.
 2. Привязку диалога к хосту и активному Trip.
 3. Генерацию контекстных вариантов автоответа (время прибытия, благодарность, встреча).
 """
 
 import json
 from datetime import datetime
-from typing import Any, Dict, List, Optional
 from pathlib import Path
+from typing import Any, Dict, List, Optional
+
 from core.context import GUEST
-from core.database import get_connection, log_audit
+from core.database import (
+    get_connection,
+    get_inbox_conversation,
+    get_inbox_conversations,
+    log_audit,
+    mark_host_declined,
+    save_inbox_conversation,
+    update_inbox_conversation,
+)
 from core.models import HostState
 
 
@@ -33,12 +42,12 @@ class InboxEngine:
                 WHERE trip_id = ? AND state = 'inbox'
                 ORDER BY updated_at DESC;
                 """,
-                (self.trip_id,)
+                (self.trip_id,),
             )
             return [dict(r) for r in cur.fetchall()]
 
     def record_incoming_reply(self, host_id: str, message_text: str) -> bool:
-        """Регистрирует ответ хоста и переводит статус в 'inbox'."""
+        """Регистрирует ответ хоста, переводит статус в 'inbox' и синхронизирует `inbox_conversations`."""
         now_iso = datetime.now().isoformat()
         with get_connection(self.db_file) as conn:
             cur = conn.cursor()
@@ -46,11 +55,27 @@ class InboxEngine:
                 """
                 UPDATE core_hosts
                 SET state = 'inbox', updated_at = ?
-                WHERE trip_id = ? AND host_id = ?;
+                WHERE trip_id = ? AND (host_id = ? OR username = ?);
                 """,
-                (now_iso, self.trip_id, host_id)
+                (now_iso, self.trip_id, host_id, host_id),
             )
             affected = cur.rowcount > 0
+            cur.execute(
+                "SELECT username, name, avatar_url, location FROM core_hosts WHERE trip_id = ? AND (host_id = ? OR username = ?) LIMIT 1;",
+                (self.trip_id, host_id, host_id),
+            )
+            ch = cur.fetchone()
+
+        if ch:
+            save_inbox_conversation(
+                host_username=ch["username"] or host_id,
+                host_name=ch["name"] or host_id,
+                last_message_received=message_text,
+                last_message_timestamp=now_iso,
+                host_avatar_url=ch["avatar_url"],
+                location=ch["location"] or "Japan",
+                db_file=self.db_file,
+            )
 
         if affected:
             log_audit(
@@ -59,7 +84,7 @@ class InboxEngine:
                 event="INCOMING_REPLY_RECEIVED",
                 host_id=host_id,
                 details={"preview": message_text[:100]},
-                db_file=self.db_file
+                db_file=self.db_file,
             )
         return affected
 
@@ -87,3 +112,13 @@ class InboxEngine:
                 f"Thank you so much for the message! That sounds wonderful. I'd love to coordinate details closer to the dates.\n\n"
                 f"Warmly,\nAndrey"
             )
+
+
+__all__ = [
+    "InboxEngine",
+    "get_inbox_conversations",
+    "get_inbox_conversation",
+    "save_inbox_conversation",
+    "update_inbox_conversation",
+    "mark_host_declined",
+]

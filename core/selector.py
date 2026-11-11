@@ -3,14 +3,15 @@ core/selector.py - Модуль СЕЛЕКТОР (Like / Pass / VIP).
 Отвечает за:
 1. Выдачу ранжированных хостов (1-5★) из Коллектора.
 2. Быстрый отбор гостем: Like (в очередь), VIP (приоритет), Pass (отклонить).
-3. Перевод состояния хоста: discovered -> selected / rejected.
+3. Перевод состояния хоста: discovered -> selected / rejected (с синхронизацией sending_queue).
 4. Пакетные правила (например: отобрать всех 4-5★).
 """
 
 import json
 from datetime import datetime
-from typing import Any, Dict, List, Optional
 from pathlib import Path
+from typing import Any, Dict, List, Optional
+
 from core.database import get_connection, log_audit
 from core.models import HostCard, HostState
 
@@ -26,7 +27,7 @@ class SelectorEngine:
         self,
         min_stars: int = 1,
         limit: int = 50,
-        offset: int = 0
+        offset: int = 0,
     ) -> List[Dict[str, Any]]:
         """Возвращает ранжированных кандидатов в статусе 'discovered'."""
         with get_connection(self.db_file) as conn:
@@ -43,12 +44,13 @@ class SelectorEngine:
                 ORDER BY score_stars DESC, created_at DESC
                 LIMIT ? OFFSET ?;
                 """,
-                (self.trip_id, min_stars, limit, offset)
+                (self.trip_id, min_stars, limit, offset),
             )
             rows = cur.fetchall()
-            
+
             results = []
             for r in rows:
+                r_keys = r.keys()
                 results.append({
                     "host_id": r["host_id"],
                     "username": r["username"],
@@ -61,15 +63,15 @@ class SelectorEngine:
                     "interests": json.loads(r["interests_json"] or "[]"),
                     "languages": json.loads(r["languages_json"] or "[]"),
                     "countries": json.loads(r["countries_json"] or "[]"),
-                    "countries_lived": json.loads(r["countries_lived_json"] or "[]") if "countries_lived_json" in r.keys() else [],
+                    "countries_lived": json.loads(r["countries_lived_json"] or "[]") if "countries_lived_json" in r_keys else [],
                     "profile_url": r["profile_url"],
                     "avatar_url": r["avatar_url"],
-                    "is_verified": bool(r["is_verified"]) if "is_verified" in r.keys() else False,
-                    "birth_country": r["birth_country"] if "birth_country" in r.keys() else None,
-                    "residence_country": r["residence_country"] if "residence_country" in r.keys() else None,
-                    "is_hosting": r["is_hosting"] if "is_hosting" in r.keys() else "unknown",
-                    "household": r["household"] if "household" in r.keys() else None,
-                    "special_notes": r["special_notes"] if "special_notes" in r.keys() else None,
+                    "is_verified": bool(r["is_verified"]) if "is_verified" in r_keys else False,
+                    "birth_country": r["birth_country"] if "birth_country" in r_keys else None,
+                    "residence_country": r["residence_country"] if "residence_country" in r_keys else None,
+                    "is_hosting": r["is_hosting"] if "is_hosting" in r_keys else "unknown",
+                    "household": r["household"] if "household" in r_keys else None,
+                    "special_notes": r["special_notes"] if "special_notes" in r_keys else None,
                     "score_stars": r["score_stars"],
                     "score_reasons": json.loads(r["score_reasons_json"] or "[]"),
                     "state": r["state"],
@@ -82,12 +84,15 @@ class SelectorEngine:
         - 'like': перевод в selected
         - 'vip': перевод в selected с пометкой VIP
         - 'pass': перевод в rejected (скрывается, но не удаляется)
+        Инвариант: никогда не перезаписывает хоста со статусом 'sent'.
         """
         decision_clean = decision.strip().lower()
         if decision_clean in ("like", "vip"):
             new_state = HostState.SELECTED
+            q_status = "Queued"
         elif decision_clean == "pass":
             new_state = HostState.REJECTED
+            q_status = "Rejected"
         else:
             raise ValueError(f"Unknown decision '{decision}'. Use 'like', 'vip', or 'pass'.")
 
@@ -98,11 +103,21 @@ class SelectorEngine:
                 """
                 UPDATE core_hosts
                 SET state = ?, updated_at = ?
-                WHERE trip_id = ? AND host_id = ?;
+                WHERE trip_id = ? AND (host_id = ? OR username = ?) AND state != 'sent';
                 """,
-                (new_state.value, now_iso, self.trip_id, host_id)
+                (new_state.value, now_iso, self.trip_id, host_id, host_id),
             )
             affected = cur.rowcount > 0
+            if affected:
+                cur.execute(
+                    """
+                    UPDATE sending_queue
+                    SET status = ?, updated_at = ?
+                    WHERE (host_id = ? OR host_id IN (SELECT id FROM hosts WHERE LOWER(username) = LOWER(?)))
+                      AND LOWER(status) != 'sent';
+                    """,
+                    (q_status, now_iso, host_id, host_id),
+                )
 
         if affected:
             log_audit(
@@ -111,7 +126,7 @@ class SelectorEngine:
                 event=f"DECISION_{decision_clean.upper()}",
                 host_id=host_id,
                 details={"new_state": new_state.value},
-                db_file=self.db_file
+                db_file=self.db_file,
             )
         return affected
 

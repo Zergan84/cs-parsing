@@ -24,40 +24,43 @@
 
 ---
 
-## 📁 Структура проекта
+## 📁 Структура проекта (Единая архитектура DDD)
 
 ```text
 couchsurfing-scraper/
-├── app.py                   # FastAPI бэкенд, REST API и сервер веб-интерфейса
-├── auto_sender.py           # Автономный Playwright-диспетчер боевой отправки запросов
-├── scraper.py               # Модуль сбора анкет хостов (GraphQL + виртуализированная пагинация)
-├── request_manager.py       # Канонический менеджер очереди кандидатов и статусов
-├── message_generator.py     # Детерминированный генератор персонализированных запросов и хуков
-├── llm_agent.py             # Интеграция Ollama / Gemini Flash и валидатор качества (Pre-dispatch QC)
-├── context_assembler.py     # Интеллектуальная сборка контекста хоста и профиля Андрея
-├── personal_context.py      # Управление личными фактами гостя и якорями совместимости
-├── profile_analyzer.py      # Извлечение структурированных атрибутов, правил дома и секретных слов
-├── database.py              # Инициализация SQLite, контекст сессий и миграции схемы
-├── hosting_guard.py         # Проверка доступности размещения и статуса хоста
-├── gender_classifier.py     # Классификатор пола хоста (Male / Female / Couple)
-├── gender_enricher.py       # Пакетное обогащение базы признаками пола
-├── auth.py                  # Авторизация в Couchsurfing и проверка валидности cookies
-├── data_cleaner.py          # Санитизация текстовых полей и удаление мусорных символов
-├── social_extractor.py      # Извлечение Instagram handle (@username)
-├── process_manager.py       # Менеджер фоновых OS-процессов и буферов логов
-├── sync_sent_requests.py    # CLI-утилита сверки отправленных запросов
+├── core/                        # КАНОНИЧЕСКИЙ ДОМЕННЫЙ СЛОЙ (DDD)
+│   ├── database.py              # Единый менеджер соединений SQLite (WAL, Foreign Keys=1)
+│   ├── models.py                # Pydantic-модели домена (Trip, HostCard, HostState и др.)
+│   ├── context.py               # Контекст гостя, факты и анти-галлюцинационный QC
+│   ├── collector.py             # Коллектор анкет, дедупликация и скоринг
+│   ├── selector.py              # Селектор хостов по поездкам (Like / Dislike)
+│   ├── queue.py                 # Очередь отправки, генератор писем и Strict QC
+│   ├── autopilot.py             # Диспетчер отправки, джиттер 5–10 мин, лимиты, фиксация Sent
+│   └── inbox.py                 # Модуль входящих ответов и рекомендаций
+├── scripts/                     # ИНСПЕКЦИЯ И МИГРАЦИЯ
+│   ├── inspect_databases.py     # Диагностика целостности, PRAGMA и строк БД
+│   ├── migrate_legacy_database.py # Каноническая миграция с атомарным бэкапом
+│   └── verify_migration.py      # Автоматическая верификация нулевых потерь данных
+├── docs/
+│   └── ARCHITECTURE.md          # Полная архитектурная спецификация (DDD, ERD, State Machine)
+├── app.py                       # FastAPI веб-сервер и REST API
+├── auto_sender.py               # Автономный Playwright-воркер отправки
+├── scraper.py                   # Модуль сбора анкет хостов (GraphQL)
+├── database.py                  # Тонкий фасад -> core.database
+├── personal_context.py          # Тонкий фасад -> core.context
+├── context_assembler.py         # Тонкий фасад -> core.context
+├── profile_analyzer.py          # Тонкий фасад -> core.collector
+├── request_manager.py           # Тонкий фасад -> core.queue
+├── tests/                       # АВТОМАТИЧЕСКИЕ ТЕСТЫ (100% Green)
+│   ├── test_tz_pipeline.py      # Интеграционные тесты 10 требований ТЗ
+│   ├── test_architectural_invariants.py # AST-тест соединений, WAL, FK, инварианты состояний
+│   └── test_migration_and_lifecycle.py  # Тесты идемпотентности миграции и E2E цикла
 ├── templates/
-│   └── index.html           # Монолитный Single Page Application интерфейс
-├── tests/
-│   └── test_tz_pipeline.py  # Интеграционные тесты пайплайна
-├── archive/
-│   ├── legacy_scripts/      # Заархивированные вспомогательные скрипты
-│   └── legacy_tests/        # Заархивированные устаревшие тесты
-├── requirements.txt         # Python-зависимости
-└── output/
-    ├── couchsurfing_platform.db  # Основная база данных SQLite (WAL-режим)
-    ├── auto_sender.log           # Лог работы автопилота
-    └── debug/                    # Скриншоты Playwright (before_send, after_send)
+│   └── index.html               # Веб-интерфейс платформы
+├── output/
+│   ├── couchsurfing_platform.db # Единый источник истины (SQLite WAL)
+│   └── backups/                 # Автоматические атомарные бэкапы
+└── requirements.txt             # Python-зависимости
 ```
 
 ---
@@ -129,6 +132,25 @@ python -u auto_sender.py \
 1. **Google Gemini Flash (приоритет):** быстрое составление текста через REST API `gemini-2.5-flash` при наличии ключа `GEMINI_API_KEY` в переменных окружения или таблице `app_settings`.
 2. **Ollama (локально):** автономная генерация через локальные модели `qwen2.5:7b` или `llama3.2:3b`.
 3. **Deterministic Fallback Generator:** мгновенное построение уникальных, заземлённых текстов по правилам ТЗ на базе извлечённых из профиля хуков и фактов Андрея, если внешние LLM недоступны.
+
+---
+
+## 🧪 Тестирование и верификация архитектуры
+
+Платформа снабжена 100% автоматическим тестовым покрытием всех доменных слоев и инвариантов:
+
+```bash
+# Запуск полного набора тестов
+PYTHONPATH=. pytest tests/ -v
+
+# Инспекция базы данных и целостности связей
+python scripts/inspect_databases.py
+
+# Автоматическая верификация нулевых потерь данных и инвариантов
+python scripts/verify_migration.py
+```
+
+Подробная архитектурная документация доступна в [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ---
 
