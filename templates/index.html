@@ -2937,6 +2937,36 @@
     .log-lvl.info { color: var(--sky-400); }
     .log-lvl.warn { color: var(--amber-400); }
     .log-lvl.error { color: var(--rose-500); }
+    .log-host-link {
+      color: #38BDF8 !important;
+      font-weight: 600;
+      text-decoration: underline;
+      text-underline-offset: 2px;
+      padding: 1px 5px;
+      margin: 0 2px;
+      background: rgba(56, 189, 248, 0.12);
+      border: 1px solid rgba(56, 189, 248, 0.25);
+      border-radius: 4px;
+      transition: all 0.15s ease;
+      display: inline-flex;
+      align-items: center;
+      gap: 2px;
+      cursor: pointer;
+    }
+    .log-host-link:hover {
+      background: rgba(56, 189, 248, 0.28);
+      color: #7DD3FC !important;
+      text-decoration: underline;
+      box-shadow: 0 0 6px rgba(56, 189, 248, 0.35);
+    }
+    .log-inline-link {
+      color: #38BDF8 !important;
+      text-decoration: underline;
+      text-underline-offset: 2px;
+    }
+    .log-inline-link:hover {
+      color: #7DD3FC !important;
+    }
 
     /* ========================================================
        RESPONSIVE & MOBILE (iPhone Safari Viewport 393-430px)
@@ -9969,6 +9999,30 @@
       renderLogs();
     }
 
+    function formatLogLineContent(text) {
+      if (!text) return '';
+      let safe = escapeHtml(text);
+
+      // 1. Полные URL -> кликабельные ссылки
+      safe = safe.replace(/(https?:\/\/[^\s<]+)/g, (url) => {
+        return `<a href="${url}" target="_blank" rel="noopener noreferrer" class="log-inline-link">${url}</a>`;
+      });
+
+      // 2. @username -> прямая ссылка на профиль CS
+      safe = safe.replace(/(?<![/\w])@([a-zA-Z0-9_.\-]+)/g, (match, uname) => {
+        const clean = uname.replace(/\.$/, '');
+        return `<a href="https://www.couchsurfing.com/people/${encodeURIComponent(clean)}" target="_blank" rel="noopener noreferrer" class="log-host-link" title="Open Couchsurfing profile @${clean}">@${clean} ↗</a>`;
+      });
+
+      // 3. "хосту: username" или "хоста: username" (если в логе имя без собаки)
+      safe = safe.replace(/(хосту|хоста):\s+([a-zA-Z0-9_.\-]+)/g, (match, prefix, uname) => {
+        const clean = uname.replace(/\.$/, '');
+        return `${prefix}: <a href="https://www.couchsurfing.com/people/${encodeURIComponent(clean)}" target="_blank" rel="noopener noreferrer" class="log-host-link" title="Open Couchsurfing profile @${clean}">@${clean} ↗</a>`;
+      });
+
+      return safe;
+    }
+
     function renderLogs() {
       const screen = document.getElementById('terminal-screen');
       if (!screen) return;
@@ -9988,17 +10042,34 @@
 
       const html = list.map(item => {
         let text = typeof item === 'string' ? item : item.message || '';
-        let ts = item.time || new Date().toLocaleTimeString('en-GB', { hour12: false });
+        let ts = '';
         let lvl = 'info';
+        let body = text;
+
+        const mFull = text.match(/^\[(?:(\d{4}-\d{2}-\d{2}\s+)?(\d{2}:\d{2}:\d{2}))\](?:\s+\[([A-Z_0-9]+)\])?\s*(.*)$/);
+        if (mFull) {
+          ts = mFull[2] || '';
+          const cat = mFull[3];
+          body = mFull[4] || '';
+          if (cat) {
+            lvl = cat.toLowerCase();
+          }
+        } else {
+          ts = item.time || new Date().toLocaleTimeString('en-GB', { hour12: false });
+        }
+
         if (/error|failed|exception/i.test(text)) lvl = 'error';
-        else if (/warn|skipped/i.test(text)) lvl = 'warn';
-        else if (/success|dispatched|connected|complete/i.test(text)) lvl = 'success';
+        else if (/warn|uncertain|skipped/i.test(text)) lvl = 'warn';
+        else if (/success|verified|dispatched|200 ok/i.test(text)) lvl = 'success';
+
+        const displayTs = ts ? `<span class="log-ts">[${escapeHtml(ts)}]</span>` : '';
+        const displayLvl = `<span class="log-lvl ${lvl}">${lvl.toUpperCase()}</span>`;
 
         return `
           <div class="log-line">
-            <span class="log-ts">[${escapeHtml(ts)}]</span>
-            <span class="log-lvl ${lvl}">${lvl.toUpperCase()}</span>
-            <span>${escapeHtml(text)}</span>
+            ${displayTs}
+            ${displayLvl}
+            <span>${formatLogLineContent(body)}</span>
           </div>
         `;
       }).join('');

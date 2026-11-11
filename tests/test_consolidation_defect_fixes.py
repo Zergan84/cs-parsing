@@ -38,6 +38,10 @@ class TestConsolidationDefectFixes(unittest.TestCase):
         cls.temp_dir.cleanup()
 
     def setUp(self):
+        from unittest.mock import patch
+        self.patcher_log_step = patch("auto_sender.log_step")
+        self.mock_log_step = self.patcher_log_step.start()
+
         with get_connection(self.db_path) as conn:
             conn.execute("DELETE FROM core_audit_logs;")
             conn.execute("DELETE FROM sending_history;")
@@ -48,6 +52,10 @@ class TestConsolidationDefectFixes(unittest.TestCase):
                 INSERT INTO core_hosts (trip_id, host_id, username, name, location, state, message_draft, qc_passed, created_at, updated_at)
                 VALUES (?, 'h_defect_1', 'daiki_tester', 'Daiki Tester', 'Sapporo', 'approved', 'Test message', 1, '2026-11-11', '2026-11-11');
             """, (TEST_TRIP_ID,))
+
+    def tearDown(self):
+        if hasattr(self, "patcher_log_step"):
+            self.patcher_log_step.stop()
 
     # 1. ТЕСТ: Конструктор AutoSender с trip_id и без него
     def test_autosender_init_with_and_without_trip_id(self):
