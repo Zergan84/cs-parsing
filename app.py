@@ -3729,28 +3729,45 @@ async def stream_logs():
 
 @app.get("/api/logs/export")
 async def export_logs(format: str = "txt"):
-    """Экспорт полного журнала логов в формате .txt или .json."""
-    logs = process_mgr.logs_buffer
+    """Экспорт полного сквозного журнала операций в формате .txt или .json."""
+    ops_file = OUTPUT_DIR / "operations.log"
+    logs = []
+    if ops_file.exists():
+        try:
+            with open(ops_file, "r", encoding="utf-8", errors="replace") as f:
+                logs = [line.strip() for line in f if line.strip()]
+        except Exception:
+            logs = process_mgr.logs_buffer
+    if not logs:
+        logs = process_mgr.logs_buffer
+
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     if format.lower() == "json":
         content = json.dumps(logs, ensure_ascii=False, indent=2)
         return Response(
             content=content,
             media_type="application/json",
-            headers={"Content-Disposition": f"attachment; filename=logs_{ts}.json"}
+            headers={"Content-Disposition": f"attachment; filename=operations_{ts}.json"}
         )
     else:
         content = "\n".join(logs)
         return PlainTextResponse(
             content=content,
-            headers={"Content-Disposition": f"attachment; filename=logs_{ts}.txt"}
+            headers={"Content-Disposition": f"attachment; filename=operations_{ts}.txt"}
         )
 
 
 @app.post("/api/logs/clear")
 async def clear_logs():
-    """Очистка текущего буфера логов."""
+    """Очистка текущего буфера логов пользователем."""
     process_mgr.logs_buffer.clear()
+    ops_file = OUTPUT_DIR / "operations.log"
+    if ops_file.exists():
+        try:
+            with open(ops_file, "w", encoding="utf-8") as f:
+                pass
+        except Exception:
+            pass
     process_mgr.append_log("🧹 Журнал логов очищен пользователем.")
     return {"status": "cleared"}
 

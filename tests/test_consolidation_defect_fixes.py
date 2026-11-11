@@ -346,6 +346,33 @@ class TestConsolidationDefectFixes(unittest.TestCase):
         disc_users = [d["username"] for d in v_rep["per_record_checks"]["unconfirmed_sent_in_core"]["discrepancies"]]
         self.assertIn("unconfirmed_user_test", disc_users)
 
+    # 11. ТЕСТ: Единое сквозное логирование — новая задача НЕ стирает буфер логов
+    def test_process_manager_preserves_logs_and_unified_operations_log(self):
+        import asyncio
+        from process_manager import ProcessManager
+
+        pm = ProcessManager()
+        pm.logs_buffer = ["Log entry from Autopilot 1", "Log entry from Autopilot 2"]
+
+        # Запуск задачи через pm.start_job не должен стирать предыдущие логи
+        async def run_test():
+            res = await pm.start_job("Тестовая задача", ["python3", "-c", "print('Вывод тестовой задачи')"])
+            self.assertTrue(res["success"])
+            if pm.active_proc:
+                await pm.active_proc.wait()
+            await asyncio.sleep(0.2)
+
+        asyncio.run(run_test())
+
+        # Проверяем, что ранние логи автопилота сохранились в буфере
+        self.assertIn("Log entry from Autopilot 1", pm.logs_buffer[0])
+        self.assertIn("Log entry from Autopilot 2", pm.logs_buffer[1])
+
+        # Проверяем, что вывод задачи добавился следом в общий буфер
+        combined_text = " ".join(pm.logs_buffer)
+        self.assertIn("Вывод тестовой задачи", combined_text)
+        self.assertIn("Тестовая задача", combined_text)
+
 
 if __name__ == "__main__":
     unittest.main()
