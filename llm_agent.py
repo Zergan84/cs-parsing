@@ -36,61 +36,90 @@ DEFAULT_CHECK_OUT = os.environ.get("CS_CHECK_OUT", "2026-11-20")
 
 # Актуальный расширенный бэкграунд гостя
 DEFAULT_GUEST_CONTEXT = (
-    "Andrey, ski coach heading to Club Med Tomamu (Hokkaido) for the winter season, "
-    "stopping in Tokyo for 2 days (Nov 18–20). Quiet, tidy, out exploring during the day."
+    "Andrey, sports coach & instructor and independent filmmaker, "
+    "visiting Kyoto. Quiet, tidy, respectful of house rules."
 )
 
-SYSTEM_PROMPT = """You are Andrey, an independent, seasoned Couchsurfer (10+ years) and professional ski instructor.
-You are writing a thoughtful, warm, and detailed one-time stay request to a Couchsurfing host in Japan.
+SYSTEM_PROMPT = """You are Andrey, an independent Couchsurfer and sports instructor / filmmaker based in Geneva, Switzerland and the French Alps.
+You are writing a thoughtful, warm, and natural one-time stay request to a Couchsurfing host in Japan.
 
-YOUR PERSONALITY & STORY (weave naturally):
-- Lifelong traveler with 55+ countries visited, deeply valuing real human connection across massive contrasts — from fast-paced hubs like NYC and Hong Kong to remote mountain villages in Nepal and rural Cambodia.
-- Professional ski instructor heading up to Hokkaido (Club Med Tomamu) for the winter season.
-- Passionate about local cultures, photography, cooking authentic meals, and deep conversations.
-- Extremely considerate guest: bulky winter luggage and skis are shipped directly to Hokkaido via Yamato Takkyubin, so you travel with only a lightweight daypack. Fully independent during the day, deeply respectful of house rules and quiet hours.
+YOUR REAL BACKGROUND (use naturally and selectively — do NOT dump everything):
+- Based in Geneva, Switzerland and the French Alps; flying to Japan from Geneva, Switzerland.
+- Professional sports instructor & ski coach.
+- Independent filmmaker (interested in photography, cinema, and visual storytelling).
+- Traveled widely across different countries and regions.
+- Speaks fluent English and French.
+- Respectful, tidy, and considerate guest: values quiet hours, respects host routines, and appreciates genuine human connection.
+- ABSOLUTE PROHIBITION ON MOSCOW / RUSSIA: NEVER mention Moscow or Russia anywhere in the message. Do NOT mention Russian nationality, Russian language, or Moscow. If mentioning where you fly or travel from, you are flying from Geneva, Switzerland.
 
-WRITING PRINCIPLES:
-1. SHOW GENUINE CARE & SUPPORT:
-   Read the host's passions (travel, arts, cooking, cinema, nature, sports, community). Validate what they do! Show that you truly care about their world and see the human behind the profile.
-2. EXPANDED BUT CRISP LENGTH:
-   Aim for 85 to 120 words across 3 short, breathable paragraphs. Never write walls of text; keep it conversational, warm, and articulate.
-3. ABSOLUTE BAN:
-   NEVER use robotic clichés like "I won't crowd your space or routine", "Hope you have a great season!", or "Love your passion for X". Speak like an appreciative, mature traveler.
+CRITICAL WRITING PRINCIPLES:
+1. SOUND LIKE A HUMAN, NOT A TEMPLATE:
+   - Target length: 60 to 90 words across 2-3 short, breathable paragraphs (empty bio: strictly under 50 words).
+   - Address the host by first name only if confirmed (e.g. "Hi Shohei,"). If ambiguous or unknown, use "Hello,".
+   - FOCUS ON EXACTLY ONE DISTINCTIVE DETAIL from the host's profile. NEVER list multiple hobbies or combine topics.
+   - Introduce Andrey naturally in connection to that ONE detail. DO NOT use a repetitive resume formula in every message ("Outside of sports coaching, I studied film and play piano...").
+   - If the host profile is empty or minimal, DO NOT invent interests, and DO NOT claim they love hosting or cultural exchange. Keep it simple, honest, and polite (< 50 words).
+   - Never boast or list achievements (do NOT mention "55+ countries" or "10+ years on Couchsurfing").
+   - DO NOT repeat calendar dates in the message body (dates are already in the request card header).
 
-FEW-SHOT EXAMPLES OF THE TARGET LEVEL:
+2. DESTINATION ONLY (NO INFERRED TRAVEL ROUTES):
+   - You are visiting {city} as established by the Trip Card.
+   - NEVER infer or mention future travel routes, onward destinations, or seasonal relocations (e.g. NEVER write "heading north to Hokkaido for skiing" or "on my way up north for the winter season").
 
-Example 1 (Host loves traveling & visited 30+ countries):
-"Hi Yuka,
+3. STRICT FACTUAL GROUNDING & SEPARATION OF FACTS:
+   - NEVER claim an ungrounded shared interest: NEVER write "We both enjoy [X]", "We both love [X]", or "fellow [X]" unless the host explicitly states that exact interest in their profile.
+   - A host's interest in travel, meeting people, or chatting with locals DOES NOT establish an interest in language learning. NEVER claim a shared interest in language learning unless the host explicitly wrote about studying or learning languages!
+   - Keep host facts and your own background strictly separate: appreciate what the host genuinely does or shares, and introduce your background as your own without pretending you share an unverified hobby.
 
-36 countries is a wonderful milestone! Traveling that extensively really shifts how you see the world — what’s been the one place that surprised you the most so far?
+4. STRICTLY FORBIDDEN CLICHES (DO NOT USE):
+   - "your passion for [X]" / "love your passion for [X]" / "passion for" (BANNED)
+   - "would love to cross paths if your timing aligns" (BANNED — vary closing naturally)
+   - "thanks for considering hosting a quiet, respectful guest" (BANNED — vary naturally)
+   - "outside of sports coaching, i studied film and play piano" (BANNED as a repetitive formula)
+   - "all bulky gear is shipped ahead" / "yamato takkyubin" (BANNED)
+   - "traveling light with a daypack" / "with only a daypack" (BANNED)
+   - "fully independent during the day" (BANNED)
+   - "historic neighborhoods" (BANNED — use natural language instead)
+   - "tea or coffee" as an obligatory offer in every message (BANNED — vary naturally)
+   - "cultural exchange" as a generic crutch (BANNED)
+   - "won't crowd your space or routine" (BANNED)
+   - "on my way north to hokkaido" / "heading to hokkaido" (BANNED)
+   - "we both enjoy language learning" / "we both love language learning" (BANNED)
 
-I’ve been fortunate to explore around 55 countries myself, and those wild contrasts — between buzzing megalopolises like NYC and the quiet serenity of Nepal — made me truly value how Couchsurfing connects kindred spirits. I’m Andrey, a ski coach passing through Tokyo Nov 16–19 before heading north to Hokkaido for the winter season at Club Med Tomamu. 
+FEW-SHOT EXAMPLES OF THE TARGET QUALITY & TONE:
 
-I travel ultra-light with just a small daypack since my winter gear is shipped ahead. I’d love to cross paths, support your favorite neighborhood spots, and trade travel memories over tea or a drink if our schedules align!
+Example 1 (Host studies mathematics or planning travel):
+"Hi Hidetaka,
+
+Planning a round-the-world journey during a gap year sounds like a wonderful adventure. Having spent considerable time traveling independently, I know how exciting that preparation stage is.
+
+I’m Andrey, a sports coach visiting Kyoto. Outside of coaching, I work in film and always enjoy chatting with people embarking on big journeys.
+
+Let me know if you might have space to host a considerate guest. Either way, best of luck with your travels and studies!
 
 Warmly,
 Andrey"
 
-Example 2 (Host loves cooking, neighborhood culture, quiet cozy lifestyle):
-"Hi Kenta,
+Example 2 (Host interested in local culture or chatting with travelers):
+"Hi Masafumi,
 
-Your philosophy around home-cooked meals and exploring quiet neighborhood markets completely resonates with me. There’s something special about food bringing people together across cultures.
+Love that you take time to chat with locals and learn about different cultures while traveling. That genuine curiosity is what makes Couchsurfing so special.
 
-I’m Andrey, a ski instructor spending a couple of days in Tokyo from Nov 16 to 19 before kicking off the winter coaching season in Hokkaido. Having traveled through 55+ countries, I always find that simple moments — like sharing a home recipe or hearing someone's local perspective — are the highlights of any journey. 
+I’m Andrey, visiting Kyoto. Alongside sports coaching, I studied film directing, and observing local life and human stories has always been at the heart of my travels.
 
-I travel completely mobile with just a daypack (my ski gear is already forwarded to Tomamu), and I always adapt effortlessly to my host's rhythm. Would be wonderful to share a casual dinner or tea and swap stories!
+Would be glad to share travel stories or grab a bite if your schedule permits. Thanks for considering!
 
 Cheers,
 Andrey"
 
-Example 3 (Host loves arts, indie cinema, or creative projects):
-"Hey Daisuke,
+Example 3 (Host with empty or minimal bio, or unverified name):
+"Hello!
 
-Really enjoyed reading your thoughts on indie cinema and creative spaces in Tokyo. It's inspiring to see people actively nurturing local arts and staying curious about different storytelling styles.
+I’m Andrey, visiting Kyoto for a few days to explore the city.
 
-I’m Andrey, heading to Club Med Tomamu in Hokkaido for the ski season, passing through Tokyo Nov 16–19. Outside coaching on snow, I've spent years traveling through 55 countries — from street photography in Hong Kong to mountain life in Nepal — and I deeply appreciate exchanging ideas with people immersed in their creative craft.
+I’m reaching out to see if you might have room to host a quiet, considerate guest. I keep my space very clean and am deeply respectful of house rules and quiet hours.
 
-My luggage is forwarded ahead, so I only carry a daypack and stay very flexible. Would love to buy you a coffee or drink and chat about Tokyo’s hidden creative corners if you have some free time!
+No worries at all if the timing doesn't work out. Appreciate your time!
 
 Best,
 Andrey"
@@ -117,19 +146,31 @@ def format_conversational_dates(check_in: str, check_out: str) -> str:
         return "Nov 18–20"
 
 
-def validate_message_qc(text: str) -> Tuple[bool, List[str]]:
+def validate_message_qc(
+    text: str,
+    is_minimal_bio: bool = False,
+    host_data: Optional[Dict[str, Any]] = None,
+    trip_city: Optional[str] = None,
+) -> Tuple[bool, List[str]]:
     """
     Контроль качества (QC Validator):
-    1. Длина строго в диапазоне 75-130 слов (целевой диапазон: 85-120 слов).
+    1. Длина в диапазоне 55-130 слов (целевой диапазон: 60-90 слов; для пустых био: 30-70 слов).
     2. Отсутствие шаблонных копипаст.
     3. Отсутствие строго запрещенных фраз (BANNED):
        - 'won't crowd your space', 'crowd your space', 'crowd your routine'
        - 'love your passion for', 'excited about your', 'hope you have a great season'
-       - 'sharing travel stories in the evening', 'grabbing a quick coffee and sharing travel stories'
-       - 'I noticed', 'I saw on your profile', 'According to your bio', 'caught my eye'
+       - 'traveling light with a daypack', 'only a daypack', 'with just a daypack'
+       - 'fully independent during the day'
+       - 'historic neighborhoods'
+       - '55+ countries', 'over 55 countries'
+       - '10+ years on couchsurfing'
        - 'tonight'
        - em-dashes ('—')
        - робо-дат в формате ISO (2026-11-18)
+    4. Фактическая заземленность (Factual Grounding):
+       - Запрет выдуманных travel routes ('on my way north to Hokkaido' при поездке в Киото/Токио).
+       - Запрет не подтвержденных общих интересов ('We both enjoy language learning' без пруфа в профиле хоста).
+       - Строгое разделение фактов хоста и личного бэкграунда Андрея.
     """
     if not text:
         return False, ["Empty text"]
@@ -137,10 +178,16 @@ def validate_message_qc(text: str) -> Tuple[bool, List[str]]:
     words = len(text.strip().split())
     issues = []
 
-    if words < 75:
-        issues.append(f"Too short ({words} words, minimum 75)")
-    elif words > 130:
-        issues.append(f"Too long ({words} words, maximum 130)")
+    if is_minimal_bio:
+        if words < 30:
+            issues.append(f"Too short ({words} words, minimum 30)")
+        elif words > 70:
+            issues.append(f"Too long for minimal bio ({words} words, maximum 70)")
+    else:
+        if words < 55:
+            issues.append(f"Too short ({words} words, minimum 55)")
+        elif words > 130:
+            issues.append(f"Too long ({words} words, maximum 130)")
 
     lower = text.lower()
     if "would love to connect!" in lower or "andrey here from the french alps" in lower:
@@ -165,10 +212,47 @@ def validate_message_qc(text: str) -> Tuple[bool, List[str]]:
         "hidden gems",
         "what an adventure",
         "love that vibe",
+        "traveling light with a daypack",
+        "travel light with a daypack",
+        "with just a daypack",
+        "with only a daypack",
+        "with just my daypack",
+        "fully independent during the day",
+        "historic neighborhoods",
+        "55+ countries",
+        "over 55 countries",
+        "10+ years on couchsurfing",
+        "a decade of travels",
+        "yamato takkyubin",
+        "yamato delivery",
+        "takkyubin",
+        "your passion for",
+        "outside of sports coaching, i studied film and play piano",
+        "would love to cross paths if your timing aligns",
+        "thanks for considering hosting a quiet, respectful guest",
+        "on my way north to hokkaido",
+        "on my way up north",
+        "heading to hokkaido",
+        "heading north to hokkaido",
+        "for skiing in hokkaido",
+        "club med tomamu",
+        "we both enjoy language learning",
+        "we both love language learning",
+        "we both enjoy languages",
+        "moscow",
+        "russia",
+        "russian",
+        "москва",
+        "россия",
+        "vgik",
+        "вгик",
     ]
     for b in banned_phrases:
         if b in lower:
-            issues.append(f"Contains forbidden cliche: '{b}'")
+            issues.append(f"Contains forbidden cliche or origin: '{b}'")
+
+    if re.search(r"\b(moscow|russia|russian|москв[аеыу]|росси[яеию]|вгик)\b", lower):
+        issues.append("BANNED: Mentions Moscow, Russia, or VGIK (user is flying from Geneva, Switzerland)")
 
     if "—" in text:
         issues.append("Contains forbidden em-dash ('—')")
@@ -176,16 +260,42 @@ def validate_message_qc(text: str) -> Tuple[bool, List[str]]:
     if re.search(r"\b\d{4}-\d{2}-\d{2}\b", text):
         issues.append("Contains robotic ISO date format")
 
+    # 4. Factual Grounding: Route Inferences
+    # The Trip Card establishes destination and dates, not onward routes.
+    effective_city = (trip_city or "").lower()
+    if "hokkaido" not in effective_city and "sapporo" not in effective_city:
+        if re.search(r"\b(on my way (?:up )?north|heading (?:up )?north)\b", lower):
+            issues.append("Contains ungrounded travel route inference ('on my way north')")
+        if re.search(r"\b(hokkaido|tomamu)\b", lower):
+            issues.append("Contains ungrounded travel destination ('Hokkaido') outside Trip Card destination")
+
+    # 5. Factual Grounding: Shared Interest Claims
+    # "We both enjoy/love/share/like X" requires explicit evidence from the host
+    shared_match = re.search(r"\bwe both (enjoy|love|share|like)\s+([a-z\s]+?)(?:[,.]|\bI\b|\band\b|$)", lower)
+    if shared_match:
+        claimed_interest = shared_match.group(2).strip()
+        if host_data:
+            bio_text = str(host_data.get("about_me_clean") or host_data.get("about_me") or "").lower()
+            interests_text = str(host_data.get("interests") or "").lower()
+            host_all = f"{bio_text} {interests_text}"
+            words_to_check = [w for w in claimed_interest.split() if len(w) > 3 and w not in ("both", "also", "really", "learning")]
+            if words_to_check and not any(w in host_all for w in words_to_check):
+                issues.append(f"Ungrounded shared interest claim: 'we both {shared_match.group(1)} {claimed_interest}' without evidence in host profile")
+        else:
+            # General strict check against presumptuous shared language learning
+            if "language" in claimed_interest:
+                issues.append(f"Ungrounded shared interest claim: 'we both {shared_match.group(1)} {claimed_interest}'")
+
     return len(issues) == 0, issues
 
 
-def clean_generated_message(text: str, date_str: str = "Nov 18–20", city: str = "Tokyo") -> str:
+def clean_generated_message(text: str, date_str: str = "Nov 18–20", city: str = "Tokyo", include_dates: bool = True) -> str:
     """
     Детерминированная постобработка (Regex Sanitizer) и комплексная проверка стоп-листа:
     1. Жесткая замена em-dash (—) и en-dash (–) на запятые или стандартный дефис (-).
     2. Устранение галлюцинаций времени ('tonight' -> 'in the evening').
     3. Исключение машинных штампов и запрещенных шаблонов.
-    4. Замена машинных ISO дат (2026-11-18) на разговорные ({date_str}).
+    4. Замена машинных ISO дат (2026-11-18) на разговорные ({date_str}) или удаление.
     5. Нормализация подписи 'Cheers, Andrey'.
     """
     if not text:
@@ -221,8 +331,16 @@ def clean_generated_message(text: str, date_str: str = "Nov 18–20", city: str 
     text = re.sub(r'\s*—\s*', ', ', text)
     text = text.replace("—", ", ")
 
-    # 5. Замена ISO дат на разговорный формат
-    text = re.sub(r"\b\d{4}-\d{2}-\d{2}(?:\s*(?:to|-|–)\s*\d{4}-\d{2}-\d{2})?\b", date_str, text)
+    # 5. Замена ISO дат на разговорный формат (или удаление, если include_dates=False)
+    if include_dates and date_str:
+        text = re.sub(r"\b\d{4}-\d{2}-\d{2}(?:\s*(?:to|-|–)\s*\d{4}-\d{2}-\d{2})?\b", date_str, text)
+    else:
+        pat_dates = r"(?i)\b(?:from\s+|between\s+)?(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2}(?:\s*(?:to|[-–—]|and)\s*(?:[A-Za-z]+\s+)?\d{1,2})?(?:,\s*\d{4})?\b"
+        text = re.sub(pat_dates, "", text)
+        text = re.sub(r"\b\d{4}-\d{2}-\d{2}(?:\s*(?:to|-|–)\s*\d{4}-\d{2}-\d{2})?\b", "", text)
+        text = re.sub(r"\b(?:from|between)\s+(?:,\s*|\.\s*|\s+)", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"[ \t]+([,.?!])", r"\1", text)
+        text = re.sub(r"[ \t]{2,}", " ", text)
 
     # 6. Жесткий Regex Safeguard для 'tonight' -> 'in the evening'
     text = re.sub(r"\btonight\b", "in the evening", text, flags=re.IGNORECASE)
@@ -249,15 +367,50 @@ def clean_generated_message(text: str, date_str: str = "Nov 18–20", city: str 
     text = re.sub(r"(?i)\b(?:for )?(?:over |more than )?10\+?\s*years on (?:cs|couchsurfing)[,.]?\s*", "", text)
     text = re.sub(r"(?i)\b(?:over |more than )?a decade on (?:cs|couchsurfing)[,.]?\s*", "", text)
     text = re.sub(r"(?i)\bi know the drill[,.]?\s*", "", text)
+    text = re.sub(r"(?i)\ba seasoned couchsurfer[,.]?\s*", "a considerate guest ", text)
+    text = re.sub(r"(?i)\b55\+?\s*countries[,.]?\s*", "many countries ", text)
+
+    # Запрещенные шаблонные фразы про рюкзак, доставку и независимость
+    text = re.sub(r"(?i)\b(?:all )?bulky gear is shipped ahead (?:via yamato takkyubin(?: delivery)?|via takkyubin)?[,.]?\s*", "", text)
+    text = re.sub(r"(?i)\bgear is shipped ahead (?:via yamato takkyubin(?: delivery)?|via takkyubin)?[,.]?\s*", "", text)
+    text = re.sub(r"(?i)\b(?:yamato takkyubin|takkyubin)(?: delivery)?[,.]?\s*", "", text)
+    text = re.sub(r"(?i)\b(?:traveling|travel)\s+(?:ultra-)?light\s+(?:with|carrying)\s+(?:just|only)?\s*(?:a|my)?\s*(?:small|lightweight)?\s*daypack[,.]?\s*", "", text)
+    text = re.sub(r"(?i)\bwith (?:just|only) (?:a|my) (?:small|lightweight )?daypack[,.]?\s*", "", text)
+    text = re.sub(r"(?i)\band am fully independent during the day[,.]?\s*", "", text)
+    text = re.sub(r"(?i)\bfully independent during the day[,.]?\s*", "", text)
+    text = re.sub(r"(?i)\bexplore historic neighborhoods and\b", "explore and", text)
+    text = re.sub(r"(?i)\bhistoric neighborhoods\b", "local neighborhoods", text)
 
     # Заглушка
     text = re.sub(r"(?i)\bwould love to connect!?\s*", "", text)
+
+    # Запрет и замена упоминаний Москвы и России (пользователь летит из Женевы, Швейцария)
+    text = re.sub(r"(?i)\b(?:visiting|traveling|flying)\s+from\s+moscow\b", "flying from Geneva, Switzerland", text)
+    text = re.sub(r"(?i)\b(?:visiting|traveling|flying)\s+from\s+russia\b", "flying from Geneva, Switzerland", text)
+    text = re.sub(r"(?i)\bfrom\s+moscow\b", "from Geneva, Switzerland", text)
+    text = re.sub(r"(?i)\bfrom\s+russia\b", "from Geneva, Switzerland", text)
+    text = re.sub(r"(?i)\bin\s+moscow\b", "in Geneva", text)
+    text = re.sub(r"(?i)\bin\s+russia\b", "in Switzerland", text)
+    text = re.sub(r"(?i)\benglish,\s*french,?\s*and\s*russian\b", "English and French", text)
+    text = re.sub(r"(?i)\band\s*native\s*russian\b", "", text)
+    text = re.sub(r"(?i)\bnative\s*russian\b", "", text)
+    text = re.sub(r"(?i)\brussian\s+cinema\b", "European cinema", text)
+    text = re.sub(r"(?i)\brussian\b", "European", text)
+    text = re.sub(r"(?i)\bmoscow\b", "Geneva", text)
+    text = re.sub(r"(?i)\brussia\b", "Switzerland", text)
+    text = re.sub(r"(?i)\bvgik\b", "film school", text)
 
     # "excited to" -> "looking forward to"
     text = re.sub(r"\bexcited to\b", "looking forward to", text, flags=re.IGNORECASE)
 
     # "fascinating" -> "inspiring"
     text = re.sub(r"\bfascinating\b", "inspiring", text, flags=re.IGNORECASE)
+
+    # Замена шаблонных штампов
+    text = re.sub(r"(?i)\byour passion for\b", "your interest in", text)
+    text = re.sub(r"(?i)\bpassion for\b", "interest in", text)
+    text = re.sub(r"(?i)\bwould love to cross paths if your timing aligns\.?\s*", "Would love to cross paths if you have space. ", text)
+    text = re.sub(r"(?i)\bthanks for considering hosting a quiet, respectful guest!?\.?\s*", "Thanks for considering! ", text)
 
     # 8. Нормализация подписи (сохраняем Warmly, Cheers, Best)
     text = re.sub(
@@ -286,10 +439,177 @@ def clean_generated_message(text: str, date_str: str = "Nov 18–20", city: str 
     return text.strip()
 
 
+VISUAL_OBJECT_MAP = {
+    "cat": ("animal", 0.95),
+    "dog": ("animal", 0.95),
+    "pet": ("animal", 0.90),
+    "camera": ("photography", 0.95),
+    "lens": ("photography", 0.90),
+    "tripod": ("photography", 0.90),
+    "guitar": ("music", 0.95),
+    "piano": ("music", 0.95),
+    "vinyl": ("music", 0.95),
+    "instrument": ("music", 0.90),
+    "koto": ("music", 0.95),
+    "stadium": ("sports", 0.90),
+    "soccer": ("sports", 0.95),
+    "football": ("sports", 0.95),
+    "futsal": ("sports", 0.95),
+    "bicycle": ("sports", 0.90),
+    "bike": ("sports", 0.90),
+    "temple": ("architecture", 0.90),
+    "shrine": ("architecture", 0.90),
+    "restaurant": ("food", 0.85),
+    "cafe": ("food", 0.85),
+    "food": ("food", 0.85),
+    "ramen": ("food", 0.90),
+    "coffee": ("food", 0.85),
+    "mountain": ("nature", 0.90),
+    "hiking": ("nature", 0.90),
+    "sea": ("nature", 0.90),
+    "ocean": ("nature", 0.90),
+    "beach": ("nature", 0.90),
+}
+
+
+def ensure_host_visual_observations(host_id: str, username: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Проверяет и обеспечивает наличие визуальных наблюдений LLaVA в базе данных:
+    1. Если в visual_observations уже есть записи для данного host_id -> сразу возвращает их из SQLite (0 вызовов Ollama).
+    2. Если наблюдений нет, ищет локальные фото в output/llava_photos/<username>_photo_*.jpg или <host_id>_photo_*.jpg.
+    3. Если фото найдены и Ollama доступна, анализирует фото через LLaVA (llava:latest / llama3.2-vision),
+       извлекает объекты и сохраняет в SQLite (кэширует навсегда).
+    4. При отсутствии фото или недоступности модели -> безопасный fallback (возвращает пустой список).
+    """
+    if not host_id and not username:
+        return []
+    u = (username or host_id or "").strip()
+    hid = (host_id or username or "").strip()
+
+    from database import db_session
+    try:
+        with db_session() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT vo.observation, vo.category, vo.evidence_confidence, pa.local_path
+                FROM visual_observations vo
+                LEFT JOIN photo_assets pa ON vo.photo_asset_id = pa.id
+                WHERE LOWER(vo.host_id) = LOWER(?) OR LOWER(vo.host_id) = LOWER(?)
+                ORDER BY vo.evidence_confidence DESC;
+            """, (hid, u))
+            rows = cur.fetchall()
+            if rows:
+                return [
+                    {
+                        "observation": r["observation"],
+                        "category": r["category"],
+                        "confidence": float(r["evidence_confidence"] or 0.9),
+                        "photo_path": r["local_path"],
+                    }
+                    for r in rows
+                ]
+    except Exception as e:
+        logger.warning(f"Error querying visual_observations cache: {e}")
+
+    # Поиск локальных фотографий на диске
+    base_dir = Path(__file__).parent
+    out_dir = Path(os.environ.get("CS_OUTPUT_DIR", str(base_dir / "output"))).resolve()
+    photos_dir = out_dir / "llava_photos"
+    if not photos_dir.is_dir():
+        return []
+
+    safe_u = re.sub(r"[^\w\-_]", "_", u)
+    safe_hid = re.sub(r"[^\w\-_]", "_", hid)
+
+    photo_files = []
+    for pattern in [f"{safe_u}_photo_*.jpg", f"{safe_u}_photo_*.png", f"{safe_hid}_photo_*.jpg", f"{safe_hid}_photo_*.png"]:
+        photo_files.extend(list(photos_dir.glob(pattern)))
+
+    photo_files = list(dict.fromkeys(photo_files))
+    if not photo_files:
+        return []
+
+    agent = get_llm_agent()
+    if not agent.is_available():
+        logger.info("Ollama is offline; visual analysis deferred.")
+        return []
+
+    vision_model = agent.select_best_model(has_images=True)
+    new_observations: List[Dict[str, Any]] = []
+
+    for p in photo_files[:3]:
+        try:
+            b64_img = agent._encode_image(p)
+            if not b64_img:
+                continue
+            payload = {
+                "model": vision_model,
+                "prompt": (
+                    "Analyze this image from a Couchsurfing host's profile. "
+                    "Describe concisely: activities, hobbies, instruments, places, food, and sports."
+                ),
+                "stream": False,
+                "images": [b64_img],
+            }
+            resp = requests.post(f"{agent.host}/api/generate", json=payload, timeout=45.0)
+            if resp.status_code == 200:
+                raw_text = resp.json().get("response", "")
+                lower_text = raw_text.lower()
+
+                found_for_photo = []
+                for kw, (cat, conf) in VISUAL_OBJECT_MAP.items():
+                    if kw in lower_text:
+                        found_for_photo.append({"observation": kw, "category": cat, "confidence": conf})
+
+                if found_for_photo:
+                    import hashlib
+                    with open(p, "rb") as f:
+                        f_hash = hashlib.sha256(f.read()).hexdigest()
+                    asset_id = f"pa_{f_hash[:16]}"
+                    now_iso = datetime.now().isoformat()
+
+                    with db_session() as conn:
+                        cur = conn.cursor()
+                        cur.execute("""
+                            INSERT OR REPLACE INTO photo_assets (
+                                id, image_hash, local_path, file_size, mime_type,
+                                llava_raw_response, detected_objects_json, model, analysis_status,
+                                analyzed_at, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?, ?);
+                        """, (
+                            asset_id, f_hash, str(p), os.path.getsize(p),
+                            "image/jpeg" if str(p).lower().endswith((".jpg", ".jpeg")) else "image/png",
+                            raw_text[:800], json.dumps([x["observation"] for x in found_for_photo]),
+                            vision_model, now_iso, now_iso
+                        ))
+
+                        for vo in found_for_photo:
+                            obs_id = f"vo_{hid}_{asset_id[:8]}_{vo['observation']}"
+                            cur.execute("""
+                                INSERT OR REPLACE INTO visual_observations (
+                                    id, host_id, photo_asset_id, observation, category,
+                                    evidence_confidence, raw_description, created_at
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                            """, (
+                                obs_id, hid, asset_id, vo["observation"], vo["category"],
+                                vo["confidence"], raw_text[:300], now_iso
+                            ))
+                            new_observations.append({
+                                "observation": vo["observation"],
+                                "category": vo["category"],
+                                "confidence": vo["confidence"],
+                                "photo_path": str(p),
+                            })
+        except Exception as err:
+            logger.warning(f"Error during LLaVA analysis of {p}: {err}")
+
+    return new_observations
+
+
 class CouchsurfingLLM:
     """
-    Класс интеграции с локальной Ollama для мультимодального анализа профилей
-    и генерации персонализированных Couchsurfing сообщений.
+    Класс интеграции с Gemini Flash и локальной Ollama для мультимодального анализа профилей
+    и генерации персонализированных Couchsurfing сообщений с автоматическим fallback на rule-based.
     """
 
     def __init__(
@@ -302,6 +622,112 @@ class CouchsurfingLLM:
         self.model = model
         self.timeout = timeout
         self._available: Optional[bool] = None
+
+    def get_gemini_api_key(self) -> Optional[str]:
+        """Возвращает ключ API Gemini из окружения или настроек базы данных."""
+        key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if key:
+            return key.strip()
+        try:
+            from database import db_session
+            with db_session() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT value FROM app_settings WHERE key = 'gemini_api_key';")
+                row = cur.fetchone()
+                if row and row[0]:
+                    return row[0].strip()
+        except Exception:
+            pass
+        return None
+
+    def generate_via_gemini(
+        self,
+        prompt: str,
+        system_prompt: str,
+        images: Optional[List[str]] = None,
+        model: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Генерация персонализированного обращения через Gemini Flash API (gemini-2.5-flash).
+        Поддерживает:
+        - Экспоненциальный бэкофф при HTTP 429 / 503
+        - Маскирование ключей в логах
+        - Защиту от бесконечных циклов
+        - 30-секундный таймаут
+        """
+        api_key = self.get_gemini_api_key()
+        if not api_key:
+            return None
+
+        active_model = model or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{active_model}:generateContent"
+
+        parts: List[Dict[str, Any]] = [{"text": prompt}]
+        if images:
+            for img_b64 in images[:2]:
+                parts.append({
+                    "inlineData": {
+                        "mimeType": "image/jpeg",
+                        "data": img_b64,
+                    }
+                })
+
+        payload = {
+            "systemInstruction": {
+                "parts": [{"text": system_prompt.strip()}]
+            },
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": parts,
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.72,
+                "topP": 0.9,
+                "maxOutputTokens": 350,
+            },
+        }
+
+        masked_key = f"{api_key[:4]}...{api_key[-4:]}" if len(api_key) > 8 else "***"
+        logger.info(f"Запрос к Gemini Flash ({active_model}, key={masked_key})")
+
+        backoff = 2.0
+        for attempt in range(1, 4):
+            try:
+                resp = requests.post(
+                    endpoint,
+                    params={"key": api_key},
+                    json=payload,
+                    timeout=30.0,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    candidates = data.get("candidates", [])
+                    if candidates:
+                        parts_resp = candidates[0].get("content", {}).get("parts", [])
+                        if parts_resp:
+                            text_out = parts_resp[0].get("text", "").strip()
+                            if text_out:
+                                logger.info(f"Gemini Flash ({active_model}) успешно вернул ответ (попытка {attempt})")
+                                return text_out
+                elif resp.status_code in (429, 500, 503, 504):
+                    logger.warning(
+                        f"Gemini Flash вернул статус {resp.status_code} (попытка {attempt}/3). Ожидание {backoff}с перед ретраем..."
+                    )
+                    time.sleep(backoff)
+                    backoff *= 2.0
+                else:
+                    logger.warning(
+                        f"Gemini Flash вернул неожиданный статус {resp.status_code}: {resp.text[:200]}"
+                    )
+                    break
+            except Exception as e:
+                logger.warning(f"Ошибка вызова Gemini Flash (попытка {attempt}/3): {e}")
+                time.sleep(backoff)
+                backoff *= 2.0
+
+        return None
 
     def is_available(self) -> bool:
         """Проверяет доступность сервера Ollama."""
@@ -369,8 +795,9 @@ class CouchsurfingLLM:
         guest_context: Optional[str] = None,
         image_insights: Optional[str] = None,
     ) -> Tuple[str, str, str]:
-        from message_generator import extract_greeting_name
-        first_name = extract_greeting_name(host)
+        from message_generator import verify_host_name
+        first_name, is_trusted = verify_host_name(host)
+        greeting_target = first_name if is_trusted and first_name else "there"
 
         raw_loc = host.get("location")
         if isinstance(raw_loc, dict):
@@ -388,32 +815,100 @@ class CouchsurfingLLM:
             else:
                 city = str(location).split(",")[0].strip() or "Tokyo"
 
-        # Извлечение структурированных профильных данных
+        # Извлечение структурированных профильных данных и Host Dossier
         from profile_analyzer import get_profile_analyzer
+        from database import get_host_dossier
         analyzer = get_profile_analyzer()
         details = analyzer.extract_host_profile_details(host)
 
-        date_str = format_conversational_dates(check_in, check_out)
+        # Host Dossier integration (provenance & confidence)
+        host_id = host.get("id") or host.get("username") or ""
+        ensure_host_visual_observations(host_id, host.get("username"))
+        dossier = get_host_dossier(host_id) if host_id else None
+        
+        dossier_interests = []
+        dossier_visuals = []
+        dossier_places = []
+        used_facts = []
+
+        if dossier:
+            # 1. Interests (confirmed / high confidence only)
+            for item in dossier.get("interests", []):
+                conf = item.get("confidence", 0.5)
+                status = item.get("status", "uncertain")
+                name_i = item.get("name", "")
+                if (status == "confirmed" or conf >= 0.8) and name_i:
+                    dossier_interests.append(f"{name_i} (provenance: {item.get('source', 'text')})")
+                    used_facts.append(f"interest:{name_i}")
+
+            # 2. Visual observations (evidence confidence >= 0.85, limit 3)
+            for vo in dossier.get("visual_observations", [])[:3]:
+                obs = vo.get("observation", "")
+                cat = vo.get("category", "")
+                if obs:
+                    dossier_visuals.append(f"{obs} ({cat})")
+                    used_facts.append(f"visual:{obs}")
+
+            # 3. Places
+            for pl in dossier.get("places", [])[:2]:
+                pl_name = pl.get("name", "")
+                pl_type = pl.get("type", "mentioned")
+                if pl_name:
+                    dossier_places.append(f"{pl_name} ({pl_type})")
+                    used_facts.append(f"place:{pl_name}")
+
+        # Интеллектуальная сборка персонального контекста через Context Assembler
+        from context_assembler import get_context_assembler
+        assembler = get_context_assembler()
+        trip_ctx = {
+            "city": city,
+            "arrival_date": check_in,
+            "departure_date": check_out,
+        }
+        assembled = assembler.assemble_context(host, trip_context=trip_ctx)
+        travel_info = assembled["travel_context"]
+        city = travel_info.get("city") or city
+        date_str = travel_info.get("dates_text") or format_conversational_dates(check_in, check_out)
+        context_instructions = assembled["llm_instructions"]
+
         has_secret = host.get("secret_code_detected", False)
         secret_code = host.get("secret_code_hint", "")
 
-        interests_str = ", ".join(details["host_interests"])
+        interests_list = details.get("host_interests", [])
+        if dossier_interests:
+            interests_list = list(dict.fromkeys(interests_list + [i.split(" (")[0] for i in dossier_interests]))
+        interests_str = ", ".join(interests_list)
         bio_snippet = details["clean_bio"][:1200]
         if not bio_snippet.strip():
             bio_snippet = "Friendly local resident interested in cultural exchange and hosting world travelers."
 
-        prompt = f"""Write a Couchsurfing stay request to {first_name}.
+        dossier_section = ""
+        if dossier_visuals or dossier_places:
+            dossier_section = f"""
+HOST DOSSIER (CONFIRMED OBSERVATIONS & PLACES):
+- Visual Observations from Photos: {', '.join(dossier_visuals) if dossier_visuals else 'None'}
+- Associated Places: {', '.join(dossier_places) if dossier_places else 'None'}
+(Note: Treat visual observations as interesting context, not absolute assertions. E.g. a camera indicates photography interest, not that they are a pro photographer.)
+"""
+
+        greeting_line = f"Address {first_name} warmly by first name (e.g. 'Hi {first_name},')." if (is_trusted and first_name) else "Use a polite universal greeting ('Hello!' or 'Hi there!'). DO NOT guess a name and DO NOT use a surname."
+
+        bio_instruction = ""
+        if len(bio_snippet.strip()) < 15 or bio_snippet.startswith("Friendly local resident"):
+            bio_instruction = "\nSPECIAL NOTE: The host's bio is empty or minimal. DO NOT invent facts about the host. DO NOT claim they love hosting, traveling, or cultural exchange. Keep the message straightforward, polite, and grounded: introduce Andrey, state the reason for visiting Kyoto, and respectfully ask if they have space to host."
+
+        prompt = f"""Write a Couchsurfing stay request to {first_name if is_trusted and first_name else 'the host'}.
 
 HOST PROFILE:
-- Name: {first_name}
+- Verified First Name: {first_name if is_trusted and first_name else 'NOT VERIFIED (use neutral greeting)'}
 - Location: {city}
-- Focus & Specific Interests: {interests_str}
+- Focus & Specific Interests: {interests_str if interests_str else 'Not specified'}
 - Occupation: {details["host_occupation"]}
 - Languages: {", ".join(details["host_languages"])}
 - Profile Bio:
 \"\"\"
 {bio_snippet}
-\"\"\""""
+\"\"\"{dossier_section}{bio_instruction}"""
 
         if has_secret and secret_code:
             prompt += f"\n- Secret Keyword / Rule: '{secret_code}' (incorporate this word naturally into the message)"
@@ -423,18 +918,32 @@ HOST PROFILE:
 
         prompt += f"""
 
-WRITE A THOUGHTFUL, DETAILED STAY REQUEST (TARGET LENGTH: 85 TO 120 WORDS IN 3 SHORT BREATHABLE PARAGRAPHS):
-1. Paragraph 1 (Genuine Care & Connection): Address {first_name} warmly. Reference their specific passions, philosophy, or lifestyle ({interests_str.split(',')[0] if interests_str else 'their bio and perspectives'}). Show genuine appreciation and validate what they do. Ask an engaging question or make a relatable observation. Never use robotic openers like "I noticed" or "I saw on your profile".
-2. Paragraph 2 (Trip Context & Contrast): Naturally introduce yourself as Andrey, a ski coach/instructor passing through {city} {date_str} on the way to Club Med Tomamu in Hokkaido for the winter. Weave in your background traveling through 55+ countries (massive contrasts like NYC/Hong Kong vs mountain villages in Nepal/Cambodia) and why Couchsurfing connects kindred spirits. Mention casually that all bulky winter luggage/skis are shipped ahead via Yamato Takkyubin, so you travel light with only a daypack and easily adapt to their rhythm.
-3. Paragraph 3 (The Vibe & Closing): Warm, low-pressure, appreciative sign-off. Express enthusiasm to share tea/drink, explore a local neighborhood spot, or swap stories if schedules align.
+WRITE A CONCISE, NATURAL STAY REQUEST (TARGET LENGTH: 60 TO 90 WORDS IN 2-3 SHORT BREATHABLE PARAGRAPHS):
+{context_instructions}
+
+PARAGRAPH REQUIREMENTS:
+1. Paragraph 1 (Greeting & Connection): {greeting_line}
+   Connect naturally with a specific detail from the host's profile or Context Assembler. If the bio is empty, open politely and naturally without inventing passions for the host. Never use robotic openers like "I noticed" or "I saw on your profile" or "Your passion for X".
+2. Paragraph 2 (Trip Context & Grounded Connection): Introduce Andrey naturally in connection to {city} and the relevant background from Context Assembler. State simply that you are visiting {city}. NEVER invent or mention travel routes beyond {city} (never say 'on my way to Hokkaido', 'heading north for skiing', etc.). Keep host facts and Andrey's background strictly separate — NEVER say 'We both enjoy [X]' or 'We both love [X]' unless the host explicitly stated that exact hobby. DO NOT list achievements (never say "55+ countries" or "10+ years on CS"). DO NOT repeat explicit calendar dates in the message body. DO NOT use boilerplate like "traveling light with a daypack" or "historic neighborhoods" or "fully independent during the day".
+3. Paragraph 3 (Closing): Warm, natural, low-pressure closing. DO NOT make "tea or coffee" an obligatory offer. Vary the sign-off naturally (e.g. asking if they might have space to host, offering to share impressions or cooking, or wishing them well).
 4. Sign-off: "Warmly, Andrey", "Cheers, Andrey", or "Best, Andrey".
 
 STRICT NEGATIVE CONSTRAINTS (NEVER USE THESE PHRASES):
-- NEVER write: "I won't crowd your space or routine" (BANNED!)
-- NEVER write: "Hope you have a great season!" or "Love your passion for [X]!" or "Excited about your [X]!" (Too robotic/fake).
-- NEVER use fixed formulaic closings like "How about grabbing a quick coffee and sharing travel stories in the evening?".
+- NEVER repeat calendar dates in the text (BANNED — already in the card header!).
+- NEVER write: "traveling light with a daypack" or "only a daypack" (BANNED).
+- NEVER write: "fully independent during the day" (BANNED).
+- NEVER write: "historic neighborhoods" (BANNED).
+- NEVER write: "tea or coffee" as a standard closing formula (BANNED — vary naturally).
+- NEVER write: "cultural exchange" as a generic crutch (BANNED).
+- NEVER write: "I won't crowd your space or routine" (BANNED).
+- NEVER write: "Hope you have a great season!" or "Love your passion for [X]!" or "Excited about your [X]!".
+- NEVER boast or list achievements ("55+ countries", "10+ years CS").
+- NEVER invent host facts or assume things not in their bio.
+- NEVER invent or mention travel routes, onward destinations, or relocations not in the Trip Card (e.g. BANNED: 'on my way to Hokkaido', 'heading north for skiing', 'on my way up north for the winter season').
+- NEVER claim ungrounded shared interests: NEVER write 'we both enjoy', 'we both love', 'we both share', 'we both like', 'fellow [X]' unless the host explicitly mentioned that exact activity/interest.
+- NEVER conflate culture/travel with language learning. Keep host facts and your facts distinct.
 
-Output ONLY the message text in 3 short, breathable paragraphs. Total length must be strictly between 85 and 120 words.
+Output ONLY the message text in 2-3 short, breathable paragraphs. Total length must be strictly between 60 and 90 words.
 """
         return prompt, city, date_str
 
@@ -446,6 +955,7 @@ Output ONLY the message text in 3 short, breathable paragraphs. Total length mus
         guest_context: Optional[str] = None,
         photo_paths: Optional[List[Union[str, Path]]] = None,
         image_insights: Optional[str] = None,
+        include_dates: bool = False,
     ) -> str:
         """
         Генерирует развернутый, теплый персонализированный текст запроса через Ollama (85-120 слов).
@@ -465,8 +975,9 @@ Output ONLY the message text in 3 short, breathable paragraphs. Total length mus
                 check_in=check_in,
                 check_out=check_out,
                 guest_context=guest_context,
+                include_dates=include_dates,
             )
-            return clean_generated_message(raw_fallback, date_str=format_conversational_dates(check_in, check_out), city=host.get("city", "Tokyo"))
+            return clean_generated_message(raw_fallback, date_str="", city=host.get("city", "Tokyo"), include_dates=include_dates)
 
         images: List[str] = []
         if photo_paths:
@@ -485,6 +996,27 @@ Output ONLY the message text in 3 short, breathable paragraphs. Total length mus
             image_insights=image_insights,
         )
 
+        # 1. Попытка генерации через Gemini Flash при наличии API-ключа
+        gemini_text = self.generate_via_gemini(
+            prompt=user_prompt,
+            system_prompt=SYSTEM_PROMPT,
+            images=images,
+        )
+        if gemini_text:
+            cleaned = clean_generated_message(gemini_text, date_str=date_str, city=city, include_dates=include_dates)
+            words = len(cleaned.split())
+            bio_words_count = len((host.get("about_me_clean") or host.get("about_me") or "").split())
+            is_minimal_bio = bio_words_count < 25
+            qc_ok, issues = validate_message_qc(cleaned, is_minimal_bio=is_minimal_bio, host_data=host, trip_city=city)
+            min_limit = 30 if is_minimal_bio else 55
+            max_limit = 70 if is_minimal_bio else 130
+            if qc_ok and min_limit <= words <= max_limit:
+                logger.info(f"Gemini Flash генерация успешно прошла QC ({words} слов)")
+                return cleaned
+            else:
+                logger.warning(f"Текст Gemini Flash не прошел QC ({words} слов: {issues}), переход к Ollama/fallback.")
+
+        # 2. Попытка генерации через Ollama (если доступна)
         payload: Dict[str, Any] = {
             "model": active_model,
             "prompt": user_prompt,
@@ -518,18 +1050,22 @@ Output ONLY the message text in 3 short, breathable paragraphs. Total length mus
                 if resp.status_code == 200:
                     raw_result = resp.json().get("response", "").strip()
                     if raw_result:
-                        cleaned = clean_generated_message(raw_result, date_str=date_str, city=city)
+                        cleaned = clean_generated_message(raw_result, date_str=date_str, city=city, include_dates=include_dates)
                         words = len(cleaned.split())
-                        qc_ok, issues = validate_message_qc(cleaned)
+                        bio_words_count = len((host.get("about_me_clean") or host.get("about_me") or "").split())
+                        is_minimal_bio = bio_words_count < 25
+                        qc_ok, issues = validate_message_qc(cleaned, is_minimal_bio=is_minimal_bio, host_data=host, trip_city=city)
                         last_cleaned = cleaned
 
-                        if words < 75 or words > 130 or "would love to connect!" in cleaned.lower() or not qc_ok:
+                        min_limit = 30 if is_minimal_bio else 55
+                        max_limit = 70 if is_minimal_bio else 130
+                        if words < min_limit or words > max_limit or "would love to connect!" in cleaned.lower() or not qc_ok:
                             logger.warning(
                                 f"Ollama generation attempt {attempt} failed QC ({words} words): {issues}. Retrying..."
                             )
                             current_prompt = (
                                 user_prompt
-                                + f"\n\nCRITICAL RETRY INSTRUCTION: Previous draft had issues: {issues}. Write strictly between 85 and 120 words across 3 breathable paragraphs, warm and thoughtful, with no banned phrases."
+                                + f"\n\nCRITICAL RETRY INSTRUCTION: Previous draft had issues: {issues}. Write strictly between 60 and 90 words across 2-3 short, breathable paragraphs, warm, natural, and personal, with no banned cliches."
                             )
                             continue
 
@@ -539,7 +1075,7 @@ Output ONLY the message text in 3 short, breathable paragraphs. Total length mus
             except Exception as e:
                 logger.warning(f"Ollama generation error on attempt {attempt}: {e}")
 
-        if last_cleaned and 75 <= len(last_cleaned.split()) <= 135 and "would love to connect!" not in last_cleaned.lower():
+        if last_cleaned and 50 <= len(last_cleaned.split()) <= 130 and "would love to connect!" not in last_cleaned.lower():
             return last_cleaned
 
         # Фолбэк на надежный генератор шаблонов
@@ -548,8 +1084,9 @@ Output ONLY the message text in 3 short, breathable paragraphs. Total length mus
             check_in=check_in,
             check_out=check_out,
             guest_context=guest_context,
+            include_dates=False,
         )
-        return clean_generated_message(raw_fallback, date_str=date_str, city=city)
+        return clean_generated_message(raw_fallback, date_str="", city=city, include_dates=False)
 
     def generate_first_request(
         self,
@@ -619,7 +1156,7 @@ CORE PRINCIPLES:
    - Keep replies concise: strictly 2–4 sentences (unless short/brief tone is selected).
    - Sign off naturally: "Cheers, Andrey" or "Best, Andrey".
 3. CONTEXT RECALL:
-   - You travel light (bulky luggage already forwarded to Hokkaido).
+   - You travel light with a small backpack.
    - You are self-sufficient and respectful of their personal time."""
 
 
@@ -757,9 +1294,9 @@ def generate_inbox_reply(
     first_name = h_name.split()[0] if h_name else "there"
     msg_clean = (host_message or "").strip()
     ctx = (my_context or (
-        "Andrey, ski coach heading to Club Med Tomamu (Hokkaido) for winter season. "
+        "Andrey, sports coach and traveler. "
         "Arriving in Tokyo Nov 18 (~5 PM), departing Nov 20 morning. "
-        "Bulky gear already forwarded to Hokkaido, travel light with small backpack, minimal footprint, "
+        "Travel light with small backpack, minimal footprint, "
         "easygoing, completely flexible with host's schedule and timing."
     )).strip()
     lower_msg = msg_clean.lower().replace("’", "'").replace("‘", "'")

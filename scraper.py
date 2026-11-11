@@ -45,7 +45,7 @@ if sys.platform == "win32":
 BASE_DIR = Path(__file__).parent
 USER_DATA_DIR = BASE_DIR / "user_data"
 AUTH_STATE_FILE = USER_DATA_DIR / "auth_state.json"
-OUTPUT_DIR = BASE_DIR / "output"
+OUTPUT_DIR = Path(os.environ.get("CS_OUTPUT_DIR", str(BASE_DIR / "output"))).resolve()
 
 
 def random_sleep(min_sec: float = 2.0, max_sec: float = 4.0) -> None:
@@ -343,6 +343,34 @@ def trip_is_upcoming(trip: Dict[str, Any]) -> bool:
         return True
 
 
+def remove_lgbtq_filter(data: Any) -> Tuple[Any, bool]:
+    """
+    Рекурсивно удаляет ключ isLGBTQ/is_lgbtq из словарей/списков.
+    Не заменяет значение на null или false — полностью удаляет ключ из структуры.
+    """
+    modified = False
+    if isinstance(data, dict):
+        cleaned = {}
+        for k, v in data.items():
+            if str(k).lower() in ("islgbtq", "is_lgbtq"):
+                modified = True
+                continue
+            new_v, sub_mod = remove_lgbtq_filter(v)
+            if sub_mod:
+                modified = True
+            cleaned[k] = new_v
+        return cleaned, modified
+    elif isinstance(data, list):
+        cleaned_list = []
+        for item in data:
+            new_item, sub_mod = remove_lgbtq_filter(item)
+            if sub_mod:
+                modified = True
+            cleaned_list.append(new_item)
+        return cleaned_list, modified
+    return data, False
+
+
 class CouchsurfingScraper:
     def __init__(
         self,
@@ -354,9 +382,10 @@ class CouchsurfingScraper:
         min_response_rate: float = 75.0,
         max_scroll_pages: int = 10,
         no_couples: bool = False,
-        no_lgbtq: bool = False,
+        no_lgbtq: Optional[bool] = None,
         arrival_date: Optional[str] = None,
         departure_date: Optional[str] = None,
+        trip_id: Optional[str] = None,
     ):
         self.city = city
         self.gender = gender
@@ -366,12 +395,19 @@ class CouchsurfingScraper:
         self.min_response_rate = min_response_rate
         self.max_scroll_pages = max_scroll_pages
         self.no_couples = no_couples
-        self.no_lgbtq = no_lgbtq
+        self.no_lgbtq = False  # LGBTQ API-фильтр полностью отключен
         self.arrival_date = arrival_date
         self.departure_date = departure_date
+        self.trip_id = trip_id
         self.collected_hosts: Dict[str, Dict[str, Any]] = {}
         self.gender_classifier = get_gender_classifier()
         self.hosting_guard = get_hosting_guard()
+
+        # Кэш результатов классификации пола и проверок Hosting Guard на уровне текущего поиска
+        self._session_gender_cache: Dict[str, Tuple[str, str, str]] = {}
+        self._session_guard_cache: Dict[str, Optional[Tuple[str, str]]] = {}
+        self._rejected_usernames: Set[str] = set()
+        self.sent_usernames: Set[str] = get_sent_usernames()
 
     def _dismiss_popups(self, page) -> None:
         """Закрывает cookie-баннеры и всплывающие окна, блокирующие интерфейс."""
@@ -728,7 +764,8 @@ class CouchsurfingScraper:
         username = item.get("handle") or item.get("slug") or item.get("username")
         if not username or username in ["visits", "stays", "feed", "explore", "search", "users"]:
             return
-        if username in self.collected_hosts:
+        u_key = username.strip().lower()
+        if u_key in self.collected_hosts or u_key in self._rejected_usernames or u_key in self.sent_usernames:
             return
 
         raw_name = item.get("displayName") or item.get("name") or item.get("slug") or username
@@ -760,29 +797,132 @@ class CouchsurfingScraper:
             is_active = True
         last_login_raw = "Recently Active" if is_active else "Active recently"
 
-        est_gender, host_type, gender_reason = self.gender_classifier.classify(name, about_me, username)
-        print(f"[GENDER] '{name}' -> {est_gender.lower()} ({gender_reason})")
+        # Кэш классификации пола на уровне текущей поисковой сессии
+        if u_key in self._session_gender_cache:
+            est_gender, host_type, gender_reason = self._session_gender_cache[u_key]
+        else:
+            est_gender, host_type, gender_reason = self.gender_classifier.classify(name, about_me, username)
+            self._session_gender_cache[u_key] = (est_gender, host_type, gender_reason)
+            print(f"[GENDER] '{name}' -> {est_gender.lower()} ({gender_reason})")
 
-        # Hosting Guard: проверка на стоп-слова
-        guard_hit = self.hosting_guard.check_regex_blacklist(about_me)
+        # Кэш Hosting Guard на уровне текущей поисковой сессии
+        if u_key in self._session_guard_cache:
+            guard_hit = self._session_guard_cache[u_key]
+        else:
+            guard_hit = self.hosting_guard.check_regex_blacklist(about_me)
+            self._session_guard_cache[u_key] = guard_hit
+            if guard_hit:
+                matched_text, _ = guard_hit
+                print(f"[GUARD] Отсеян {username} ({name}): '{matched_text}'")
+
         if guard_hit:
-            matched_text, _ = guard_hit
-            print(f"[GUARD] Отсеян {username} ({name}): '{matched_text}'")
+            self._rejected_usernames.add(u_key)
             return
 
         if self.no_couples and host_type == "couple":
-            return
-        if self.no_lgbtq and any(w in about_me.lower() for w in ["lgbt", "lgbtq", "queer", "non-binary", "transgender", "rainbow"]):
+            self._rejected_usernames.add(u_key)
             return
 
         insta_url, insta_handle = extract_instagram(about_me)
+
+        # 1. Языки (ISO-639 коды -> Человекочитаемые названия)
+        LANGUAGE_MAP = {
+            "eng": "English", "jpn": "Japanese", "fra": "French", "fre": "French",
+            "rus": "Russian", "spa": "Spanish", "deu": "German", "ger": "German",
+            "ita": "Italian", "cmn": "Chinese", "zho": "Chinese", "kor": "Korean",
+            "por": "Portuguese", "ara": "Arabic", "hin": "Hindi", "pol": "Polish",
+            "nld": "Dutch", "tur": "Turkish", "vie": "Vietnamese", "tha": "Thai"
+        }
+        raw_langs = item.get("languages") or []
+        parsed_langs = []
+        for l in raw_langs:
+            l_str = str(l).strip().lower()
+            parsed_langs.append(LANGUAGE_MAP.get(l_str, l_str.capitalize()))
+
+        # 2. Интересы и хобби
+        raw_interests = item.get("interests") or []
+        parsed_interests = []
+        for itm in raw_interests:
+            if isinstance(itm, dict):
+                n = itm.get("name")
+                if n:
+                    parsed_interests.append(str(n))
+            elif isinstance(itm, str) and itm.strip():
+                parsed_interests.append(itm.strip())
+
+        # 3. Посещенные страны
+        visited_countries = []
+        for p in (item.get("visitedPlaces") or []):
+            if isinstance(p, dict):
+                c = p.get("locationDescription", {}).get("country")
+                if c and c not in visited_countries:
+                    visited_countries.append(str(c))
+
+        # 4. Страны проживания
+        lived_countries = []
+        for p in (item.get("livedPlaces") or []):
+            if isinstance(p, dict):
+                c = p.get("locationDescription", {}).get("country")
+                if c and c not in lived_countries:
+                    lived_countries.append(str(c))
+
+        # 5. Родной город / Страна рождения
+        ht = item.get("homeTownLocationDescription") or {}
+        birth_country = ht.get("country") if isinstance(ht, dict) else None
+
+        # 6. Место / страна проживания
+        dom = item.get("domicileLocationDescription") or {}
+        residence_country = dom.get("country") if isinstance(dom, dict) else None
+
+        # 7. Verified статус
+        is_verified = bool(item.get("isIdentificationVerified"))
+
+        # 8. Возраст
+        host_age = item.get("age")
+
+        # 9. Статус приема гостей
+        lower_about = about_me.lower()
+        is_hosting = "accepting"
+        not_hosting_markers = [
+            "not hosting", "currently not hosting", "cannot host", "can't host", 
+            "unable to host", "taking a break from hosting", "not accepting guests",
+            "not accepting any guests", "temporarily not hosting", "temporarily closed",
+            "away from home", "currently traveling", "traveling right now", "i am traveling",
+            "i am away", "out of town", "not living here", "no longer hosting",
+            "not available to host", "not taking guests", "busy with work so can't host",
+            "не принимаю", "временно не принимаю", "не могу принять", "сейчас не хощу",
+            "не хощу", "не принимаю гостей", "я уехал", "уехала", "я в поездке",
+            "в путешествии", "сейчас путешествую", "не живу здесь", "переехал", "переехала"
+        ]
+        if any(k in lower_about for k in not_hosting_markers):
+            is_hosting = "not_accepting"
+
+        # 10. Домохозяйство (один / семья / соседи)
+        household = "unknown"
+        if any(k in lower_about for k in ["live alone", "live by myself", "living alone", "my studio"]):
+            household = "alone"
+        elif any(k in lower_about for k in ["my wife", "my husband", "my partner", "my family", "with my family", "our daughter", "our son", "with my kids"]):
+            household = "family"
+        elif any(k in lower_about for k in ["roommate", "flatmate", "share house", "shared house", "flatmates"]):
+            household = "flatmates"
+
+        # 11. Спецпослания и ограничения из био
+        notes = []
+        if any(k in lower_about for k in ["only host 1", "only 1 person", "solo traveler only", "solo travelers only", "one person only"]):
+            notes.append("Только 1 гость (соло)")
+        if any(k in lower_about for k in ["female only", "women only", "only female"]):
+            notes.append("Только для девушек")
+        if any(k in lower_about for k in ["one night only", "max 2 nights", "maximum 2 nights", "1-2 nights"]):
+            notes.append("Ограничение по сроку (1-2 ночи)")
+        if is_hosting == "not_accepting":
+            notes.append("В био: временно не принимает гостей")
 
         self.collected_hosts[username] = {
             "id": item.get("id") or item.get("userId") or username,
             "username": username,
             "name": name,
             "clean_name": clean_name,
-            "age": item.get("age"),
+            "age": host_age,
             "gender": est_gender.lower(),
             "host_type": host_type,
             "gender_reason": gender_reason,
@@ -797,6 +937,17 @@ class CouchsurfingScraper:
             "references_count": int(refs),
             "about_me": " ".join(about_me.split())[:1500],
             "profile_url": f"https://www.couchsurfing.com/c/users/{username}",
+            "avatar_url": item.get("avatarUrl") or (item.get("avatarImage", {}).get("medium", {}).get("url") if isinstance(item.get("avatarImage"), dict) else None),
+            "is_verified": is_verified,
+            "birth_country": birth_country,
+            "residence_country": residence_country,
+            "languages": parsed_langs,
+            "interests": parsed_interests,
+            "countries_visited": visited_countries,
+            "countries_lived": lived_countries,
+            "is_hosting": is_hosting,
+            "household": household,
+            "special_notes": "; ".join(notes) if notes else None,
             "target_city": self.city,
             "arrival_date": self.arrival_date,
             "departure_date": self.departure_date,
@@ -929,7 +1080,10 @@ class CouchsurfingScraper:
                 if not user_match:
                     continue
                 username = user_match.group(1)
-                if username in ["visits", "stays", "feed", "explore", "search", "users", "members", "people"] or username in self.collected_hosts:
+                if username in ["visits", "stays", "feed", "explore", "search", "users", "members", "people"]:
+                    continue
+                u_key = username.strip().lower()
+                if u_key in self.collected_hosts or u_key in self._rejected_usernames or u_key in self.sent_usernames:
                     continue
 
                 parent_text = ""
@@ -987,19 +1141,30 @@ class CouchsurfingScraper:
                 )
                 last_login_raw = "Recently Active" if is_recently_active else "Active recently"
 
-                est_gender, host_type, gender_reason = self.gender_classifier.classify(name, about_me, username)
-                print(f"[GENDER] '{name}' -> {est_gender.lower()} ({gender_reason})")
+                # Кэш классификации пола на уровне текущей поисковой сессии
+                if u_key in self._session_gender_cache:
+                    est_gender, host_type, gender_reason = self._session_gender_cache[u_key]
+                else:
+                    est_gender, host_type, gender_reason = self.gender_classifier.classify(name, about_me, username)
+                    self._session_gender_cache[u_key] = (est_gender, host_type, gender_reason)
+                    print(f"[GENDER] '{name}' -> {est_gender.lower()} ({gender_reason})")
 
-                # Hosting Guard: проверка на стоп-слова
-                guard_hit = self.hosting_guard.check_regex_blacklist(about_me)
+                # Кэш Hosting Guard на уровне текущей поисковой сессии
+                if u_key in self._session_guard_cache:
+                    guard_hit = self._session_guard_cache[u_key]
+                else:
+                    guard_hit = self.hosting_guard.check_regex_blacklist(about_me)
+                    self._session_guard_cache[u_key] = guard_hit
+                    if guard_hit:
+                        matched_text, _ = guard_hit
+                        print(f"[GUARD] Отсеян {username} ({name}): '{matched_text}'")
+
                 if guard_hit:
-                    matched_text, _ = guard_hit
-                    print(f"[GUARD] Отсеян {username} ({name}): '{matched_text}'")
+                    self._rejected_usernames.add(u_key)
                     continue
 
                 if self.no_couples and host_type == "couple":
-                    continue
-                if self.no_lgbtq and any(w in about_me.lower() for w in ["lgbt", "lgbtq", "queer", "non-binary", "transgender", "rainbow"]):
+                    self._rejected_usernames.add(u_key)
                     continue
 
                 insta_url, insta_handle = extract_instagram(about_me)
@@ -1031,6 +1196,78 @@ class CouchsurfingScraper:
                 }
             except Exception:
                 pass
+
+    def _setup_request_interception(self, page) -> None:
+        """
+        Перехватывает исходящие API-запросы поиска Couchsurfing (tRPC, GraphQL, REST)
+        и полностью удаляет параметр 'isLGBTQ' из payload (как GET query string, так и POST body).
+        Значение не заменяется другим — ключ удаляется полностью.
+        """
+        def _filter_route(route):
+            try:
+                req = route.request
+                url = req.url
+                new_url = url
+                post_data = req.post_data
+                new_post_data = post_data
+                was_modified = False
+
+                # 1. Проверяем URL (GET query string, tRPC batch request)
+                if "islgbtq" in url.lower():
+                    from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+                    parsed = urlparse(url)
+                    qparams = parse_qs(parsed.query, keep_blank_values=True)
+                    for k, vals in list(qparams.items()):
+                        new_vals = []
+                        for v in vals:
+                            try:
+                                json_v = json.loads(v)
+                                cleaned_v, mod = remove_lgbtq_filter(json_v)
+                                if mod:
+                                    was_modified = True
+                                    new_vals.append(json.dumps(cleaned_v, separators=(',', ':')))
+                                else:
+                                    new_vals.append(v)
+                            except Exception:
+                                new_vals.append(v)
+                        qparams[k] = new_vals
+                    new_query = urlencode(qparams, doseq=True)
+                    new_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+
+                # 2. Проверяем POST body (POST tRPC или GraphQL)
+                if post_data and "islgbtq" in post_data.lower():
+                    try:
+                        parsed_body = json.loads(post_data)
+                        cleaned_body, mod = remove_lgbtq_filter(parsed_body)
+                        if mod:
+                            was_modified = True
+                            new_post_data = json.dumps(cleaned_body, separators=(',', ':'))
+                    except Exception:
+                        pass
+
+                if was_modified:
+                    print("[API_FILTER] Обнаружен 'isLGBTQ' в реальном запросе Couchsurfing!")
+                    print(f"[API_FILTER] Параметр полностью удален из API-запроса.")
+                    print(f"[API_FILTER] Фактический payload после очистки: {new_post_data or new_url}")
+                    route.continue_(url=new_url, post_data=new_post_data)
+                else:
+                    route.continue_()
+            except Exception as e:
+                print(f"[!] Ошибка фильтрации API-запроса: {e}")
+                route.continue_()
+
+        # Подключаем перехват к эндпоинтам поиска хостов Couchsurfing
+        search_patterns = [
+            "**/hostSearch.searchHostsV2*",
+            "**/searchHosts*",
+            "**/api/web/trpc/*",
+            "**/graphql*",
+        ]
+        for pat in search_patterns:
+            try:
+                page.route(pat, _filter_route)
+            except Exception as e:
+                print(f"[!] Не удалось зарегистрировать route '{pat}': {e}")
 
     def run(self) -> List[Dict[str, Any]]:
         USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -1107,6 +1344,8 @@ class CouchsurfingScraper:
 
             # Регистрация перехвата сетевых API-ответов
             page.on("response", self._handle_search_response)
+            # Регистрация перехвата сетевых API-запросов (удаление фильтра isLGBTQ)
+            self._setup_request_interception(page)
 
             # 1. Пре-чек авторизации
             if not self._check_auth_validity(page):
@@ -1291,7 +1530,7 @@ class CouchsurfingScraper:
         return self._filter_and_save()
 
     def _save_live_hosts(self) -> None:
-        """Сохраняет текущих собранных хостов в live-файл для отображения в UI в реальном времени."""
+        """Сохраняет текущих собранных хостов в live-файл и SQLite в реальном времени."""
         try:
             OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
             all_hosts = list(self.collected_hosts.values())
@@ -1299,8 +1538,147 @@ class CouchsurfingScraper:
             live_path = OUTPUT_DIR / f"hosts_{slug_city}_live.json"
             with open(live_path, "w", encoding="utf-8") as f:
                 json.dump(all_hosts, f, ensure_ascii=False, indent=2)
+
+            # Сохранение в SQLite по мере обнаружения
+            self._upsert_hosts_to_db(all_hosts)
         except Exception as e:
             print(f"[!] Не удалось сохранить live-хосты: {e}")
+            raise
+
+    def _upsert_hosts_to_db(self, hosts_to_save: List[Dict[str, Any]]) -> None:
+        """Атомарное сохранение списка хостов в SQLite hosts, profile_analyses и trip_hosts."""
+        if not hosts_to_save:
+            return
+
+        # Определяем актуальный trip_id и чистый город
+        clean_city = getattr(self, "city", "") or "Kyoto"
+        if clean_city.startswith("http") or "/c/trips/" in clean_city:
+            extracted = city_from_trip_url(clean_city)
+            clean_city = extracted or ("Kyoto" if "kyoto" in clean_city.lower() else "Tokyo")
+
+        active_trip_id = getattr(self, "trip_id", None)
+        if not active_trip_id and hasattr(self, "city") and (self.city.startswith("http") or "/c/trips/" in self.city):
+            m = re.search(r"/c/trips/([^/?#]+)", self.city)
+            if m:
+                active_trip_id = m.group(1)
+        if not active_trip_id and getattr(self, "arrival_date", None) and getattr(self, "departure_date", None):
+            active_trip_id = f"trip_{clean_city.lower()}_{self.arrival_date}_{self.departure_date}"
+
+        try:
+            from database import db_session
+            with db_session() as conn:
+                cur = conn.cursor()
+                for h in hosts_to_save:
+                    raw_uname = str(h.get("username") or h.get("id") or "").strip()
+                    if not raw_uname:
+                        continue
+
+                    # Дедупликация: проверяем, существует ли уже хост по username или id
+                    existing = cur.execute("SELECT id FROM hosts WHERE username = ? OR id = ?", (raw_uname, raw_uname)).fetchone()
+                    host_pk = existing[0] if existing else raw_uname
+
+                    cur.execute("""
+                        INSERT INTO hosts (
+                            id, username, name, clean_name, profile_url, stay_request_url,
+                            location, avatar_url, about_me, about_me_clean,
+                            references_count, response_rate_pct, instagram_handle, instagram_url,
+                            first_scraped_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                        ON CONFLICT(id) DO UPDATE SET
+                            name=coalesce(excluded.name, hosts.name),
+                            clean_name=coalesce(excluded.clean_name, hosts.clean_name),
+                            profile_url=coalesce(excluded.profile_url, hosts.profile_url),
+                            location=coalesce(excluded.location, hosts.location),
+                            about_me=coalesce(excluded.about_me, hosts.about_me),
+                            about_me_clean=coalesce(excluded.about_me_clean, hosts.about_me_clean),
+                            references_count=coalesce(excluded.references_count, hosts.references_count),
+                            response_rate_pct=coalesce(excluded.response_rate_pct, hosts.response_rate_pct),
+                            updated_at=CURRENT_TIMESTAMP;
+                    """, (
+                        host_pk,
+                        raw_uname,
+                        h.get("name") or raw_uname,
+                        h.get("clean_name") or h.get("name") or raw_uname,
+                        h.get("profile_url") or f"https://www.couchsurfing.com/c/users/{raw_uname}",
+                        h.get("stay_request_url") or "",
+                        h.get("location") or clean_city,
+                        h.get("avatar_url") or "",
+                        h.get("about_me") or "",
+                        h.get("about_me_clean") or h.get("about_me") or "",
+                        h.get("references_count") or 0,
+                        h.get("response_rate_pct") or 90.0,
+                        h.get("instagram_handle") or "",
+                        h.get("instagram_url") or "",
+                    ))
+
+                    raw_gender = h.get("gender") or h.get("estimated_gender") or "Unknown"
+                    cap_gender = raw_gender.capitalize() if str(raw_gender).lower() in ("male", "female", "couple") else "Unknown"
+
+                    cur.execute("""
+                        INSERT INTO profile_analyses (
+                            host_id, estimated_gender, host_type, can_host_overnight,
+                            hosting_verdict_reason, hosting_confidence, sleeping_arrangement,
+                            house_rules, secret_code_detected, secret_code_hint,
+                            conversation_hooks_json, compatibility_points_json,
+                            conversation_strategy, compatibility_score, analyzed_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT(host_id) DO UPDATE SET
+                            estimated_gender=coalesce(excluded.estimated_gender, profile_analyses.estimated_gender),
+                            host_type=coalesce(excluded.host_type, profile_analyses.host_type),
+                            can_host_overnight=coalesce(excluded.can_host_overnight, profile_analyses.can_host_overnight),
+                            hosting_verdict_reason=coalesce(excluded.hosting_verdict_reason, profile_analyses.hosting_verdict_reason),
+                            hosting_confidence=coalesce(excluded.hosting_confidence, profile_analyses.hosting_confidence),
+                            sleeping_arrangement=coalesce(excluded.sleeping_arrangement, profile_analyses.sleeping_arrangement),
+                            house_rules=coalesce(excluded.house_rules, profile_analyses.house_rules),
+                            secret_code_detected=coalesce(excluded.secret_code_detected, profile_analyses.secret_code_detected),
+                            secret_code_hint=coalesce(excluded.secret_code_hint, profile_analyses.secret_code_hint),
+                            conversation_hooks_json=coalesce(excluded.conversation_hooks_json, profile_analyses.conversation_hooks_json),
+                            compatibility_points_json=coalesce(excluded.compatibility_points_json, profile_analyses.compatibility_points_json),
+                            conversation_strategy=coalesce(excluded.conversation_strategy, profile_analyses.conversation_strategy),
+                            compatibility_score=coalesce(excluded.compatibility_score, profile_analyses.compatibility_score),
+                            analyzed_at=CURRENT_TIMESTAMP;
+                    """, (
+                        host_pk,
+                        cap_gender,
+                        h.get("host_type") or "solo",
+                        1 if h.get("can_host_overnight", True) else 0,
+                        h.get("hosting_verdict_reason") or "",
+                        float(h.get("hosting_confidence") or 1.0),
+                        h.get("sleeping_arrangement") or "Not specified",
+                        h.get("house_rules") or "",
+                        1 if h.get("secret_code_detected") else 0,
+                        h.get("secret_code_hint") or "",
+                        json.dumps(h.get("conversation_hooks") or [], ensure_ascii=False),
+                        json.dumps(h.get("compatibility_points") or [], ensure_ascii=False),
+                        h.get("conversation_strategy") or "",
+                        float(h["compatibility_score"]) if h.get("compatibility_score") is not None else None,
+                    ))
+
+                    if active_trip_id:
+                        cur.execute("""
+                            INSERT OR IGNORE INTO trip_hosts (trip_id, host_id, city, arrival_date, departure_date, created_at)
+                            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP);
+                        """, (
+                            active_trip_id,
+                            host_pk,
+                            clean_city,
+                            getattr(self, "arrival_date", None) or "",
+                            getattr(self, "departure_date", None) or "",
+                        ))
+
+            # DDD Pipeline Ingestion (core_hosts & core_host_snapshots)
+            try:
+                from core.database import get_active_trip
+                from core.collector import CollectorEngine
+                active_trip = get_active_trip()
+                if active_trip:
+                    collector = CollectorEngine(trip_id=active_trip.id)
+                    collector.ingest_batch(hosts_to_save)
+            except Exception as e:
+                print(f"[!] Предупреждение DDD: не удалось сохранить в core_hosts: {e}")
+        except Exception as e:
+            print(f"[!] Ошибка сохранения хостов в SQLite: {e}")
+            raise
 
     def _filter_and_save(self) -> List[Dict[str, Any]]:
         """Фильтрация и экспорт в CSV и JSON."""
@@ -1318,6 +1696,12 @@ class CouchsurfingScraper:
                 print(f"[FILTER] Пропуск хоста {username}: запрос уже был отправлен ранее")
                 self.hosting_guard.record_rejected(host, "Already sent (sending_history/queue)")
                 continue
+            # Отсеивание людей, которые в анкете пишут, что не принимают гостей / уехали / в поездке
+            if host.get("is_hosting") == "not_accepting":
+                print(f"[FILTER] Пропуск хоста {username}: анкета указывает на отказ принимать гостей (not accepting / временно не принимает)")
+                self.hosting_guard.record_rejected(host, "Explicitly not accepting guests in bio")
+                continue
+
             days = host.get("last_login_days", 1)
             rate = host.get("response_rate_pct", 90.0)
 
@@ -1368,6 +1752,15 @@ class CouchsurfingScraper:
             df = df[actual_cols]
             df.to_csv(csv_path, index=False, encoding="utf-8-sig")
             print(f"[+] CSV сохранен: {csv_path.resolve()}")
+
+        # Сохранение в SQLite как надежный постоянный источник истины
+        if filtered_hosts:
+            try:
+                self._upsert_hosts_to_db(filtered_hosts)
+                print(f"[+] Успешно сохранено {len(filtered_hosts)} хостов в SQLite hosts & profile_analyses")
+            except Exception as e:
+                print(f"[!] КРИТИЧЕСКАЯ ОШИБКА: сохранение в SQLite не выполнено: {e}")
+                raise
 
         return filtered_hosts
 
@@ -1422,6 +1815,9 @@ class CouchsurfingScraper:
                 page.wait_for_timeout(4000)
                 self._dismiss_popups(page)
 
+                if "sign_in" in page.url or "login" in page.url:
+                    raise RuntimeError("Сессия Couchsurfing истекла или недействительна (редирект на страницу входа).")
+
                 # Сохраняем скриншот для диагностики
                 try:
                     page.screenshot(path=str(debug_dir / "trips_list.png"))
@@ -1453,12 +1849,13 @@ class CouchsurfingScraper:
 
             except Exception as e:
                 print(f"[!] Ошибка при получении списка трипов: {e}")
-
-            try:
-                context.close()
-                browser.close()
-            except Exception:
-                pass
+                raise
+            finally:
+                try:
+                    context.close()
+                    browser.close()
+                except Exception:
+                    pass
 
         print(f"[*] Всего трипов найдено: {len(trips)}")
         return trips
@@ -1475,11 +1872,11 @@ def main():
     parser.add_argument("--min-rate", type=float, default=75.0, help="Мин. Response Rate")
     parser.add_argument("--pages", type=int, default=10, help="Количество шагов скролла")
     parser.add_argument("--no-couples", action="store_true", default=False, help="Исключать пары")
-    parser.add_argument("--no-lgbtq", action="store_true", default=False, help="Исключать LGBTQ анкеты")
     parser.add_argument("--arrival-date", default=None, help="Дата заезда (YYYY-MM-DD)")
     parser.add_argument("--departure-date", default=None, help="Дата выезда (YYYY-MM-DD)")
     parser.add_argument("--list-trips", action="store_true", default=False, help="Вывести список трипов из /c/trips и выйти")
     parser.add_argument("--trip-url", default=None, help="Прямая URL ссылки на трип для парсинга хостов")
+    parser.add_argument("--trip-id", default=None, help="Идентификатор трипа")
 
     args = parser.parse_args()
 
@@ -1495,9 +1892,9 @@ def main():
         min_response_rate=args.min_rate,
         max_scroll_pages=args.pages,
         no_couples=args.no_couples,
-        no_lgbtq=args.no_lgbtq,
         arrival_date=args.arrival_date,
         departure_date=args.departure_date,
+        trip_id=args.trip_id,
     )
 
     if args.list_trips:
@@ -1510,11 +1907,17 @@ def main():
         # Режим парсинга хостов из конкретного трипа
         print(f"[*] Режим парсинга хостов из трипа: {args.trip_url}")
         scraper.city = args.trip_url
+        if not scraper.trip_id:
+            m = re.search(r"/c/trips/([^/?#]+)", args.trip_url)
+            if m:
+                scraper.trip_id = m.group(1)
+            else:
+                scraper.trip_id = args.trip_url
         if args.arrival_date:
             scraper.arrival_date = args.arrival_date
         if args.departure_date:
             scraper.departure_date = args.departure_date
-        print(f"[*] Даты поездки: {scraper.arrival_date} – {scraper.departure_date}")
+        print(f"[*] Trip ID: {scraper.trip_id}, Даты поездки: {scraper.arrival_date} – {scraper.departure_date}")
         # Вызываем run() - он обнаружит trip URL и перейдет по нему
         scraper.run()
         return

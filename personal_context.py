@@ -1,87 +1,149 @@
 """
-personal_context.py - Модуль управления структурированной базой знаний заявителя (Personal Context).
+personal_context.py - Модуль управления структурированной базой знаний заявителя (Personal Context)
+и якорями совместимости (Compatibility Anchors).
 
 Обеспечивает:
-1. Хранение структурированных фактов в таблице personal_context_facts базы данных SQLite.
-2. Категоризацию:
-   - Personal Background
-   - Travel Experience
+1. Хранение структурированных фактов в таблице personal_context_facts базы данных SQLite:
    - Professional Background
-   - Technology & Entrepreneurship
+   - Personal Background
    - Hobbies & Interests
-   - Current Travel Context (динамический контекст поездки)
-3. Управление фактами: добавление, редактирование, удаление, переключение активности, импорт/экспорт JSON.
-4. Интеллектуальный селектор: подбор только 1-2 наиболее релевантных фактов под конкретного хоста.
+   - Travel Experience
+   - Education
+   - Languages
+   - Technology & Entrepreneurship
+2. Хранение и управление якорями совместимости в таблице compatibility_anchors:
+   - Photography
+   - Cinema & Filmmaking
+   - Mountains / Outdoor / Ski
+   - Music & Sound
+   - Technology / Startups / AI
+   - Food & Cooking
+   - Culture & Languages
+3. Полный CRUD: создание, редактирование, удаление, переключение активности, приоритеты.
+4. Экспорт/импорт JSON.
 """
 
 import json
 import logging
 import re
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from database import db_session
 
 logger = logging.getLogger("PersonalContext")
 
-# Эталонная текстовая выжимка расширенного бэкграунда заявителя
+# Эталонная текстовая выжимка бэкграунда заявителя (обратная совместимость)
 DEFAULT_GUEST_CONTEXT = (
-    "Andrey, professional ski instructor based in Courchevel (French Alps), moving to Hokkaido for winter season. "
-    "10+ years CS veteran (overland Moscow-Paris, Morocco). High-altitude trekker (Thorong La Pass 5416m with son Mark in 2026, "
-    "solo Everest Base Camp). Film director (VGIK, Cannes 2024), plays piano, rides BMW GS motorcycle. "
+    "Andrey, professional ski instructor based in Geneva (Switzerland) and Courchevel (French Alps), flying to Japan from Geneva. "
+    "10+ years CS veteran (overland Geneva-Paris, Alps, Morocco). High-altitude trekker (Thorong La Pass 5416m with son Mark in 2026, "
+    "solo Everest Base Camp). Film director (Cannes 2024), plays piano, rides BMW GS motorcycle. "
     "Independent, quiet, out exploring all day."
 )
 
-# Начальные эталонные факты Андрея
+# Эталонные категории Personal Profile
+PERSONAL_CATEGORIES = [
+    "Professional Background",
+    "Personal Background",
+    "Hobbies & Interests",
+    "Travel Experience",
+    "Education",
+    "Languages",
+    "Technology & Entrepreneurship",
+]
+
+# Начальные структурированные факты заявителя (Андрей)
 DEFAULT_FACTS = [
-    # 1. Personal Background
+    # 1. Professional Background
     {
-        "fact_id": "pb_lifestyle_respect",
-        "category": "Personal Background",
-        "title": "Уважение к личному пространству и чистоте",
-        "content": "Внимательный и тихий гость. Понимает границы личного пространства, соблюдает режим тишины и чистоты в доме. Днем гуляет и исследует город самостоятельно.",
+        "fact_id": "prof_ski_coach_alps",
+        "category": "Professional Background",
+        "title": "Горнолыжный инструктор (Куршевель, Франция)",
+        "content": "Профессиональный инструктор по горным лыжам и сноуборду, базируется в Женеве (Швейцария) и Французских Альпах (Куршевель, Les 3 Vallées). Летит в Японию из Женевы.",
+        "priority": 2,
         "status": "confirmed",
         "source": "curated",
         "confidence": 1.0,
         "is_active": 1,
     },
     {
-        "fact_id": "pb_languages",
-        "category": "Personal Background",
-        "title": "Языки общения",
-        "content": "Свободный английский, базовый французский, родной русский. Легко общается на межкультурные темы.",
+        "fact_id": "prof_film_director_cannes",
+        "category": "Professional Background",
+        "title": "Режиссер кино (ВГИК, Канны 2024)",
+        "content": "Высшее образование кинорежиссера (ВГИК), опыт работы в независимом кинопроизводстве. Участник Каннского кинофестиваля в 2024 году. Профессионально занимается визуальным сторителлингом.",
+        "priority": 2,
         "status": "confirmed",
         "source": "curated",
         "confidence": 1.0,
         "is_active": 1,
     },
+
+    # 2. Personal Background
     {
         "fact_id": "pb_cs_veteran",
         "category": "Personal Background",
         "title": "10+ лет на Couchsurfing",
-        "content": "В сообществе Couchsurfing более 10 лет как активный путешественник и как хост во Французских Альпах. Знает культуру хостинга изнутри.",
+        "content": "В сообществе Couchsurfing более 10 лет как активный путешественник и как хост во Французских Альпах. Прекрасно понимает этику хостинга изнутри.",
+        "priority": 2,
+        "status": "confirmed",
+        "source": "curated",
+        "confidence": 1.0,
+        "is_active": 1,
+    },
+    {
+        "fact_id": "pb_lifestyle_respect",
+        "category": "Personal Background",
+        "title": "Уважение к личному пространству и чистоте",
+        "content": "Внимательный и тихий гость. Понимает границы личного пространства, соблюдает чистоту и режим в доме. Днем исследует город самостоятельно.",
+        "priority": 1,
         "status": "confirmed",
         "source": "curated",
         "confidence": 1.0,
         "is_active": 1,
     },
 
-    # 2. Travel Experience
+    # 3. Hobbies & Interests
     {
-        "fact_id": "te_countries_55",
-        "category": "Travel Experience",
-        "title": "55+ стран и независимые путешествия",
-        "content": "Исследовал более 55 стран самостоятельно. Предпочитает глубокое погружение в аутентичную среду вместо туристических штампов.",
+        "fact_id": "hobby_photography",
+        "category": "Hobbies & Interests",
+        "title": "Стрит-фотография и визуальное искусство",
+        "content": "Увлекается стрит-фотографией, композицией, аналоговой эстетикой и запечатлением аутентичных городских уголков и людей.",
+        "priority": 2,
         "status": "confirmed",
         "source": "curated",
         "confidence": 1.0,
         "is_active": 1,
     },
     {
-        "fact_id": "te_hong_kong_asia",
+        "fact_id": "hobby_piano_music",
+        "category": "Hobbies & Interests",
+        "title": "Фортепиано, классика и эмбиент",
+        "content": "Играет на фортепиано, ценит классическую музыку, эмбиент, винил и акустическое звучание.",
+        "priority": 1,
+        "status": "confirmed",
+        "source": "curated",
+        "confidence": 1.0,
+        "is_active": 1,
+    },
+    {
+        "fact_id": "hobby_cooking_local_food",
+        "category": "Hobbies & Interests",
+        "title": "Кулинария и аутентичные вкусы",
+        "content": "Любит готовить вкусные домашние блюда, открывать локальные гастрономические традиции, рынки, фермерские продукты и сезонную кухню.",
+        "priority": 1,
+        "status": "confirmed",
+        "source": "curated",
+        "confidence": 1.0,
+        "is_active": 1,
+    },
+
+    # 4. Travel Experience
+    {
+        "fact_id": "te_countries_55",
         "category": "Travel Experience",
-        "title": "Жизнь в Гонконге и связь с Азией",
-        "content": "Жил в Гонконге, имеет глубокую связь с культурой Азии, понимает местный этикет и городские ритмы.",
+        "title": "55+ стран и независимые путешествия",
+        "content": "Исследовал более 55 стран самостоятельно. Предпочитает глубокое погружение в аутентичную среду вместо стандартных туристических маршрутов.",
+        "priority": 2,
         "status": "confirmed",
         "source": "curated",
         "confidence": 1.0,
@@ -92,6 +154,7 @@ DEFAULT_FACTS = [
         "category": "Travel Experience",
         "title": "Высокогорный треккинг в Непале (Торунг Ла, Эверест)",
         "content": "Опыт высокогорного треккинга в Непале: соло трек к Everest Base Camp и Kala Patthar (5642 м), прохождение кольца Аннапурны с сыном Марком через перевал Thorong La (5416 м в 2026 году).",
+        "priority": 2,
         "status": "confirmed",
         "source": "curated",
         "confidence": 1.0,
@@ -101,132 +164,219 @@ DEFAULT_FACTS = [
         "fact_id": "te_bmw_gs_moto",
         "category": "Travel Experience",
         "title": "Мотопутешествия на BMW GS (Альпы, Марокко)",
-        "content": "Путешествует на мотоцикле BMW GS по горным серпантинам Европы, Альпам и Марокко. Увлекается мотомеханикой и автопутешествиями (overland Москва-Париж).",
-        "status": "confirmed",
-        "source": "curated",
-        "confidence": 1.0,
-        "is_active": 1,
-    },
-
-    # 3. Professional Background
-    {
-        "fact_id": "prof_ski_coach_alps",
-        "category": "Professional Background",
-        "title": "Горнолыжный инструктор (Куршевель, Франция)",
-        "content": "Профессиональный инструктор по горным лыжам и сноуборду, базируется во Французских Альпах (Куршевель, Les 3 Vallées). Работал в России, Польше и Франции.",
+        "content": "Путешествует на мотоцикле BMW GS по горным серпантинам Европы, Альпам и Марокко. Увлекается мотомеханикой и автопутешествиями (overland Женева-Париж, Альпы).",
+        "priority": 1,
         "status": "confirmed",
         "source": "curated",
         "confidence": 1.0,
         "is_active": 1,
     },
     {
-        "fact_id": "prof_film_director_cannes",
-        "category": "Professional Background",
-        "title": "Режиссер кино (ВГИК, Канны 2024)",
-        "content": "Высшее образование кинорежиссера (ВГИК), опыт работы в киноиндустрии. Участник Каннского кинофестиваля в 2024 году. Профессионально занимается фотографией и видео.",
+        "fact_id": "te_hong_kong_asia",
+        "category": "Travel Experience",
+        "title": "Жизнь в Гонконге и связь с Азией",
+        "content": "Жил в Гонконге, имеет глубокую связь с культурой Азии, понимает местный этикет, ритмы мегаполисов и культуру чайных церемоний.",
+        "priority": 1,
         "status": "confirmed",
         "source": "curated",
         "confidence": 1.0,
         "is_active": 1,
     },
 
-    # 4. Technology & Entrepreneurship
+    # 5. Education
+    {
+        "fact_id": "edu_vgik_cinema",
+        "category": "Education",
+        "title": "Высшее образование: Режиссура кино",
+        "content": "Диплом кинорежиссера (киношкола визуальных искусств). Классическая школа киноязыка, драматургии и визуальной композиции.",
+        "priority": 1,
+        "status": "confirmed",
+        "source": "curated",
+        "confidence": 1.0,
+        "is_active": 1,
+    },
+
+    # 6. Languages
+    {
+        "fact_id": "lang_multilingual",
+        "category": "Languages",
+        "title": "Языки общения: English, Français",
+        "content": "Свободный английский (fluent), французский (French). Легко находит общий язык с людьми разных культур.",
+        "priority": 1,
+        "status": "confirmed",
+        "source": "curated",
+        "confidence": 1.0,
+        "is_active": 1,
+    },
+
+    # 7. Technology & Entrepreneurship
     {
         "fact_id": "tech_fitness_ml_tools",
         "category": "Technology & Entrepreneurship",
         "title": "IT-разработка, AI и Fitness Web Tools",
-        "content": "Разрабатывает собственные веб-сервисы в сфере фитнеса и машинного обучения. Интересуется автоматизацией, агентными системами и LLM.",
+        "content": "Разрабатывает веб-сервисы в сфере фитнеса и машинного обучения. Интересуется практическим применением LLM, автономными агентами и автоматизацией.",
+        "priority": 2,
         "status": "confirmed",
         "source": "curated",
         "confidence": 1.0,
         "is_active": 1,
     },
+]
 
-    # 5. Hobbies & Interests
+# Начальные эталонные якоря совместимости
+DEFAULT_ANCHORS = [
     {
-        "fact_id": "hobby_piano_music",
-        "category": "Hobbies & Interests",
-        "title": "Фортепиано, классика и эмбиент",
-        "content": "Играет на фортепиано, ценит классическую музыку, эмбиент и акустическое звучание.",
-        "status": "confirmed",
-        "source": "curated",
-        "confidence": 1.0,
+        "anchor_id": "anchor_photo",
+        "name": "Photography",
+        "category": "Creative & Visual",
+        "keywords": ["photo", "photography", "camera", "street photography", "portrait", "visual art", "photographer", "fujifilm", "leica"],
+        "description": "Стрит-фотография, визуальное искусство, композиция, свет, камеры",
+        "priority": 2,
         "is_active": 1,
     },
     {
-        "fact_id": "hobby_cooking_local_food",
-        "category": "Hobbies & Interests",
-        "title": "Кулинария и аутентичные вкусы",
-        "content": "Любит готовить вкусные домашние блюда, открывать для себя локальные гастрономические традиции, рынки и сезонную кухню.",
-        "status": "confirmed",
-        "source": "curated",
-        "confidence": 1.0,
+        "anchor_id": "anchor_cinema",
+        "name": "Cinema & Filmmaking",
+        "category": "Creative & Visual",
+        "keywords": ["film", "cinema", "movies", "director", "filmmaking", "screenwriting", "video", "documentary", "cannes", "arthouse", "editing"],
+        "description": "Кинематограф, режиссура, авторское кино, Каннский фестиваль, видеомонтаж",
+        "priority": 2,
         "is_active": 1,
     },
-
-    # 6. Current Travel Context (Динамическая категория)
     {
-        "fact_id": "curr_tokyo_hokkaido_2026",
-        "category": "Current Travel Context",
-        "title": "Токио (ноябрь 2026) -> Club Med Tomamu (Хоккайдо)",
-        "content": "Визит в Токио на даты 18-20 ноября 2026 года для акклиматизации и покупки зимнего снаряжения, после чего переезд на сезонную работу инструктором в Club Med Tomamu (Хоккайдо).",
-        "status": "temporary",
-        "source": "user_schedule",
-        "confidence": 1.0,
+        "anchor_id": "anchor_mountains",
+        "name": "Mountains / Outdoor / Ski",
+        "category": "Nature & Adventure",
+        "keywords": ["mountain", "mountains", "hiking", "trek", "trekking", "climb", "ski", "skiing", "snowboard", "alps", "nature", "outdoor", "trail", "nepal", "everest", "annapurna", "sports", "sport", "soccer", "futsal", "football", "badminton", "tennis", "running", "cycling", "biking", "fitness", "coach", "coaching"],
+        "description": "Горнолыжный спорт, активный спорт, треккинг в Непале, перевалы, горная природа",
+        "priority": 2,
+        "is_active": 1,
+    },
+    {
+        "anchor_id": "anchor_music",
+        "name": "Music & Sound",
+        "category": "Culture & Arts",
+        "keywords": ["music", "piano", "classical", "ambient", "guitar", "instrument", "instruments", "koto", "shamisen", "traditional instrument", "concert", "vinyl", "audio", "jazz", "acoustic", "synthesizer", "band", "musician"],
+        "description": "Фортепиано, традиционные инструменты (кото), эмбиент, классическая музыка, акустика, джаз, живой звук",
+        "priority": 1,
+        "is_active": 1,
+    },
+    {
+        "anchor_id": "anchor_tech",
+        "name": "Technology / Startups / AI",
+        "category": "Technology & Business",
+        "keywords": ["tech", "software", "developer", "coding", "programming", "python", "ai", "machine learning", "startup", "engineering", "web", "data science"],
+        "description": "IT-разработка, искусственный интеллект, стартапы, автоматизация, инженерия",
+        "priority": 2,
+        "is_active": 1,
+    },
+    {
+        "anchor_id": "anchor_food",
+        "name": "Food & Cooking",
+        "category": "Lifestyle",
+        "keywords": ["food", "cook", "cooking", "culinary", "cuisine", "gastronomy", "local food", "restaurant", "restaurants", "tasting", "delicious", "sweets", "tictac", "dining", "delicacies", "coffee", "tea", "wine", "ramen", "baking", "sushi"],
+        "description": "Кулинарные традиции, рестораны, дегустация блюд, локальные вкусы, домашняя кухня, кофе/чай, сезонная еда",
+        "priority": 1,
+        "is_active": 1,
+    },
+    {
+        "anchor_id": "anchor_culture_lang",
+        "name": "Culture & Languages",
+        "category": "Culture & Arts",
+        "keywords": ["language", "languages", "culture", "cultural exchange", "expat", "linguistics", "travel stories", "multilingual", "asia", "hong kong", "japan", "english", "japanese", "french", "spanish", "practicing english", "learning english", "learning japanese", "language exchange", "bylocals", "recommendations", "local guide", "local spots", "cross-cultural"],
+        "description": "Межкультурный диалог, языковая практика (EN/FR/RU), рекомендации местных мест, жизнь в Азии, глубокие путешествия",
+        "priority": 1,
         "is_active": 1,
     },
 ]
 
 
 class PersonalContextManager:
-    """Менеджер операций над базой знаний заявителя."""
+    """Менеджер управления персональной базой знаний и якорями совместимости."""
 
     def __init__(self):
         self.ensure_default_facts()
+        self.ensure_default_anchors()
 
     def ensure_default_facts(self) -> None:
-        """Инициализирует базу данных начальным набором фактов при первом запуске."""
+        """Инициализирует и синхронизирует эталонные факты Андрея по 7 категориям."""
         with db_session() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM personal_context_facts;")
-            count = cur.fetchone()[0]
-            if count == 0:
+            now = datetime.now().isoformat()
+            for f in DEFAULT_FACTS:
+                cur.execute(
+                    """
+                    INSERT INTO personal_context_facts 
+                    (fact_id, category, title, content, priority, status, source, confidence, is_active, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(fact_id) DO UPDATE SET
+                        category = excluded.category,
+                        priority = COALESCE(personal_context_facts.priority, excluded.priority);
+                    """,
+                    (
+                        f["fact_id"],
+                        f["category"],
+                        f["title"],
+                        f["content"],
+                        f.get("priority", 1),
+                        f["status"],
+                        f["source"],
+                        f["confidence"],
+                        f["is_active"],
+                        now,
+                        now,
+                    ),
+                )
+
+    def ensure_default_anchors(self) -> None:
+        """Инициализирует и синхронизирует базовые якоря совместимости."""
+        with db_session() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM compatibility_anchors;")
+            if cur.fetchone()[0] == 0:
                 now = datetime.now().isoformat()
-                for f in DEFAULT_FACTS:
+                for a in DEFAULT_ANCHORS:
                     cur.execute(
                         """
-                        INSERT INTO personal_context_facts 
-                        (fact_id, category, title, content, status, source, confidence, is_active, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        INSERT OR IGNORE INTO compatibility_anchors
+                        (anchor_id, name, category, keywords_json, description, priority, is_active, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
                         """,
                         (
-                            f["fact_id"],
-                            f["category"],
-                            f["title"],
-                            f["content"],
-                            f["status"],
-                            f["source"],
-                            f["confidence"],
-                            f["is_active"],
+                            a["anchor_id"],
+                            a["name"],
+                            a["category"],
+                            json.dumps(a["keywords"]),
+                            a.get("description", ""),
+                            a.get("priority", 1),
+                            a.get("is_active", 1),
                             now,
                             now,
                         ),
                     )
-                logger.info("Таблица personal_context_facts инициализирована эталонными фактами.")
 
-    def get_all_facts(self, active_only: bool = False) -> List[Dict[str, Any]]:
-        """Возвращает список всех фактов, сгруппированных по категориям."""
+    # -------------------------------------------------------------
+    # PERSONAL PROFILE FACTS CRUD
+    # -------------------------------------------------------------
+
+    def get_all_facts(self, active_only: bool = False, category: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Возвращает список фактов с сортировкой по приоритету (DESC) и категории."""
         with db_session() as conn:
             cur = conn.cursor()
+            query = "SELECT * FROM personal_context_facts WHERE 1=1"
+            params: List[Any] = []
             if active_only:
-                cur.execute("SELECT * FROM personal_context_facts WHERE is_active = 1 ORDER BY category, title;")
-            else:
-                cur.execute("SELECT * FROM personal_context_facts ORDER BY category, title;")
+                query += " AND is_active = 1"
+            if category:
+                query += " AND category = ?"
+                params.append(category)
+            query += " ORDER BY category ASC, priority DESC, title ASC;"
+            cur.execute(query, params)
             rows = cur.fetchall()
             return [dict(r) for r in rows]
 
     def get_fact(self, fact_id: str) -> Optional[Dict[str, Any]]:
-        """Возвращает факт по его ID."""
+        """Возвращает факт по ID."""
         with db_session() as conn:
             cur = conn.cursor()
             cur.execute("SELECT * FROM personal_context_facts WHERE fact_id = ?;", (fact_id,))
@@ -239,6 +389,7 @@ class PersonalContextManager:
         category: str,
         title: str,
         content: str,
+        priority: int = 1,
         status: str = "confirmed",
         source: str = "user",
         confidence: float = 1.0,
@@ -252,12 +403,13 @@ class PersonalContextManager:
             cur.execute(
                 """
                 INSERT INTO personal_context_facts 
-                (fact_id, category, title, content, status, source, confidence, is_active, valid_until, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (fact_id, category, title, content, priority, status, source, confidence, is_active, valid_until, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(fact_id) DO UPDATE SET
                     category = excluded.category,
                     title = excluded.title,
                     content = excluded.content,
+                    priority = excluded.priority,
                     status = excluded.status,
                     source = excluded.source,
                     confidence = excluded.confidence,
@@ -270,9 +422,10 @@ class PersonalContextManager:
                     category,
                     title,
                     content,
+                    int(priority),
                     status,
                     source,
-                    confidence,
+                    float(confidence),
                     1 if is_active else 0,
                     valid_until,
                     now,
@@ -282,7 +435,7 @@ class PersonalContextManager:
             return self.get_fact(fact_id) or {}
 
     def toggle_fact_active(self, fact_id: str, is_active: bool) -> bool:
-        """Включает или выключает факт."""
+        """Переключает статус активности факта."""
         now = datetime.now().isoformat()
         with db_session() as conn:
             cur = conn.cursor()
@@ -299,31 +452,163 @@ class PersonalContextManager:
             cur.execute("DELETE FROM personal_context_facts WHERE fact_id = ?;", (fact_id,))
             return cur.rowcount > 0
 
-    def export_json(self) -> str:
-        """Экспорт всех фактов в JSON строку."""
-        facts = self.get_all_facts(active_only=False)
-        return json.dumps(facts, ensure_ascii=False, indent=2)
+    # -------------------------------------------------------------
+    # COMPATIBILITY ANCHORS CRUD
+    # -------------------------------------------------------------
 
-    def import_json(self, json_str: str) -> int:
-        """Импорт фактов из JSON строки."""
-        data = json.loads(json_str)
-        if not isinstance(data, list):
-            raise ValueError("Expected a JSON array of facts")
-        imported_count = 0
-        for it in data:
-            self.upsert_fact(
-                fact_id=it["fact_id"],
-                category=it.get("category", "Personal Background"),
-                title=it.get("title", "Untitled Fact"),
-                content=it.get("content", ""),
-                status=it.get("status", "confirmed"),
-                source=it.get("source", "import"),
-                confidence=float(it.get("confidence", 1.0)),
-                is_active=bool(it.get("is_active", True)),
-                valid_until=it.get("valid_until"),
+    def get_all_anchors(self, active_only: bool = False) -> List[Dict[str, Any]]:
+        """Возвращает список якорей совместимости."""
+        with db_session() as conn:
+            cur = conn.cursor()
+            query = "SELECT * FROM compatibility_anchors"
+            if active_only:
+                query += " WHERE is_active = 1"
+            query += " ORDER BY priority DESC, name ASC;"
+            cur.execute(query)
+            rows = cur.fetchall()
+            res = []
+            for r in rows:
+                item = dict(r)
+                if isinstance(item.get("keywords_json"), str):
+                    try:
+                        item["keywords"] = json.loads(item["keywords_json"])
+                    except Exception:
+                        item["keywords"] = []
+                else:
+                    item["keywords"] = []
+                res.append(item)
+            return res
+
+    def get_anchor(self, anchor_id: str) -> Optional[Dict[str, Any]]:
+        """Возвращает якорь по ID."""
+        with db_session() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM compatibility_anchors WHERE anchor_id = ?;", (anchor_id,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            item = dict(row)
+            try:
+                item["keywords"] = json.loads(item.get("keywords_json", "[]"))
+            except Exception:
+                item["keywords"] = []
+            return item
+
+    def upsert_anchor(
+        self,
+        anchor_id: str,
+        name: str,
+        category: str,
+        keywords: Union[List[str], str],
+        description: str = "",
+        priority: int = 1,
+        is_active: bool = True,
+    ) -> Dict[str, Any]:
+        """Создает или обновляет якорь совместимости."""
+        now = datetime.now().isoformat()
+        if isinstance(keywords, str):
+            kw_list = [k.strip() for k in keywords.split(",") if k.strip()]
+        else:
+            kw_list = [str(k).strip() for k in keywords if str(k).strip()]
+        kw_json = json.dumps(kw_list, ensure_ascii=False)
+
+        with db_session() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO compatibility_anchors
+                (anchor_id, name, category, keywords_json, description, priority, is_active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(anchor_id) DO UPDATE SET
+                    name = excluded.name,
+                    category = excluded.category,
+                    keywords_json = excluded.keywords_json,
+                    description = excluded.description,
+                    priority = excluded.priority,
+                    is_active = excluded.is_active,
+                    updated_at = excluded.updated_at;
+                """,
+                (
+                    anchor_id,
+                    name,
+                    category,
+                    kw_json,
+                    description,
+                    int(priority),
+                    1 if is_active else 0,
+                    now,
+                    now,
+                ),
             )
-            imported_count += 1
-        return imported_count
+            return self.get_anchor(anchor_id) or {}
+
+    def toggle_anchor_active(self, anchor_id: str, is_active: bool) -> bool:
+        """Включает или выключает якорь совместимости."""
+        now = datetime.now().isoformat()
+        with db_session() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE compatibility_anchors SET is_active = ?, updated_at = ? WHERE anchor_id = ?;",
+                (1 if is_active else 0, now, anchor_id),
+            )
+            return cur.rowcount > 0
+
+    def delete_anchor(self, anchor_id: str) -> bool:
+        """Удаляет якорь совместимости."""
+        with db_session() as conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM compatibility_anchors WHERE anchor_id = ?;", (anchor_id,))
+            return cur.rowcount > 0
+
+    # -------------------------------------------------------------
+    # IMPORT & EXPORT
+    # -------------------------------------------------------------
+
+    def export_json(self) -> str:
+        """Экспорт фактов и якорей в структурированный JSON."""
+        data = {
+            "facts": self.get_all_facts(active_only=False),
+            "anchors": self.get_all_anchors(active_only=False),
+        }
+        return json.dumps(data, ensure_ascii=False, indent=2)
+
+    def import_json(self, json_str: str) -> Dict[str, int]:
+        """Импорт фактов и якорей из JSON строки."""
+        data = json.loads(json_str)
+        facts_count = 0
+        anchors_count = 0
+
+        facts_list = data.get("facts", data) if isinstance(data, dict) else data
+        if isinstance(facts_list, list):
+            for it in facts_list:
+                self.upsert_fact(
+                    fact_id=it["fact_id"],
+                    category=it.get("category", "Personal Background"),
+                    title=it.get("title", "Untitled"),
+                    content=it.get("content", ""),
+                    priority=it.get("priority", 1),
+                    status=it.get("status", "confirmed"),
+                    source=it.get("source", "import"),
+                    confidence=float(it.get("confidence", 1.0)),
+                    is_active=bool(it.get("is_active", True)),
+                    valid_until=it.get("valid_until"),
+                )
+                facts_count += 1
+
+        if isinstance(data, dict) and "anchors" in data and isinstance(data["anchors"], list):
+            for an in data["anchors"]:
+                self.upsert_anchor(
+                    anchor_id=an["anchor_id"],
+                    name=an.get("name", "Untitled Anchor"),
+                    category=an.get("category", "General"),
+                    keywords=an.get("keywords", []),
+                    description=an.get("description", ""),
+                    priority=an.get("priority", 1),
+                    is_active=bool(an.get("is_active", True)),
+                )
+                anchors_count += 1
+
+        return {"imported_facts": facts_count, "imported_anchors": anchors_count}
 
     def select_relevant_facts(
         self,
@@ -331,80 +616,18 @@ class PersonalContextManager:
         max_facts: int = 2,
     ) -> List[Dict[str, Any]]:
         """
-        Интеллектуальный подбор 1-2 фактов обо мне, наиболее релевантных конкретному хосту.
-        Не навязывает нерелевантные совпадения. Если точек пересечения нет, возвращает базовую надежность.
+        Сохранена для обратной совместимости.
+        Делегирует подбор фактов в ContextAssembler.
         """
-        all_active = self.get_all_facts(active_only=True)
-        about = (host_profile.get("about_me_clean") or host_profile.get("about_me") or "").lower()
-        home = (host_profile.get("house_rules") or "").lower()
-        full_text = f"{about} {home}"
-
-        scored_facts: List[Tuple[float, Dict[str, Any]]] = []
-
-        for fact in all_active:
-            cat = fact["category"]
-            fid = fact["fact_id"]
-            score = 0.0
-
-            # 1. Горы, лыжи, сноуборд, треккинг, Альпы, Непал
-            if fid in ("prof_ski_coach_alps", "te_nepal_mountains"):
-                if any(k in full_text for k in ("mountain", "hike", "hiking", "ski", "skiing", "snowboard", "alps", "trekking", "climb", "nature", "outdoor", "nepal")):
-                    score += 5.0
-
-            # 2. Кино, режиссура, Канны, фото, видео
-            elif fid == "prof_film_director_cannes":
-                if any(k in full_text for k in ("film", "cinema", "director", "photo", "photography", "camera", "video", "art", "creative", "cannes")):
-                    score += 5.0
-
-            # 3. Мотоциклы, BMW GS, механика, роудтрипы
-            elif fid == "te_bmw_gs_moto":
-                if any(k in full_text for k in ("moto", "motorcycle", "motorbike", "biker", "road trip", "mechanic", "bmw")):
-                    score += 5.0
-
-            # 4. IT, разработка, ML, стартапы
-            elif fid == "tech_fitness_ml_tools":
-                if any(k in full_text for k in ("software", "developer", "engineer", "machine learning", "coding", "tech", "python", "ai", "startup")):
-                    score += 4.5
-
-            # 5. Музыка, фортепиано
-            elif fid == "hobby_piano_music":
-                if any(k in full_text for k in ("music", "piano", "classical", "ambient", "guitar", "concert")):
-                    score += 4.5
-
-            # 6. Европа, Франция, экспаты
-            elif fid in ("prof_ski_coach_alps", "te_bmw_gs_moto"):
-                if any(k in full_text for k in ("europe", "france", "french", "courchevel", "italy", "switzerland")):
-                    score += 4.0
-
-            # 7. Гонконг, жизнь в Азии
-            elif fid == "te_hong_kong_asia":
-                if any(k in full_text for k in ("hong kong", "asia", "taiwan", "china", "expat")):
-                    score += 4.0
-
-            # 8. Кулинария, еда
-            elif fid == "hobby_cooking_local_food":
-                if any(k in full_text for k in ("food", "cook", "cooking", "ramen", "sushi", "wine", "tea", "baking", "foodie")):
-                    score += 3.5
-
-            # Базовый опыт на CS и надежность
-            elif fid == "pb_cs_veteran":
-                score += 1.0
-
-            if score > 0:
-                scored_facts.append((score, fact))
-
-        scored_facts.sort(key=lambda x: x[0], reverse=True)
-
-        if scored_facts and scored_facts[0][0] >= 3.0:
-            # Найдено явное тематическое пересечение: берем топ-1 или топ-2 факта
-            selected = [f for s, f in scored_facts[:max_facts]]
-        else:
-            # Если специфического совпадения нет, берем проверенный факт о 10+ годах на CS и уважении к границам
-            cs_fact = next((f for f in all_active if f["fact_id"] == "pb_cs_veteran"), None)
-            resp_fact = next((f for f in all_active if f["fact_id"] == "pb_lifestyle_respect"), None)
-            selected = [f for f in (cs_fact, resp_fact) if f]
-
-        return selected
+        try:
+            from context_assembler import get_context_assembler
+            assembler = get_context_assembler()
+            assembled = assembler.assemble_context(host_profile)
+            return assembled.get("selected_cards", [])
+        except Exception as e:
+            logger.warning(f"Fallback selection in select_relevant_facts: {e}")
+            all_active = self.get_all_facts(active_only=True)
+            return all_active[:max_facts]
 
 
 _pcm_instance: Optional[PersonalContextManager] = None

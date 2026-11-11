@@ -21,7 +21,7 @@ from pydantic import BaseModel
 from starlette.requests import Request
 
 BASE_DIR = Path(__file__).parent
-OUTPUT_DIR = BASE_DIR / "output"
+OUTPUT_DIR = Path(os.environ.get("CS_OUTPUT_DIR", str(BASE_DIR / "output"))).resolve()
 TEMPLATES_DIR = BASE_DIR / "templates"
 INBOX_STATUS_FILE = OUTPUT_DIR / "inbox_status.json"
 

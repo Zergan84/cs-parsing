@@ -13,6 +13,10 @@ import json
 import sqlite3
 import unittest
 from pathlib import Path
+from test_isolation import activate_test_isolation, get_db_path
+
+activate_test_isolation()
+
 from fastapi.testclient import TestClient
 
 from app import app
@@ -32,9 +36,13 @@ class TestPlatformArchitecture(unittest.TestCase):
         cls.analyzer = get_profile_analyzer()
         cls.queue_mgr = RequestQueueManager()
 
+    def setUp(self):
+        init_db()
+        self.context_mgr.ensure_default_facts()
+
     def test_01_sqlite_database_tables(self):
         """Проверка существования всех 8 таблиц и WAL-режима."""
-        conn = sqlite3.connect(str(DB_PATH))
+        conn = sqlite3.connect(str(get_db_path()))
         cur = conn.cursor()
         cur.execute("PRAGMA journal_mode;")
         mode = cur.fetchone()[0]

@@ -11,6 +11,9 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from test_isolation import activate_test_isolation
+
+activate_test_isolation()
 
 from auto_sender import AutoSender, QUEUE_FILE
 

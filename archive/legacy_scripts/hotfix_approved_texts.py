@@ -7,6 +7,7 @@ hotfix_approved_texts.py
 """
 
 import sys
+import os
 import re
 import json
 import random
@@ -14,9 +15,10 @@ import sqlite3
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "requests.db"
-PLATFORM_DB = BASE_DIR / "output" / "couchsurfing_platform.db"
-QUEUE_FILE = BASE_DIR / "output" / "requests_queue.json"
+OUTPUT_DIR = Path(os.environ.get("CS_OUTPUT_DIR", str(BASE_DIR / "output"))).resolve()
+DB_PATH = Path(os.environ.get("CS_DB_PATH", str(BASE_DIR / "requests.db"))).resolve()
+PLATFORM_DB = Path(os.environ.get("CS_DB_PATH", str(OUTPUT_DIR / "couchsurfing_platform.db"))).resolve()
+QUEUE_FILE = OUTPUT_DIR / "requests_queue.json"
 
 GREETINGS = [
     "Hi {name},",

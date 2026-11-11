@@ -25,16 +25,17 @@ import requests
 logger = logging.getLogger("HostingGuard")
 
 BASE_DIR = Path(__file__).parent
-OUTPUT_DIR = BASE_DIR / "output"
+OUTPUT_DIR = Path(os.environ.get("CS_OUTPUT_DIR", str(BASE_DIR / "output"))).resolve()
 REJECTED_FILE = OUTPUT_DIR / "rejected_hosts.json"
 GUARD_CACHE_FILE = OUTPUT_DIR / "hosting_guard_cache.json"
 
 DEFAULT_OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 DEFAULT_MODEL = "qwen2.5:7b"
 
-# Детерминированные стоп-паттерны (Case-Insensitive)
-RE_BLACKLIST_PATTERNS = [
-    # 1. Прямой отказ от хостинга
+# Детерминированные стоп-паттерны по категориям (Case-Insensitive)
+
+# 1. Однозначный явный отказ от хостинга (Explicit Refusal)
+PATTERNS_EXPLICIT_REFUSAL = [
     r"\bdo\s+not\s+send\s+(?:me\s+)?(?:home\s+|stay\s+)?requests?\b",
     r"\bnot\s+hosting\b",
     r"\bno\s+hosting\b",
@@ -52,8 +53,11 @@ RE_BLACKLIST_PATTERNS = [
     r"\bnot\s+hosting\s+(?:people|guests|anyone)\b",
     r"\bdo\s+not\s+host\b",
     r"\bdon['’]?t\s+host\b",
+]
 
-    # 2. Только гости женского пола (дисквалификация для заявителя-мужчины)
+# 2. Ограниченные предпочтения гостей и условий (Guest Restrictions)
+PATTERNS_GUEST_RESTRICTIONS = [
+    # Только гости женского пола (дисквалификация для заявителя-мужчины)
     r"\bfemale\s+guests?\s+only\b",
     r"\bonly\s+female\b",
     r"\bwomen\s+only\b",
@@ -65,23 +69,13 @@ RE_BLACKLIST_PATTERNS = [
     r"\bfemale\s+(?:travelers?|couchsurfers?|guests?)\s+only\b",
     r"\bonly\s+(?:host|accept)\s+(?:female|women|girls?)\b",
 
-    # 3. Путешествия / отсутствие в городе / за пределами Японии
-    r"\btrave[l]+ing(?:\s+solo)?\s+(?:through|in|around|across|europe|asia|south\s+america|latin\s+america|south\s+korea|america|world|abroad)\b",
-    r"\bcurrently\s+trave[l]+ing\b",
-    r"\bcurrently\s+(?:in|on|exploring|traveling(?:\s+solo)?\s+in|traveling(?:\s+solo)?\s+through)\s+(?!tokyo|japan|my\s+apartment|home\b)[a-z\s]+",
-    r"\bwho\s+is\s+trave[l]+ing\b",
-    r"\bexploring\s+(?:south\s+korea|europe|asia|vietnam|thailand|world|[a-z\s]+for\s+next)\b",
-    r"\bnot\s+in\s+japan\b",
-    r"\bcurrently\s+not\s+in\s+japan\b",
-    r"\bliving\s+in\s+(?!tokyo|japan)[a-z\s]+\s+now\b",
-
-    # 4. Проживание с родителями / семьей / нет собственного жилья
+    # Проживание с родителями / семьей / нет собственного жилья
     r"\b(?:live|living|staying)\s+(?:with|at)\s+(?:my\s+)?(?:parents|family)(?:\s+house)?\b",
     r"\blive\s+(?:in\s+)?(?:my\s+)?parents\s+house\b",
     r"\bparents['’]?\s+house\b",
     r"\bwith\s+my\s+family\s+and\s+(?:can['’]?t\s+host|no\s+space)\b",
 
-    # 5. Только встречи / кофе / бары
+    # Только встречи / кофе / бары (отказ от предоставления ночлега)
     r"\b(?:only|just)\s+(?:meet|coffee|hang|hangout|hang\s+out|drinks?|drink|walk|chat)\b",
     r"\b(?:only|just)\s+want\s+to\s+meet\b",
     r"\b(?:only|just)\s+available\s+(?:for|to)\s+(?:meet|coffee|drinks?)\b",
@@ -91,7 +85,7 @@ RE_BLACKLIST_PATTERNS = [
     r"\bmeet\s+up\s+only\b",
     r"\bavailable\s+for\s+hangout\s+only\b",
 
-    # 6. Отсутствие спального места или пространства
+    # Отсутствие спального места или пространства
     r"\bnot\s+enough\s+space\b",
     r"\bno\s+(?:spare\s+)?(?:bed|room|couch|space)\b",
     r"\bdon['’]?t\s+have\s+(?:a\s+)?(?:place|room|space|bed|couch)\b",
@@ -99,6 +93,17 @@ RE_BLACKLIST_PATTERNS = [
     r"\bmy\s+apartment\s+is\s+too\s+small\b",
 ]
 
+# 3. Несовпадение постоянного места проживания (Residence Mismatch)
+# Примечание: фразы общего характера вроде 'traveling around' или 'traveling abroad'
+# НЕ исключают профиль, так как не доказывают невозможность принять гостей в будущие даты поездки.
+PATTERNS_RESIDENCE_MISMATCH = [
+    r"\b(?:currently\s+)?not\s+in\s+japan\b",
+    r"\b(?:moved|relocated)\s+(?:away|out\s+of\s+japan)\b",
+    r"\bno\s+longer\s+living\s+in\s+japan\b",
+    r"\bpermanently\s+(?:living|moved)\s+in\s+(?!tokyo|japan|kyoto|osaka)[a-z\s]+\b",
+]
+
+RE_BLACKLIST_PATTERNS = PATTERNS_EXPLICIT_REFUSAL + PATTERNS_GUEST_RESTRICTIONS + PATTERNS_RESIDENCE_MISMATCH
 COMPILED_PATTERNS = [re.compile(p, re.IGNORECASE) for p in RE_BLACKLIST_PATTERNS]
 
 

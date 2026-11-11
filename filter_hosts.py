@@ -19,6 +19,7 @@ filter_hosts.py - Модуль глубокой постобработки и ф
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -41,7 +42,7 @@ if sys.platform == "win32":
         pass
 
 BASE_DIR = Path(__file__).parent
-OUTPUT_DIR = BASE_DIR / "output"
+OUTPUT_DIR = Path(os.environ.get("CS_OUTPUT_DIR", str(BASE_DIR / "output"))).resolve()
 USER_DATA_DIR = BASE_DIR / "user_data"
 AUTH_STATE_FILE = USER_DATA_DIR / "auth_state.json"
 
@@ -84,7 +85,9 @@ STOP_PATTERNS = [
     (r"\bexploring\s+(?:south\s+korea|europe|asia|vietnam|thailand|world|[a-z\s]+for\s+next)\b", "exploring abroad"),
     (r"not\s+in\s+japan", "not in japan"),
     (r"currently\s+not\s+in\s+japan", "currently not in japan"),
-    (r"currently\s+(?:in|on|exploring|traveling\s+in|traveling\s+through)\s+(?!tokyo|japan|my\s+apartment|home\b)[a-z\s]+", "currently outside tokyo/japan"),
+    (r"\bcurrently\s+(?:traveling|travelling|abroad|away|out\s+of\s+town|out\s+of\s+the\s+country)\b", "currently traveling/abroad"),
+    (r"\bcurrently\s+on\s+(?:a\s+)?(?:trip|vacation|holiday|tour|sabbatical|journey|the\s+road)\b", "currently on trip/vacation"),
+    (r"\bcurrently\s+(?:in|exploring)\s+(?:europe|asia|america|africa|australia|korea|taiwan|thailand|vietnam|bali|singapore|london|paris|usa|canada)\b", "currently traveling abroad"),
     (r"working\s+holiday", "working holiday"),
     (r"trave[l]+ing\s+around\s+the\s+world", "traveling around the world"),
     (r"\bindefinite\b", "indefinite travel"),
@@ -95,7 +98,7 @@ STOP_PATTERNS = [
     (r"refrain\s+from\s+sending\s+(?:stay\s+)?requests?", "refrain from sending requests"),
     (r"don't\s+offer\s+accommodation", "no accommodation"),
     (r"do\s+not\s+offer\s+accommodation", "no accommodation"),
-    (r"living\s+in\s+(?!tokyo|japan)[a-z\s]+\s+now", "living outside tokyo/japan"),
+    (r"living\s+in\s+(?!tokyo|japan|kyoto|osaka)[a-z\s]+\s+now", "living outside tokyo/japan"),
 
     # Проживание с родителями / семьей / нет места
     (r"(?:live|living|staying)\s+(?:with|at)\s+(?:my\s+)?(?:parents|family)(?:\s+house)?", "living with parents/family"),

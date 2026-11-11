@@ -15,6 +15,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
+from test_isolation import activate_test_isolation
+
+activate_test_isolation()
 
 import auto_sender as as_mod
 

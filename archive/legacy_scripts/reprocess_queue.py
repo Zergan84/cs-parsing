@@ -13,6 +13,7 @@ reprocess_queue.py - Аудит, жесткая фильтрация и пере
 
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -20,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 
 BASE_DIR = Path(__file__).parent
-OUTPUT_DIR = BASE_DIR / "output"
+OUTPUT_DIR = Path(os.environ.get("CS_OUTPUT_DIR", str(BASE_DIR / "output"))).resolve()
 QUEUE_FILE = OUTPUT_DIR / "requests_queue.json"
 BACKUP_FILE = OUTPUT_DIR / "requests_queue_before_reprocess.json"
 REJECTED_FILE = OUTPUT_DIR / "rejected_hosts.json"

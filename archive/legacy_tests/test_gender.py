@@ -13,6 +13,10 @@ from pathlib import Path
 BASE_DIR = Path(__file__).parent
 sys.path.insert(0, str(BASE_DIR))
 
+from test_isolation import activate_test_isolation, get_output_dir
+
+activate_test_isolation()
+
 from gender_classifier import LLMGenderClassifier, get_gender_classifier
 
 
@@ -21,8 +25,8 @@ def run_tests():
     print("🇯🇵 ТЕСТИРОВАНИЕ ГИБРИДНОГО КЛАССИФИКАТОРА ПОЛА (Лингвистика + Ollama + Кэш)")
     print("=" * 80)
 
-    # Используем изолированный кэш для чистоты измерений
-    test_cache = BASE_DIR / "output" / "test_gender_cache.json"
+    # Используем изолированный кэш во временной директории для чистоты измерений
+    test_cache = get_output_dir() / "test_gender_cache.json"
     if test_cache.exists():
         test_cache.unlink()
 

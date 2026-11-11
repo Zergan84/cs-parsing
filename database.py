@@ -17,6 +17,7 @@ database.py - Высоконадежный слой персистентност
 
 import json
 import logging
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
@@ -26,14 +27,15 @@ from typing import Any, Dict, Generator, List, Optional, Tuple
 logger = logging.getLogger("Database")
 
 BASE_DIR = Path(__file__).parent
-OUTPUT_DIR = BASE_DIR / "output"
-DB_PATH = OUTPUT_DIR / "couchsurfing_platform.db"
+OUTPUT_DIR = Path(os.environ.get("CS_OUTPUT_DIR", str(BASE_DIR / "output"))).resolve()
+DB_PATH = Path(os.environ.get("CS_DB_PATH", str(OUTPUT_DIR / "couchsurfing_platform.db"))).resolve()
 
 
 def get_db_connection() -> sqlite3.Connection:
     """Создает потокобезопасное подключение к SQLite с поддержкой WAL и foreign keys."""
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH), timeout=30.0, check_same_thread=False)
+    db_path = Path(os.environ.get("CS_DB_PATH", str(DB_PATH))).resolve()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path), timeout=30.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
@@ -72,6 +74,7 @@ def init_db() -> None:
             status TEXT NOT NULL DEFAULT 'confirmed', -- confirmed | assumption | temporary | outdated
             source TEXT DEFAULT 'user_curated',
             confidence REAL DEFAULT 1.0,
+            priority INTEGER DEFAULT 1,
             is_active INTEGER DEFAULT 1,
             valid_until TEXT,
             created_at TEXT NOT NULL,
@@ -80,6 +83,22 @@ def init_db() -> None:
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_pcf_category ON personal_context_facts(category);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_pcf_active ON personal_context_facts(is_active);")
+
+        # 1.1 Якоря совместимости (Compatibility Anchors)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS compatibility_anchors (
+            anchor_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            category TEXT NOT NULL,
+            keywords_json TEXT NOT NULL,
+            description TEXT,
+            priority INTEGER DEFAULT 1,
+            is_active INTEGER DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ca_active ON compatibility_anchors(is_active);")
 
         # 2. Хосты Couchsurfing
         cursor.execute("""
@@ -121,6 +140,7 @@ def init_db() -> None:
             conversation_hooks_json TEXT, -- List[str]
             compatibility_points_json TEXT, -- List[Dict]
             conversation_strategy TEXT,
+            compatibility_score REAL DEFAULT NULL,
             analyzed_at TEXT NOT NULL,
             FOREIGN KEY (host_id) REFERENCES hosts(id) ON DELETE CASCADE
         );
@@ -137,6 +157,11 @@ def init_db() -> None:
             word_count INTEGER NOT NULL,
             hook_used TEXT,
             context_facts_used_json TEXT, -- List of fact_ids
+            anchor_used TEXT,
+            host_fact_used TEXT,
+            user_fact_used TEXT,
+            confidence REAL,
+            fallback_used INTEGER DEFAULT 0,
             qc_passed INTEGER DEFAULT 1,
             qc_notes TEXT,
             is_active INTEGER DEFAULT 1,
@@ -255,21 +280,221 @@ def init_db() -> None:
                 (k, v, datetime.now().isoformat()),
             )
 
-        # Очистка зависших статусов 'sending' при инициализации
-        cursor.execute("UPDATE sending_queue SET status = 'Approved' WHERE LOWER(status) = 'sending';")
+        # Очистка зависших статусов 'sending' при инициализации:
+        # ВНИМАНИЕ: перевод в 'Verification_Required', чтобы предотвратить несанкционированную повторную отправку
+        cursor.execute("UPDATE sending_queue SET status = 'Verification_Required', notes = 'Recovered from interrupted sending' WHERE LOWER(status) = 'sending';")
+
+        # 10. Таблицы подсистемы Host Dossier и анализа фотографий
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS photo_assets (
+            id TEXT PRIMARY KEY,
+            image_hash TEXT UNIQUE NOT NULL,
+            local_path TEXT NOT NULL,
+            file_size INTEGER,
+            mime_type TEXT,
+            llava_raw_response TEXT,
+            detected_objects_json TEXT,
+            detected_topics_json TEXT,
+            model TEXT NOT NULL DEFAULT 'llava:latest',
+            analysis_status TEXT NOT NULL DEFAULT 'completed',
+            analyzed_at TEXT,
+            created_at TEXT NOT NULL,
+            incomplete_source_metadata INTEGER DEFAULT 0
+        );
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_pa_hash ON photo_assets(image_hash);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_pa_path ON photo_assets(local_path);")
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS host_photos (
+            id TEXT PRIMARY KEY,
+            host_id TEXT NOT NULL,
+            photo_asset_id TEXT NOT NULL,
+            original_url TEXT,
+            photo_page_url TEXT,
+            photo_order INTEGER,
+            is_avatar INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (host_id) REFERENCES hosts(id) ON DELETE CASCADE,
+            FOREIGN KEY (photo_asset_id) REFERENCES photo_assets(id) ON DELETE CASCADE,
+            UNIQUE(host_id, photo_asset_id)
+        );
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hp_host ON host_photos(host_id);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hp_asset ON host_photos(photo_asset_id);")
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS visual_observations (
+            id TEXT PRIMARY KEY,
+            host_id TEXT NOT NULL,
+            photo_asset_id TEXT NOT NULL,
+            observation TEXT NOT NULL,
+            category TEXT NOT NULL,
+            evidence_confidence REAL NOT NULL DEFAULT 0.95,
+            raw_description TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (host_id) REFERENCES hosts(id) ON DELETE CASCADE,
+            FOREIGN KEY (photo_asset_id) REFERENCES photo_assets(id) ON DELETE CASCADE
+        );
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_vo_host ON visual_observations(host_id);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_vo_obs ON visual_observations(observation);")
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS host_interests (
+            id TEXT PRIMARY KEY,
+            host_id TEXT NOT NULL,
+            interest_name TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT 'general',
+            source TEXT NOT NULL,
+            confirming_facts_json TEXT,
+            source_refs_json TEXT,
+            confidence REAL NOT NULL DEFAULT 0.5,
+            status TEXT NOT NULL DEFAULT 'uncertain',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (host_id) REFERENCES hosts(id) ON DELETE CASCADE
+        );
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hi_host ON host_interests(host_id);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hi_conf ON host_interests(confidence);")
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS host_places (
+            id TEXT PRIMARY KEY,
+            host_id TEXT NOT NULL,
+            place_name TEXT NOT NULL,
+            place_type TEXT NOT NULL,
+            country TEXT,
+            city TEXT,
+            landmark TEXT,
+            source TEXT NOT NULL,
+            confidence REAL NOT NULL DEFAULT 0.5,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (host_id) REFERENCES hosts(id) ON DELETE CASCADE
+        );
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hpl_host ON host_places(host_id);")
+
+        # 17. Связка хостов с конкретными поездками (Trip Cards Isolation)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS trip_hosts (
+            trip_id TEXT NOT NULL,
+            host_id TEXT NOT NULL,
+            city TEXT,
+            arrival_date TEXT,
+            departure_date TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (trip_id, host_id)
+        );
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_th_trip ON trip_hosts(trip_id);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_th_host ON trip_hosts(host_id);")
+
+        # 18. Реальные поездки пользователя (User Trips single source of truth)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_trips (
+            trip_id TEXT PRIMARY KEY,
+            city TEXT NOT NULL,
+            arrival_date TEXT,
+            departure_date TEXT,
+            dates_text TEXT,
+            url TEXT,
+            is_active INTEGER DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ut_city ON user_trips(city);")
+
+        # Безопасная миграция: compatibility_score в profile_analyses (DEFAULT NULL, никаких фиктивных 90.0)
+        cursor.execute("PRAGMA table_info(profile_analyses);")
+        pa_cols_info = {r[1]: r for r in cursor.fetchall()}
+        if "compatibility_score" not in pa_cols_info:
+            cursor.execute("ALTER TABLE profile_analyses ADD COLUMN compatibility_score REAL DEFAULT NULL;")
+            logger.info("Безопасная миграция: добавлена колонка compatibility_score в profile_analyses.")
+        elif pa_cols_info["compatibility_score"][4] not in (None, "NULL"):
+            cursor.execute("ALTER TABLE profile_analyses DROP COLUMN compatibility_score;")
+            cursor.execute("ALTER TABLE profile_analyses ADD COLUMN compatibility_score REAL DEFAULT NULL;")
+            logger.info("Миграция: дефолт compatibility_score обновлен на NULL.")
+
+        # Очистка фиктивных оценок 90.0, если колонка не рассчитывается реально
+        cursor.execute("UPDATE profile_analyses SET compatibility_score = NULL WHERE compatibility_score = 90.0;")
+
+        # Безопасная миграция: priority в personal_context_facts
+        cursor.execute("PRAGMA table_info(personal_context_facts);")
+        pcf_cols = [r[1] for r in cursor.fetchall()]
+        if "priority" not in pcf_cols:
+            cursor.execute("ALTER TABLE personal_context_facts ADD COLUMN priority INTEGER DEFAULT 1;")
+            logger.info("Безопасная миграция: добавлена колонка priority в personal_context_facts.")
+
+        # Безопасная миграция: метаданные Context Assembler в generated_messages
+        cursor.execute("PRAGMA table_info(generated_messages);")
+        gm_cols = [r[1] for r in cursor.fetchall()]
+        if "anchor_used" not in gm_cols:
+            cursor.execute("ALTER TABLE generated_messages ADD COLUMN anchor_used TEXT DEFAULT NULL;")
+        if "host_fact_used" not in gm_cols:
+            cursor.execute("ALTER TABLE generated_messages ADD COLUMN host_fact_used TEXT DEFAULT NULL;")
+        if "user_fact_used" not in gm_cols:
+            cursor.execute("ALTER TABLE generated_messages ADD COLUMN user_fact_used TEXT DEFAULT NULL;")
+        if "confidence" not in gm_cols:
+            cursor.execute("ALTER TABLE generated_messages ADD COLUMN confidence REAL DEFAULT NULL;")
+        if "fallback_used" not in gm_cols:
+            cursor.execute("ALTER TABLE generated_messages ADD COLUMN fallback_used INTEGER DEFAULT 0;")
+
+        # Инициализация дефолтных якорей совместимости, если таблица пуста
+        cursor.execute("SELECT COUNT(*) FROM compatibility_anchors;")
+        if cursor.fetchone()[0] == 0:
+            import json
+            now_iso = datetime.now().isoformat()
+            default_anchors = [
+                ("anchor_photo", "Photography", "Creative & Visual", json.dumps(["photo", "photography", "camera", "street photography", "portrait", "visual art", "photographer"]), "Стрит-фотография, визуальное искусство, композиция, объективы", 2, 1),
+                ("anchor_cinema", "Cinema & Filmmaking", "Creative & Visual", json.dumps(["film", "cinema", "movies", "director", "filmmaking", "screenwriting", "video", "documentary", "cannes", "arthouse"]), "Кинематограф, режиссура, авторское кино, Каннский фестиваль", 2, 1),
+                ("anchor_mountains", "Mountains / Outdoor / Ski", "Nature & Adventure", json.dumps(["mountain", "mountains", "hiking", "trek", "trekking", "climb", "ski", "skiing", "snowboard", "alps", "nature", "outdoor", "trail", "nepal"]), "Горнолыжный спорт, треккинг в Непале, перевалы, горная природа", 2, 1),
+                ("anchor_music", "Music & Sound", "Culture & Arts", json.dumps(["music", "piano", "classical", "ambient", "guitar", "instruments", "concert", "vinyl", "audio", "jazz", "acoustic"]), "Фортепиано, эмбиент, классическая музыка, акустика, джаз", 1, 1),
+                ("anchor_tech", "Technology / Startups / AI", "Technology & Business", json.dumps(["tech", "software", "developer", "coding", "programming", "python", "ai", "machine learning", "startup", "engineering", "web"]), "IT-разработка, искусственный интеллект, стартапы, автоматизация", 2, 1),
+                ("anchor_food", "Food & Cooking", "Lifestyle", json.dumps(["food", "cook", "cooking", "culinary", "cuisine", "gastronomy", "local food", "coffee", "tea", "wine", "ramen", "baking"]), "Кулинарные традиции, локальные вкусы, домашняя кухня, кофе/чай", 1, 1),
+                ("anchor_culture_lang", "Culture & Languages", "Culture & Arts", json.dumps(["language", "languages", "culture", "cultural exchange", "expat", "linguistics", "travel stories", "multilingual", "asia", "hong kong"]), "Межкультурный обмен, языки (EN/FR/RU), жизнь в Азии, путешествия", 1, 1),
+            ]
+            for a_id, a_name, a_cat, a_kw, a_desc, a_prio, a_act in default_anchors:
+                cursor.execute("""
+                INSERT OR IGNORE INTO compatibility_anchors (anchor_id, name, category, keywords_json, description, priority, is_active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """, (a_id, a_name, a_cat, a_kw, a_desc, a_prio, a_act, now_iso, now_iso))
+            logger.info("Таблица compatibility_anchors успешно инициализирована базовыми якорями.")
 
     logger.info("База данных SQLite успешно инициализирована с таблицами и индексами.")
 
 
 def reset_stuck_sending_statuses() -> int:
-    """Сбрасывает зависшие статусы 'sending' обратно в 'Approved'."""
+    """Переводит зависшие статусы 'sending' в 'Verification_Required' для защиты от повторной отправки."""
     try:
         with db_session() as conn:
             cur = conn.cursor()
-            cur.execute("UPDATE sending_queue SET status = 'Approved' WHERE LOWER(status) = 'sending';")
+            cur.execute("UPDATE sending_queue SET status = 'Verification_Required', notes = 'Stuck sending status recovered to verification' WHERE LOWER(status) = 'sending';")
             count = cur.rowcount
             return count
     except Exception as e:
+        logger.warning(f"Ошибка сброса зависших статусов 'sending': {e}")
+        return 0
+
+
+def reset_stuck_background_jobs() -> int:
+    """Переводит незавершенные задачи background_jobs со статусом 'running' в 'interrupted'."""
+    try:
+        with db_session() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE background_jobs 
+                SET status = 'interrupted', 
+                    message = 'Server restarted while process was running',
+                    finished_at = CURRENT_TIMESTAMP 
+                WHERE status = 'running';
+            """)
+            return cur.rowcount
+    except Exception as e:
+        logger.warning(f"Ошибка сброса зависших задач background_jobs: {e}")
+        return 0
         logger.warning(f"Ошибка сброса зависших статусов 'sending': {e}")
         return 0
 
@@ -350,8 +575,10 @@ def get_sent_usernames() -> set:
     except Exception as e:
         logger.debug(f"Ошибка чтения отправленных из SQLite: {e}")
 
+    out_dir = Path(os.environ.get("CS_OUTPUT_DIR", str(OUTPUT_DIR))).resolve()
+
     # 2. Из sent_history.json
-    sent_hist_path = OUTPUT_DIR / "sent_history.json"
+    sent_hist_path = out_dir / "sent_history.json"
     if sent_hist_path.exists():
         try:
             with open(sent_hist_path, "r", encoding="utf-8") as f:
@@ -363,7 +590,7 @@ def get_sent_usernames() -> set:
             pass
 
     # 3. Из sent_log.json
-    sent_log_path = OUTPUT_DIR / "sent_log.json"
+    sent_log_path = out_dir / "sent_log.json"
     if sent_log_path.exists():
         try:
             with open(sent_log_path, "r", encoding="utf-8") as f:
@@ -384,7 +611,7 @@ def get_sent_usernames() -> set:
             pass
 
     # 4. Из requests_queue.json: только реальный Sent с датой или явным подтверждением.
-    queue_path = OUTPUT_DIR / "requests_queue.json"
+    queue_path = out_dir / "requests_queue.json"
     if queue_path.exists():
         try:
             with open(queue_path, "r", encoding="utf-8") as f:
@@ -544,6 +771,108 @@ def mark_host_declined(host_username: str) -> None:
                 SELECT id FROM hosts WHERE LOWER(username) = LOWER(?) OR LOWER(id) = LOWER(?)
             ) OR LOWER(host_id) = LOWER(?);
         """, (host_username.strip(), host_username.strip(), host_username.strip()))
+
+
+def get_host_dossier(host_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Формирует единое досье хоста (Host Dossier) с учетом provenance и confidence.
+    Интегрирует данные профиля, визуальные наблюдения LLaVA, подтвержденные интересы и географию.
+    """
+    if not host_id:
+        return None
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM hosts WHERE LOWER(id) = LOWER(?) OR LOWER(username) = LOWER(?);", (host_id, host_id))
+        host_row = cur.fetchone()
+        if not host_row:
+            return None
+        h_data = dict(host_row)
+
+        actual_id = h_data.get("id") or host_id
+        u_name = h_data.get("username") or host_id
+
+        # Profile analysis
+        cur.execute("SELECT * FROM profile_analyses WHERE host_id = ? OR host_id = ?;", (actual_id, u_name))
+        pa_row = cur.fetchone()
+        analysis = dict(pa_row) if pa_row else {}
+
+        # Interests with confidence and provenance
+        cur.execute("""
+            SELECT interest_name, category, source, confirming_facts_json, confidence, status
+            FROM host_interests
+            WHERE host_id = ? OR host_id = ?
+            ORDER BY confidence DESC;
+        """, (actual_id, u_name))
+        interests = []
+        for r in cur.fetchall():
+            facts = []
+            if r["confirming_facts_json"]:
+                try:
+                    facts = json.loads(r["confirming_facts_json"])
+                except Exception:
+                    facts = []
+            interests.append({
+                "name": r["interest_name"],
+                "category": r["category"],
+                "source": r["source"],
+                "facts": facts,
+                "confidence": float(r["confidence"] or 0.5),
+                "status": r["status"] or "uncertain"
+            })
+
+        # Places
+        cur.execute("""
+            SELECT place_name, place_type, country, city, source, confidence
+            FROM host_places
+            WHERE host_id = ? OR host_id = ?
+            ORDER BY confidence DESC;
+        """, (actual_id, u_name))
+        places = []
+        for r in cur.fetchall():
+            places.append({
+                "name": r["place_name"],
+                "type": r["place_type"],
+                "country": r["country"],
+                "city": r["city"],
+                "source": r["source"],
+                "confidence": float(r["confidence"] or 0.5)
+            })
+
+        # Visual observations from photos (provenance: photo_assets)
+        cur.execute("""
+            SELECT vo.observation, vo.category, vo.evidence_confidence, pa.local_path, pa.model
+            FROM visual_observations vo
+            LEFT JOIN photo_assets pa ON vo.photo_asset_id = pa.id
+            WHERE vo.host_id = ? OR vo.host_id = ?
+            ORDER BY vo.evidence_confidence DESC;
+        """, (actual_id, u_name))
+        visual_obs = []
+        for r in cur.fetchall():
+            visual_obs.append({
+                "observation": r["observation"],
+                "category": r["category"],
+                "confidence": float(r["evidence_confidence"] or 0.9),
+                "photo_path": r["local_path"]
+            })
+
+        return {
+            "host_id": actual_id,
+            "username": h_data.get("username"),
+            "name": h_data.get("name"),
+            "clean_name": h_data.get("clean_name"),
+            "location": h_data.get("location"),
+            "about_me": h_data.get("about_me"),
+            "about_me_clean": h_data.get("about_me_clean"),
+            "analysis": analysis,
+            "interests": interests,
+            "places": places,
+            "visual_observations": visual_obs,
+        }
+
+
+def get_host_dossier_v2(host_id: str) -> Optional[Dict[str, Any]]:
+    """Alias for backwards compatibility with v2 dossier scripts."""
+    return get_host_dossier(host_id)
 
 
 if __name__ == "__main__":

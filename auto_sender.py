@@ -19,9 +19,16 @@ import json
 import os
 import random
 import re
+import signal
 import sqlite3
 import sys
 import time
+
+try:
+    if hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+except Exception:
+    pass
 from datetime import datetime, date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -38,7 +45,7 @@ if sys.platform == "win32":
         pass
 
 BASE_DIR = Path(__file__).parent
-OUTPUT_DIR = BASE_DIR / "output"
+OUTPUT_DIR = Path(os.environ.get("CS_OUTPUT_DIR", str(BASE_DIR / "output"))).resolve()
 DEBUG_DIR = OUTPUT_DIR / "debug"
 USER_DATA_DIR = BASE_DIR / "user_data"
 AUTH_STATE_FILE = USER_DATA_DIR / "auth_state.json"
@@ -57,7 +64,11 @@ def sanitize_before_send(text: str, host_clean_name: Optional[str] = None) -> st
     if not lines:
         return text
 
-    first_line = lines[0]
+    first_line = lines[0].strip()
+    # Если приветствие уже чистое ("Hi Name," или "Hello Name,"), не искажаем пунктуацию
+    if re.match(r'^(Hi|Hello|Hey)\s+[A-Za-zА-Яа-яЁё]+,\s*$', first_line):
+        return text
+
     fake_placeholders = {"there", "host", "user", "member", "unknown", "none", "null"}
 
     # Ловим паттерны "Hey Name,", "Hi Name:", "Hello!" и чистим мусорные суффиксы
@@ -127,10 +138,19 @@ def compute_randomized_delays(num_messages: int, period_minutes: int) -> List[fl
 
 
 def log_step(category: str, message: str) -> str:
-    """Выводит форматированную строку лога с таймштампом."""
+    """Выводит форматированную строку лога с таймштампом, защищенную от обрыва stdout-пайпа."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] [{category}] {message}"
-    print(line, flush=True)
+    try:
+        print(line, flush=True)
+    except (BrokenPipeError, IOError, OSError):
+        pass
+    try:
+        log_file = OUTPUT_DIR / "auto_sender.log"
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
     return line
 
 
@@ -150,6 +170,7 @@ class AutoSender:
         headless: bool = True,
         target_username: Optional[str] = None,
         test_mode: bool = False,
+        trip_id: Optional[str] = None,
     ):
         self.daily_limit = max(1, daily_limit)
         self.delay_min = delay_min
@@ -164,8 +185,10 @@ class AutoSender:
         self.headless = headless
         self.target_username = target_username
         self.test_mode = test_mode
+        self.trip_id = trip_id
         self.is_running = True
         self.is_paused = False
+        self._start_timestamp = time.time()
 
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         DEBUG_DIR.mkdir(parents=True, exist_ok=True)
@@ -344,8 +367,63 @@ class AutoSender:
                         """,
                         (new_status, effective_sent_at, effective_sent_at, int(clear_sent_at), now_iso, username, username),
                     )
-        except Exception:
-            pass
+
+                # Синхронизация в единый источник истины core_hosts (ТЗ)
+                st_map = {
+                    "sent": "sent",
+                    "was sent": "sent",
+                    "skipped": "skipped",
+                    "failed": "skipped",
+                    "approved": "approved",
+                    "queued": "selected",
+                    "qc_review_required": "drafted",
+                    "draft": "drafted",
+                }
+                c_st = st_map.get(status_norm)
+                if c_st:
+                    cur.execute(
+                        """
+                        UPDATE core_hosts
+                        SET state = ?,
+                            sent_at = CASE WHEN ? = 'sent' THEN coalesce(sent_at, ?) ELSE sent_at END,
+                            qc_notes = CASE WHEN ? = 'skipped' THEN coalesce(?, qc_notes) ELSE qc_notes END,
+                            updated_at = ?
+                        WHERE (LOWER(username) = LOWER(?) OR LOWER(host_id) = LOWER(?));
+                        """,
+                        (c_st, c_st, effective_sent_at or now_iso, c_st, notes, now_iso, username, username),
+                    )
+        except Exception as e:
+            log_step("WARN", f"Ошибка синхронизации статуса: {e}")
+
+    def move_host_to_end_of_queue(self, username: str, reason: str = "") -> None:
+        """Перемещает проблемного хоста в самый конец очереди (вниз левого стакана) без остановки автопилота."""
+        now_iso = datetime.now().isoformat()
+        try:
+            from database import db_session
+            with db_session() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    UPDATE sending_queue
+                    SET priority = COALESCE(priority, 0) - 100,
+                        notes = ?,
+                        updated_at = ?
+                    WHERE host_id IN (SELECT id FROM hosts WHERE LOWER(username) = LOWER(?) OR LOWER(id) = LOWER(?));
+                    """,
+                    (f"Moved to bottom of queue: {reason}", now_iso, username, username),
+                )
+                cur.execute(
+                    """
+                    UPDATE core_hosts
+                    SET qc_notes = ?,
+                        updated_at = ?
+                    WHERE (LOWER(username) = LOWER(?) OR LOWER(host_id) = LOWER(?));
+                    """,
+                    (f"Moved to bottom: {reason}", now_iso, username, username),
+                )
+            log_step("QUEUE", f"Хост @{username} перемещен в конец очереди (priority -100). Причина: {reason}")
+        except Exception as e:
+            log_step("WARN", f"Ошибка перемещения @{username} в конец очереди: {e}")
 
     def sync_queue_against_sent_and_inbox(self, page=None) -> int:
         """
@@ -370,7 +448,7 @@ class AutoSender:
                         try:
                             if "json" in res.headers.get("content-type", ""):
                                 data = res.json()
-                                from sync_sent_requests import extract_members_from_json
+                                from data_cleaner import extract_members_from_json
                                 extract_members_from_json(data, chat_members)
                         except Exception:
                             pass
@@ -422,6 +500,19 @@ class AutoSender:
             with open(STATUS_FILE, "r", encoding="utf-8") as f:
                 d = json.load(f)
                 return bool(d.get("is_paused"))
+        except Exception:
+            return False
+
+    def check_is_stopped(self) -> bool:
+        """Проверяет флаг остановки автопилота из файла статуса с защитным периодом при старте."""
+        if hasattr(self, "_start_timestamp") and (time.time() - self._start_timestamp < 4.0):
+            return False
+        if not STATUS_FILE.exists():
+            return False
+        try:
+            with open(STATUS_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                return d.get("is_running") is False
         except Exception:
             return False
 
@@ -505,9 +596,21 @@ class AutoSender:
 
     def human_type(self, element, text: str) -> None:
         """Имитирует естественный человеческий ввод текста с жесткими таймаутами."""
-        element.click(timeout=10000)
-        time.sleep(random.uniform(0.3, 0.6))
-        element.fill("", timeout=10000)
+        try:
+            element.click(timeout=5000)
+        except Exception:
+            try:
+                element.click(force=True, timeout=5000)
+            except Exception:
+                try:
+                    element.focus(timeout=5000)
+                except Exception:
+                    pass
+        time.sleep(random.uniform(0.2, 0.4))
+        try:
+            element.fill("", timeout=5000)
+        except Exception:
+            pass
 
         if len(text) > 400:
             first_part = text[:70]
@@ -527,38 +630,44 @@ class AutoSender:
     def get_host_dates_and_city(self, host_item: Dict[str, Any]) -> Tuple[str, str, str]:
         """
         Считывает даты и город кандидата из объекта host_item и базы данных SQLite.
+        Приоритет отдается городу и датам Trip Card, так как на CS сопоставляется карточка поездки.
         """
         username = host_item.get("username", "")
         arrival_date = host_item.get("arrival_date") or host_item.get("check_in")
         departure_date = host_item.get("departure_date") or host_item.get("check_out")
         target_city = (
-            host_item.get("target_city")
+            host_item.get("trip_city")
             or host_item.get("city")
-            or host_item.get("location")
+            or host_item.get("target_city")
         )
 
         # Синхронизация с базой данных output/couchsurfing_platform.db
-        db_path = OUTPUT_DIR / "couchsurfing_platform.db"
+        db_path = Path(os.environ.get("CS_DB_PATH", str(OUTPUT_DIR / "couchsurfing_platform.db"))).resolve()
         if db_path.exists() and username:
             conn = None
             try:
                 conn = sqlite3.connect(db_path)
                 cursor = conn.cursor()
                 cursor.execute("""
-                    SELECT h.location, gm.check_in, gm.check_out
+                    SELECT 
+                        COALESCE(ut.city, th.city, gm.target_city, h.location) as trip_city,
+                        COALESCE(gm.check_in, th.arrival_date, ut.arrival_date) as cin,
+                        COALESCE(gm.check_out, th.departure_date, ut.departure_date) as cout
                     FROM hosts h
+                    LEFT JOIN trip_hosts th ON (th.host_id = h.id OR LOWER(th.host_id) = LOWER(h.username))
+                    LEFT JOIN user_trips ut ON th.trip_id = ut.trip_id
                     LEFT JOIN generated_messages gm ON gm.host_id = h.id AND gm.is_active = 1
                     WHERE h.username = ? OR h.id = ?
-                    ORDER BY gm.id DESC LIMIT 1
+                    ORDER BY th.created_at DESC, gm.id DESC LIMIT 1
                 """, (username, username))
                 row = cursor.fetchone()
                 if row:
-                    db_loc, db_cin, db_cout = row
-                    if db_loc and not host_item.get("target_city"):
-                        target_city = db_loc
-                    if db_cin:
+                    db_city, db_cin, db_cout = row
+                    if db_city and not target_city:
+                        target_city = db_city
+                    if db_cin and not arrival_date:
                         arrival_date = db_cin
-                    if db_cout:
+                    if db_cout and not departure_date:
                         departure_date = db_cout
             except Exception:
                 pass
@@ -577,8 +686,24 @@ class AutoSender:
             if known.lower() in raw_lower:
                 clean_city = known
                 break
+
+        tokyo_districts = [
+            "kinshi", "sumida", "meguro", "shibuya", "shinjuku", "minato", "chuo", "chiyoda",
+            "ota", "shinagawa", "setagaya", "nakano", "suginami", "toshima", "kita", "arakawa",
+            "itabashi", "nerima", "adachi", "katsushika", "edogawa", "koto", "taito",
+            "nihonbashi", "ginza", "roppongi", "akihabara", "ueno", "asakusa"
+        ]
         if not clean_city:
-            clean_city = target_city.split(",")[0].strip() or "Tokyo"
+            if (self.trip_id and "tokyo" in self.trip_id.lower()) or any(d in raw_lower for d in tokyo_districts):
+                clean_city = "Tokyo"
+            elif self.trip_id and "kyoto" in self.trip_id.lower():
+                clean_city = "Kyoto"
+            elif self.trip_id and "osaka" in self.trip_id.lower():
+                clean_city = "Osaka"
+            elif self.trip_id and "sapporo" in self.trip_id.lower():
+                clean_city = "Sapporo"
+            else:
+                clean_city = target_city.split(",")[0].strip() or "Tokyo"
 
         return arrival_date, departure_date, clean_city
 
@@ -619,6 +744,9 @@ class AutoSender:
     ALREADY_SENT_PHRASES = (
         "you sent a request to",
         "this user needs to accept your request before you can send another message",
+        "view chat request",
+        "view stay request",
+        "request pending",
     )
 
     def detect_already_sent(self, page) -> Optional[str]:
@@ -730,6 +858,10 @@ class AutoSender:
 
     def is_trip_selection_screen(self, page) -> bool:
         try:
+            if page.locator('button[data-testid="trip-cards-trip-gallery-card-overlay-button"]').count() > 0:
+                return True
+            if page.locator('[data-testid*="trip-selector"]').count() > 0:
+                return True
             loc = page.get_by_text("Which trip is this stay for?")
             return loc.count() > 0 and loc.first.is_visible()
         except Exception:
@@ -752,6 +884,26 @@ class AutoSender:
         Находит карточку поездки по городу (+ даты для приоритета) и кликает её overlay-кнопку.
         Карточка = ближайший предок overlay-кнопки (button.absolute.inset-0), содержащий ровно одну такую кнопку.
         """
+        # 1. Прямой поиск кнопки через data-testid с совпадением города в aria-label
+        try:
+            gallery_btns = page.locator('button[data-testid="trip-cards-trip-gallery-card-overlay-button"]')
+            if gallery_btns.count() > 0:
+                for idx in range(gallery_btns.count()):
+                    b = gallery_btns.nth(idx)
+                    label = (b.get_attribute("aria-label") or "").strip()
+                    if city.lower() in label.lower():
+                        b.click(timeout=8000)
+                        log_step("TRIP", f"Выбрана карточка поездки из галереи: '{label}'")
+                        return True
+                # Если точный город не найден в aria-label, кликаем первую карточку
+                first_btn = gallery_btns.first
+                first_label = (first_btn.get_attribute("aria-label") or "").strip()
+                first_btn.click(timeout=8000)
+                log_step("TRIP", f"Выбрана первая доступная карточка поездки: '{first_label}'")
+                return True
+        except Exception as e:
+            log_step("DEBUG", f"Галерея trip-cards поиск: {e}")
+
         date_hint = self._trip_date_hint(arrival_date, departure_date)
         js = r"""
         ({city, dateHint}) => {
@@ -831,6 +983,7 @@ class AutoSender:
         departure_date: str,
         before_screenshot: Path,
         found_selector: str,
+        message: str = "",
     ) -> None:
         """
         Пишет результат тестового прогона (dry-run) только в sent_log.json.
@@ -851,6 +1004,7 @@ class AutoSender:
             "before_screenshot": str(before_screenshot),
             "button_selector": found_selector,
             "notes": "Form verified and filled in dry-run mode. Send button was not clicked.",
+            "message": message,
         })
 
     def process_host(self, page, host_item: Dict[str, Any]) -> bool:
@@ -863,6 +1017,70 @@ class AutoSender:
         message = host_item.get("generated_message", "")
         arrival_date, departure_date, target_city = self.get_host_dates_and_city(host_item)
         stay_url = f"https://www.couchsurfing.com/c/users/{username}/stay-request"
+
+        # Предохранитель Pre-flight QC: жесткая проверка перед запуском браузера
+        from llm_agent import validate_message_qc
+        from message_generator import verify_host_name
+
+        first_name, is_trusted = verify_host_name(host_item)
+        if not is_trusted or not first_name:
+            log_step("WARN", f"Остановка отправки @{username}: сомнительное имя '{host_item.get('name')}'. Требуется проверка.")
+            self.update_queue_status(username, "Name_Review_Required", notes="Untrusted display name; manual review required.")
+            return False
+
+        if not message or not message.strip():
+            log_step("WARN", f"Остановка отправки @{username}: пустое сообщение.")
+            self.update_queue_status(username, "Draft", notes="Missing message text.")
+            return False
+
+        bio_words = len((host_item.get("about_me_clean") or host_item.get("about_me") or "").split())
+        is_minimal = bio_words < 25
+        qc_ok, qc_issues = validate_message_qc(
+            message,
+            is_minimal_bio=is_minimal,
+            host_data=host_item,
+            trip_city=host_item.get("city") or host_item.get("trip_city"),
+        )
+        if not qc_ok:
+            log_step("WARN", f"Сообщение для @{username} не прошло QC ({', '.join(qc_issues)}). Пробуем авто-перегенерацию...")
+            try:
+                from message_generator import generate_stay_request
+                regen_msg = generate_stay_request(
+                    host_item,
+                    check_in=arrival_date,
+                    check_out=departure_date,
+                )
+                regen_qc_ok, regen_qc_issues = validate_message_qc(
+                    regen_msg,
+                    is_minimal_bio=is_minimal,
+                    host_data=host_item,
+                    trip_city=target_city,
+                )
+                if regen_qc_ok:
+                    log_step("INFO", f"Успешная авто-перегенерация для @{username} ({len(regen_msg.split())} слов).")
+                    message = regen_msg
+                    host_item["generated_message"] = regen_msg
+                    from database import db_session
+                    with db_session() as conn:
+                        cur = conn.cursor()
+                        cur.execute(
+                            "UPDATE core_hosts SET message_draft = ?, qc_passed = 1, qc_notes = 'Auto-regenerated passed QC' WHERE LOWER(username) = LOWER(?)",
+                            (regen_msg, username),
+                        )
+                        cur.execute(
+                            "UPDATE generated_messages SET message_text = ? WHERE host_id IN (SELECT id FROM hosts WHERE LOWER(username) = LOWER(?))",
+                            (regen_msg, username),
+                        )
+                    qc_ok = True
+                else:
+                    log_step("WARN", f"Перегенерация для @{username} не прошла QC: {', '.join(regen_qc_issues)}.")
+            except Exception as ex:
+                log_step("WARN", f"Ошибка авто-перегенерации для @{username}: {ex}")
+
+        if not qc_ok:
+            log_step("WARN", f"Остановка отправки @{username}: сообщение не прошло QC ({', '.join(qc_issues)}).")
+            self.update_queue_status(username, "QC_Review_Required", notes=f"Pre-dispatch QC: {', '.join(qc_issues)}")
+            return "QC_FAILED"
 
         before_screenshot = DEBUG_DIR / f"before_send_{username}.png"
         after_screenshot = DEBUG_DIR / f"after_send_{username}.png"
@@ -890,12 +1108,18 @@ class AutoSender:
                 method = req.method.upper()
                 # Перехватываем ТОЛЬКО POST/PUT запросы на создание запроса/сообщения
                 if method in ("POST", "PUT") and any(k in u for k in ("stay_request", "stay-request", "stayrequest", "graphql", "couchsurfing.com/api", "messages", "conversations")):
+                    body = ""
+                    try:
+                        body = res.text()[:1000]
+                    except Exception:
+                        pass
                     api_responses.append({
                         "url": res.url,
                         "method": method,
                         "status": res.status,
                         "status_text": res.status_text,
                         "ok": res.ok,
+                        "body": body,
                     })
             except Exception:
                 pass
@@ -1043,6 +1267,17 @@ class AutoSender:
                         pass
 
                 if not found:
+                    already_msg = self.detect_already_sent(page)
+                    if not already_msg:
+                        view_req = page.locator("button:has-text('View Chat Request'), button:has-text('View Stay Request'), a:has-text('View Chat Request'), a:has-text('View Stay Request')")
+                        if view_req.count() > 0 and view_req.first.is_visible():
+                            already_msg = "View Request button visible on profile"
+
+                    if already_msg:
+                        return self._mark_already_sent(
+                            username, host_name, target_city, arrival_date, departure_date, already_msg
+                        )
+
                     try:
                         page.screenshot(path=str(DEBUG_DIR / f"profile_{username}.png"), timeout=5000)
                     except Exception:
@@ -1127,14 +1362,23 @@ class AutoSender:
                     error_screenshot, error_html,
                 )
 
-            # 5.1. Поле ввода сообщения (форма уже видна; даём 15 сек на появление textarea)
+            # 5.1. Поле ввода сообщения (форма уже видна; даём 15 сек на появление целевой textarea)
             textarea = None
-            try:
-                ta = page.locator("textarea:visible").first
-                ta.wait_for(state="visible", timeout=15000)
-                textarea = ta
-            except Exception:
-                textarea = None
+            selectors = [
+                'textarea[data-testid="stay-request-introduction-textarea"]:visible',
+                'textarea[name="message"]:visible',
+                'textarea:not([data-testid*="trip"]):visible',
+                'textarea:visible'
+            ]
+            for sel in selectors:
+                try:
+                    ta = page.locator(sel).first
+                    if ta.count() > 0 and ta.is_visible():
+                        ta.wait_for(state="visible", timeout=4000)
+                        textarea = ta
+                        break
+                except Exception:
+                    continue
 
             if textarea is None:
                 return self._fail_attempt(
@@ -1195,8 +1439,20 @@ class AutoSender:
                     departure_date=departure_date,
                     before_screenshot=before_screenshot,
                     found_selector=found_selector,
+                    message=message,
                 )
                 return True
+
+            # 8.5. Экстренная проверка STOP / PAUSE перед боевым кликом отправки
+            if self.check_emergency_stop() or self.check_is_paused():
+                log_step("STOP", "Обнаружен сигнал остановки/паузы непосредственно перед отправкой! Клик отменен.")
+                self.update_autopilot_status(
+                    is_running=False,
+                    is_paused=self.check_is_paused(),
+                    current_host=None,
+                    last_status="Отправка прервана сигналом STOP/PAUSE перед кликом",
+                )
+                return False
 
             # 9. БОЕВОЙ РЕЖИМ: Очистка буфера ответов, клик и строгая верификация
             api_responses.clear()
@@ -1214,8 +1470,11 @@ class AutoSender:
                 err_res = [r for r in api_responses if not r.get("ok") and r.get("status", 0) >= 400]
 
                 if err_res:
-                    http_status = err_res[-1].get("status")
-                    log_step("WARN", f"Получен ошибочный ответ сервера: HTTP {http_status}")
+                    err_info = err_res[-1]
+                    http_status = err_info.get("status")
+                    err_url = err_info.get("url")
+                    err_body = err_info.get("body", "")
+                    log_step("WARN", f"Получен ошибочный ответ сервера: HTTP {http_status} от {err_url}. Тело ответа: {err_body}")
                     break
 
                 if ok_res:
@@ -1265,6 +1524,7 @@ class AutoSender:
                     "proof_screenshot": str(after_screenshot),
                     "before_screenshot": str(before_screenshot),
                     "notes": f"Stay request sent and verified. Server status: {http_status or 200}.",
+                    "message": message,
                 })
                 self.update_queue_status(username, "Sent")
                 return True
@@ -1393,6 +1653,13 @@ class AutoSender:
         log_step("INIT", f"Режим отображения браузера: {'Headed (видимое окно)' if not self.headless else 'Headless (фоновый)'}")
         log_step("INIT", f"Режим симуляции: {'Dry-Run (без клика)' if self.dry_run else 'Live (боевая отправка)'}")
 
+        self.update_autopilot_status(
+            is_running=True,
+            is_paused=False,
+            current_host=None,
+            last_status="Инициализация очереди и проверка лимитов...",
+        )
+
         # 1. Проверка суточного лимита
         sent_today = self.get_sent_today_count()
         log_step("CHECK", f"Отправлено сегодня: {sent_today} / {self.daily_limit}")
@@ -1410,18 +1677,13 @@ class AutoSender:
         # 1.5. Синхронизация очереди перед отбором (исключение уже отправленных хостов)
         self.sync_queue_against_sent_and_inbox()
 
-        # 2. Загрузка очереди кандидатов (единый канонический источник и порядок)
-        candidates = self.queue_manager.get_ready_dispatch_candidates()
-
-        # Предварительная проверка для --target
+        # Предварительная проверка наличия кандидатов к отправке
+        initial_candidates = self.queue_manager.get_ready_dispatch_candidates(trip_id=self.trip_id)
         if self.target_username:
             target_norm = self.target_username.strip().lower()
-            candidates = [c for c in candidates if str(c.get("username", "")).strip().lower() == target_norm]
-            if not candidates:
-                log_step("WARN", f"Хост '{self.target_username}' не найден среди готовых к отправке (Approved/Queued) или уже отправлен.")
-                return
+            initial_candidates = [c for c in initial_candidates if str(c.get("username", "")).strip().lower() == target_norm]
 
-        if not candidates:
+        if not initial_candidates:
             log_step("INFO", "В очереди нет хостов со статусом 'Approved'/'Queued'. Отправка черновиков ('Draft', 'Skipped') заблокирована.")
             self.update_autopilot_status(
                 is_running=False,
@@ -1432,19 +1694,15 @@ class AutoSender:
             )
             return
 
-        if self.max_requests and len(candidates) > self.max_requests:
-            candidates = candidates[:self.max_requests]
+        log_step("QUEUE", f"Отобрано кандидатов в текущей пачке: {len(initial_candidates)}")
 
-        log_step("QUEUE", f"Отобрано кандидатов к отправке: {len(candidates)}")
-
-        # Пауза между кандидатами ВСЕГДА строго в диапазоне
-        # --min-interval-minutes .. --max-interval-minutes (300–600 сек по умолчанию).
-        # Конфликтующий --period-minutes (генерировал 35-sek интервалы) больше не используется.
         delays_schedule: List[float] = []
         self.period_minutes = None
 
         processed_this_run = 0
         consecutive_failures = 0
+        host_failures: Dict[str, int] = {}
+        iteration_index = 0
 
         # 3. Инициализация Playwright
         with sync_playwright() as p:
@@ -1467,11 +1725,47 @@ class AutoSender:
             context = browser.new_context(**context_kwargs)
             page = context.new_page()
 
-            # Обработка кандидатов в цикле
-            for idx, candidate in enumerate(candidates, 1):
-                if not self.is_running:
-                    log_step("ABORT", "Работа автопилота прервана.")
+            # Непрерывная обработка кандидатов в цикле до исчерпания очереди или достижения суточного лимита
+            while self.is_running:
+                if self.check_is_stopped():
+                    log_step("STOP", "Автопилот остановлен через UI/файл статуса. Завершение работы.")
+                    self.is_running = False
                     break
+                # Жесткая проверка суточного лимита ДО отбора
+                if self.get_sent_today_count() >= self.daily_limit:
+                    log_step("LIMIT", f"[LIMIT] Daily limit reached ({self.get_sent_today_count()}/{self.daily_limit}). Dispatcher halted.")
+                    self.update_autopilot_status(
+                        is_running=False,
+                        is_paused=False,
+                        current_host=None,
+                        seconds_remaining=0,
+                        last_status=f"Завершено. Отправлено сегодня: {self.get_sent_today_count()}/{self.daily_limit}",
+                    )
+                    break
+
+                if self.max_requests and processed_this_run >= self.max_requests:
+                    log_step("FINISH", f"Достигнут лимит запросов на запуск (--max-requests {self.max_requests}). Завершение.")
+                    break
+
+                # Динамический отбор следующей пачки кандидатов (автоматически разблокирует хостов при освобождении вступительных фраз)
+                active_candidates = self.queue_manager.get_ready_dispatch_candidates(trip_id=self.trip_id)
+                if self.target_username:
+                    target_norm = self.target_username.strip().lower()
+                    active_candidates = [c for c in active_candidates if str(c.get("username", "")).strip().lower() == target_norm]
+
+                if not active_candidates:
+                    log_step("INFO", "Очередь готовых кандидатов пуста или все одобренные хосты обработаны.")
+                    self.update_autopilot_status(
+                        is_running=False,
+                        is_paused=False,
+                        current_host=None,
+                        seconds_remaining=0,
+                        last_status=f"Завершено. Отправлено сегодня: {self.get_sent_today_count()}/{self.daily_limit}",
+                    )
+                    break
+
+                candidate = active_candidates[0]
+                iteration_index += 1
 
                 # Если активен Emergency Stop или пауза — ждем снятия без завершения процесса
                 while self.check_emergency_stop() or self.check_is_paused():
@@ -1488,19 +1782,13 @@ class AutoSender:
                 if not self.is_running:
                     break
 
-                # Жесткая проверка суточного лимита ДО отправки
-                if self.get_sent_today_count() >= self.daily_limit:
-                    log_step("LIMIT", "[LIMIT] Daily limit reached. Dispatcher halted.")
-                    self.update_autopilot_status(
-                        is_running=False,
-                        is_paused=False,
-                        current_host=None,
-                        seconds_remaining=0,
-                        last_status="[LIMIT] Daily limit reached. Dispatcher halted.",
-                    )
-                    break
-
                 username = candidate.get("username", "")
+                self.update_autopilot_status(
+                    is_running=True,
+                    is_paused=False,
+                    current_host=username,
+                    last_status=f"Обработка #{iteration_index}: @{username} ({candidate.get('name') or username})...",
+                )
                 res = None
                 try:
                     res = self.process_host(page, candidate)
@@ -1508,7 +1796,6 @@ class AutoSender:
                     log_step("ERROR", f"Непредвиденная ошибка при обработке {username}: {ex}")
                     res = "ERROR"
                 finally:
-                    # В ЛЮБОМ случае (включая ошибки) сбрасываем current_host = None
                     self.update_autopilot_status(
                         is_running=True,
                         current_host=None,
@@ -1516,27 +1803,47 @@ class AutoSender:
 
                 processed_this_run += 1
 
-                # Учет подряд идущих ошибок формы: 3 ошибки подряд -> остановка (что-то сломалось на сайте)
+                # Обработка результата отправки хосту
+                was_demoted_to_bottom = False
                 if res is True or res == "ALREADY_SENT":
                     consecutive_failures = 0
+                    host_failures.pop(username, None)
+                elif res == "QC_FAILED":
+                    # Ошибка валидации текста конкретного хоста: не инкрементирует consecutive_failures
+                    host_failures[username] = host_failures.get(username, 0) + 1
+                    if host_failures[username] >= 3:
+                        log_step("WARN", f"Хост @{username} не прошёл QC 3 раза. Перемещаем в самый конец очереди...")
+                        self.move_host_to_end_of_queue(username, reason="QC validation failed 3 times")
+                        host_failures.pop(username, None)
+                        was_demoted_to_bottom = True
                 else:
-                    consecutive_failures += 1
-                    if consecutive_failures >= 3:
-                        log_step("HALT", f"[HALT] {consecutive_failures} ошибки формы подряд. Диспетчер остановлен — проверьте скриншоты в output/debug/.")
-                        self.update_autopilot_status(
-                            is_running=False,
-                            is_paused=False,
-                            current_host=None,
-                            last_status=f"Остановлен: {consecutive_failures} ошибки подряд (см. Live Logs)",
-                        )
-                        break
+                    host_failures[username] = host_failures.get(username, 0) + 1
+                    if host_failures[username] >= 3:
+                        log_step("WARN", f"Хост @{username} дал сбой {host_failures[username]} раза подряд. Перемещаем в самый конец очереди (вниз списка) и продолжаем отправку...")
+                        self.move_host_to_end_of_queue(username, reason=f"3 dispatch attempts failed: {res}")
+                        host_failures.pop(username, None)
+                        consecutive_failures = 0
+                        was_demoted_to_bottom = True
+                    else:
+                        consecutive_failures += 1
+                        if consecutive_failures >= 5:
+                            log_step("HALT", f"[HALT] {consecutive_failures} системных сбоев подряд на разных хостах. Диспетчер остановлен — проверьте скриншоты в output/debug/.")
+                            self.update_autopilot_status(
+                                is_running=False,
+                                is_paused=False,
+                                current_host=None,
+                                last_status=f"Остановлен: {consecutive_failures} системные ошибки подряд (см. Live Logs)",
+                            )
+                            break
 
-                # Проверка лимита на запуск (--max-requests)
+                if self.target_username:
+                    log_step("FINISH", f"Целевой хост @{self.target_username} обработан. Завершение.")
+                    break
+
                 if self.max_requests and processed_this_run >= self.max_requests:
                     log_step("FINISH", f"Достигнут лимит запросов на запуск (--max-requests {self.max_requests}). Завершение.")
                     break
 
-                # Жесткая проверка суточного лимита ПОСЛЕ отправки
                 if self.get_sent_today_count() >= self.daily_limit:
                     log_step("LIMIT", "[LIMIT] Daily limit reached. Dispatcher halted.")
                     self.update_autopilot_status(
@@ -1548,18 +1855,26 @@ class AutoSender:
                     )
                     break
 
+                # Проверяем, есть ли следующие кандидаты в очереди
+                next_batch = self.queue_manager.get_ready_dispatch_candidates(trip_id=self.trip_id)
+                if not next_batch:
+                    log_step("INFO", "Все доступные кандидаты в очереди отправлены.")
+                    break
+
                 # Обязательная пауза перед следующим кандидатом (никогда не пропускается!)
-                if idx < len(candidates) and self.is_running:
+                if self.is_running:
                     if res is not True and res != "SENT_SUCCESS" and res != "ALREADY_SENT":
-                        # ОШИБКА ФОРМЫ -> тоже полноценный Human Jitter (никаких быстрых повторов)
                         res_is_error = True
                     else:
                         res_is_error = False
 
-                    if res is True or res == "SENT_SUCCESS" or res_is_error:
-                        # УСПЕШНАЯ ОТПРАВКА / ОШИБКА -> ОБЯЗАТЕЛЬНЫЙ HUMAN JITTER (5-10 мин; в test mode 6-12 сек)
-                        sleep_seconds = self.compute_human_delay(idx, res_is_error, delays_schedule)
-
+                    if was_demoted_to_bottom:
+                        sleep_seconds = random.randint(20, 35) if not self.test_mode else 3
+                        pause_type = "🛡️ Demote Pause"
+                        status_msg = f"Хост отправлен в конец очереди. Пауза ({int(sleep_seconds)} сек)"
+                        log_step("SKIP_PAUSE", f"Хост @{username} перемещен в конец очереди. Пауза {int(sleep_seconds)} сек перед переходом к следующему кандидату...")
+                    elif res is True or res == "SENT_SUCCESS" or res_is_error:
+                        sleep_seconds = self.compute_human_delay(iteration_index, res_is_error, delays_schedule)
                         mins = int(sleep_seconds // 60)
                         secs = int(sleep_seconds % 60)
                         pause_type = "🎲 Human Jitter"
@@ -1568,14 +1883,11 @@ class AutoSender:
                             log_step("SLEEP", f"@{username} НЕ отправлен (ошибка формы/сети, возвращён в очередь Queued). Пауза {int(sleep_seconds)} сек ({mins} мин {secs} сек) ({pause_type})...")
                         else:
                             log_step("SLEEP", f"Ожидание {int(sleep_seconds)} сек ({mins} мин {secs} сек) ({pause_type}) до следующего запроса...")
-
                     else:
-                        # ALREADY_SENT (подтверждено видимым текстом) -> короткая безопасная пауза (30-60 сек)
                         if self.test_mode:
                             sleep_seconds = random.randint(4, 8)
                         else:
                             sleep_seconds = random.randint(30, 60)
-
                         pause_type = "🛡️ Safe Skip Pause"
                         status_msg = f"Безопасная пауза перед следующим ({int(sleep_seconds)} сек)"
                         reason = "уже отправлен ранее" if res == "ALREADY_SENT" else "ошибка / форма не найдена"
@@ -1595,10 +1907,11 @@ class AutoSender:
 
                     start_sleep = time.time()
                     while time.time() - start_sleep < sleep_seconds:
-                        if not self.is_running:
+                        if not self.is_running or self.check_is_stopped():
+                            self.is_running = False
+                            log_step("STOP", "Автопилот остановлен во время ожидания таймера. Завершение работы.")
                             break
 
-                        # Проверка флага паузы и аварийной остановки (Emergency Stop)
                         while self.check_is_paused() or self.check_emergency_stop():
                             self.update_autopilot_status(
                                 is_running=True,
@@ -1780,6 +2093,7 @@ def main():
     parser.add_argument("--no-headless", dest="headed", action="store_true", help="Запуск с видимым окном браузера (алиас)")
     parser.add_argument("--target", type=str, default=None, help="Целевой username хоста")
     parser.add_argument("--test-mode", action="store_true", help="Быстрый тестовый режим пауз (секунды вместо минут)")
+    parser.add_argument("--trip-id", type=str, default=None, help="ID активной карточки поездки (фильтр хостов)")
 
     args = parser.parse_args()
 
@@ -1799,6 +2113,7 @@ def main():
         headless=not args.headed,
         target_username=args.target,
         test_mode=args.test_mode,
+        trip_id=args.trip_id,
     )
     sender.run()
 

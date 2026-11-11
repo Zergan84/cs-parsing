@@ -34,7 +34,7 @@ import requests
 logger = logging.getLogger("GenderClassifier")
 
 BASE_DIR = Path(__file__).parent
-OUTPUT_DIR = BASE_DIR / "output"
+OUTPUT_DIR = Path(os.environ.get("CS_OUTPUT_DIR", str(BASE_DIR / "output"))).resolve()
 CACHE_FILE = OUTPUT_DIR / "gender_cache.json"
 
 DEFAULT_OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
@@ -47,6 +47,32 @@ WESTERN_MALE_NAMES = {
     "carlos", "pedro", "luis", "juan", "marco", "diego", "mateo",
     "maxence", "wade", "dec", "decdec"
 }
+
+# Международные имена, оканчивающиеся на гласные или суффиксы (-a, -i, -ka, -mi, -na),
+# которые являются мужскими и НЕ должны классифицироваться по японским женским суффиксам
+INTERNATIONAL_MALE_NAMES_WITH_VOWELS = {
+    "luka", "luca", "mika", "sami", "rami", "krishna", "joshua", "slava", "nikita",
+    "sasha", "ilya", "dima", "andrea", "mustafa", "hamza", "reza", "ali", "eli",
+    "levi", "jonah", "noah", "ezra", "misha", "kolya", "vasya", "petya", "toma",
+    "kuba", "kostya", "yura", "vanya", "boris", "dani", "danny", "jean", "sena"
+}
+
+NON_JAPANESE_CHARS = set("lvxq")
+NON_JAPANESE_CLUSTERS = (
+    "kr", "sl", "st", "sm", "sn", "sp", "sc", "sk", "br", "dr",
+    "fr", "gr", "pr", "tr", "pl", "bl", "cl", "gl", "fl", "ph", "th"
+)
+
+def is_likely_japanese_name(name: str) -> bool:
+    """Проверяет, соответствует ли имя базовым фонетическим правилам японского языка (ромадзи)."""
+    n = name.lower()
+    if any(c in NON_JAPANESE_CHARS for c in n):
+        return False
+    if "c" in n and "ch" not in n:
+        return False
+    if any(cl in n for cl in NON_JAPANESE_CLUSTERS):
+        return False
+    return True
 
 # Проверенные японские мужские имена
 JP_MALE_NAMES = {
@@ -78,7 +104,7 @@ WESTERN_FEMALE_NAMES = {
 JP_FEMALE_NAMES = {
     "ai", "nozomi", "sakura", "yui", "aoi", "hina", "rin", "mio", "mei", "yuna", "akari",
     "koharu", "hana", "ayaka", "asuka", "nanami", "rina", "yuka", "misaki",
-    "erika", "kana", "sayaka", "mai", "chika", "mika", "tomomi", "ayumi", "megumi",
+    "erika", "kana", "sayaka", "mai", "chika", "tomomi", "ayumi", "megumi",
     "shiori", "haruka", "marion", "sophie", "julia", "elena", "maria", "emma", "sarah",
     "charlotte", "laura", "anna", "tessa", "alice", "chihiro", "reiko", "keiko",
     "yoko", "kumiko", "midori", "naoko", "mariko", "tomoko", "junko", "noriko",
@@ -91,7 +117,7 @@ JP_FEMALE_NAMES = {
 AMBIGUOUS_NAMES = {
     "yuki", "ren", "kaoru", "makoto", "aoi", "shinobu", "tsubasa", "akira",
     "hikaru", "hinata", "nagisa", "sora", "ibuki", "mutsumi",
-    "reona", "asahi", "mitsuki", "izumi", "shizuka", "haru", "ryo"
+    "reona", "asahi", "mitsuki", "izumi", "shizuka", "haru", "ryo", "mika"
 }
 
 # Маркеры пар (Couple)
@@ -115,34 +141,42 @@ COUPLE_TEXT_PATTERNS = [
     re.compile(r"\bhusband\s+and\s+wife\b", re.IGNORECASE),
 ]
 
-# УРОВЕНЬ 1: Мужские маркеры в Bio
-RE_MALE_BIO_NAME_SELF = re.compile(
-    r"\b(?:call\s+me|i['’]?m|i\s+am|my\s+name\s+is|name['’]?s|people\s+call\s+me|friends\s+call\s+me|just\s+call\s+me)\s+(?:tom|tommy|ken|dan|nick|mike|alex|ben|jose|felipe|hide)\b",
-    re.IGNORECASE,
-)
-
+# УРОВЕНЬ 1: Мужские контекстные маркеры в Bio
 RE_MALE_BIO_KEYWORDS = re.compile(
-    r"\b(?:ex-girlfriend|ex\s+girlfriend|my\s+girlfriend|my\s+wife|as\s+a\s+guy|as\s+a\s+man|i['’]?m\s+a\s+guy|i\s+am\s+a\s+guy|i['’]?m\s+a\s+man|i\s+am\s+a\s+man|i['’]?m\s+a\s+dude|i\s+am\s+a\s+dude|i['’]?m\s+a\s+boy|i\s+am\s+a\s+boy|he/him|him/he|solo\s+male|actor|mr\.)\b",
+    r"\b(?:"
+    r"ex-girlfriend|ex\s+girlfriend|my\s+girlfriend|my\s+wife"
+    r"|as\s+a\s+(?:guy|man|boy|male|dude)"
+    r"|i['’]?m\s+(?:a\s+)?(?:guy|man|boy|male|dude)"
+    r"|i\s+am\s+(?:a\s+)?(?:guy|man|boy|male|dude)"
+    r"|solo\s+(?:male|guy|man|boy)"
+    r"|solo\s+adventure\s+boy"
+    r"|he/him|him/he"
+    r"|father|husband|boyfriend|brother|son"
+    r"|actor|mr\."
+    r")\b",
     re.IGNORECASE,
 )
 
-# УРОВЕНЬ 1: Женские маркеры в Bio (включая "I am japanese woman", "japanese girl", и т.д.)
+# УРОВЕНЬ 1: Женские контекстные маркеры в Bio
 RE_FEMALE_BIO_KEYWORDS = re.compile(
     r"\b(?:"
     r"i['’]?m\s+(?:a\s+)?(?:japanese\s+|asian\s+|solo\s+)?(?:woman|girl|lady|female)"
     r"|i\s+am\s+(?:a\s+)?(?:japanese\s+|asian\s+|solo\s+)?(?:woman|girl|lady|female)"
     r"|japanese\s+(?:woman|girl|lady|female)"
+    r"|the\s+girl\s+who\b"
     r"|as\s+a\s+(?:girl|woman|lady|female|female\s+trave[l]+er)"
     r"|solo\s+female(?:\s+trave[l]+er)?"
-    r"|ex-boyfriend|ex\s+boyfriend|my\s+husband"
-    r"|she/her|her/she|actress|ms\.|mrs\."
+    r"|ex-boyfriend|ex\s+boyfriend|my\s+boyfriend|my\s+husband"
+    r"|she/her|her/she"
+    r"|mother|sister|daughter"
+    r"|actress|ms\.|mrs\."
     r")\b",
     re.IGNORECASE,
 )
 
 # УРОВЕНЬ 2: Местоимения в References
-RE_MALE_PRONOUNS = re.compile(r"\b(he|him|his|guy|gentleman|brother)\b", re.IGNORECASE)
-RE_FEMALE_PRONOUNS = re.compile(r"\b(she|her|hers|girl|lady|sister)\b", re.IGNORECASE)
+RE_MALE_PRONOUNS = re.compile(r"\b(he|him|his|guy|gentleman|brother|man)\b", re.IGNORECASE)
+RE_FEMALE_PRONOUNS = re.compile(r"\b(she|her|hers|girl|lady|sister|woman)\b", re.IGNORECASE)
 
 
 class GenderClassifier:
@@ -226,35 +260,22 @@ class GenderClassifier:
 
     def _check_level1_bio(self, clean_name: str, about_text: str) -> Optional[Tuple[str, str, str]]:
         """
-        УРОВЕНЬ 1: Проверка жестких мужских маркеров и никнеймов в Bio.
-        Возвращает (gender, host_type, source) или None.
+        УРОВЕНЬ 1: Проверка явных контекстных маркеров пола в Bio.
+        Пол НЕ определяется только по имени, никнейму или суффиксу.
         """
-        first_word = re.split(r"[\s\-_./]+", clean_name.lower())[0] if clean_name else ""
-
-        # Мужские имена в имени профиля (западные и японские)
-        if first_word in WESTERN_MALE_NAMES or first_word in JP_MALE_NAMES:
-            return "male", "solo", "bio_keywords"
-
-        for suff in MALE_NAME_SUFFIXES:
-            if first_word.endswith(suff):
-                return "male", "solo", f"japanese_male_suffix (-{suff})"
-
         about_lower = about_text.lower() if about_text else ""
+        if not about_lower:
+            return None
 
-        # Упоминания имени/никнейма в Bio ("Call me Tom", "I'm Mike")
-        m_self = RE_MALE_BIO_NAME_SELF.search(about_lower)
-        if m_self:
-            return "male", "solo", "bio_keywords"
-
-        # Мужские маркеры отношений и самоидентификации ("ex-girlfriend", "my girlfriend", "as a guy")
+        # Мужские маркеры отношений и самоидентификации ("ex-girlfriend", "my girlfriend", "as a guy", "he/him")
         m_kw = RE_MALE_BIO_KEYWORDS.search(about_lower)
-        if m_kw:
-            return "male", "solo", "bio_keywords"
-
         # Женские маркеры отношений и самоидентификации ("she/her", "as a girl", "ex-boyfriend")
         f_kw = RE_FEMALE_BIO_KEYWORDS.search(about_lower)
-        if f_kw:
-            return "female", "solo", "bio_keywords"
+
+        if m_kw and not f_kw:
+            return "male", "solo", f"bio_context ('{m_kw.group(0)}')"
+        if f_kw and not m_kw:
+            return "female", "solo", f"bio_context ('{f_kw.group(0)}')"
 
         return None
 
@@ -272,10 +293,10 @@ class GenderClassifier:
         male_count = len(male_matches)
         female_count = len(female_matches)
 
-        if male_count >= 2 and (female_count == 0 or male_count >= female_count * 2):
-            return "male", "solo", "references_pronouns"
-        elif female_count >= 2 and (male_count == 0 or female_count >= male_count * 2):
-            return "female", "solo", "references_pronouns"
+        if male_count >= 1 and (female_count == 0 or male_count >= female_count * 2):
+            return "male", "solo", f"references_pronouns (he/him x{male_count})"
+        elif female_count >= 1 and (male_count == 0 or female_count >= male_count * 2):
+            return "female", "solo", f"references_pronouns (she/her x{female_count})"
 
         return None
 
@@ -314,13 +335,25 @@ class GenderClassifier:
             return "female", "solo", "japanese_female_suffix (-ko)"
 
         # Мужские суффиксы:
-        # -suke, -taro, -kazu, -shi, -to, -ro, -ya, -ji, -hei, -pei, -ichi
+        # -suke, -taro, -kazu, -taka, -fumi, -masa, -hide, -shige, -nori, -shi, -to, -ro, -ya, -ji, -hei, -pei, -ichi
         if first_name.endswith("suke"):
             return "male", "solo", "japanese_male_suffix (-suke)"
         if first_name.endswith("taro"):
             return "male", "solo", "japanese_male_suffix (-taro)"
         if first_name.endswith("kazu"):
             return "male", "solo", "japanese_male_suffix (-kazu)"
+        if first_name.endswith("taka"):
+            return "male", "solo", "japanese_male_suffix (-taka)"
+        if first_name.endswith("fumi"):
+            return "male", "solo", "japanese_male_suffix (-fumi)"
+        if first_name.endswith("masa"):
+            return "male", "solo", "japanese_male_suffix (-masa)"
+        if first_name.endswith("hide"):
+            return "male", "solo", "japanese_male_suffix (-hide)"
+        if first_name.endswith("shige"):
+            return "male", "solo", "japanese_male_suffix (-shige)"
+        if first_name.endswith("nori"):
+            return "male", "solo", "japanese_male_suffix (-nori)"
         if first_name.endswith("shi"):
             return "male", "solo", "japanese_male_suffix (-shi)"
         if first_name.endswith("to"):
@@ -342,17 +375,24 @@ class GenderClassifier:
 
         # Женские суффиксы:
         # -mi (Eimi, Yumi, Ayami), -ka (Haruka, Asuka), -na (Rina, Kana), -e (Rie, Tomoe)
-        if first_name.endswith("mi"):
-            return "female", "solo", "japanese_female_suffix (-mi)"
-        if first_name.endswith("ka"):
-            return "female", "solo", "japanese_female_suffix (-ka)"
-        if first_name.endswith("na"):
-            return "female", "solo", "japanese_female_suffix (-na)"
+        # ВАЖНО: суффиксы -ka, -mi, -na применяются ТОЛЬКО к валидным японским именам!
+        # Неяпонские и международные имена (Luka, Mika, Slava, Sami, Rami, Krishna и др.)
+        # не должны классифицироваться как female по окончанию.
+        if first_name in INTERNATIONAL_MALE_NAMES_WITH_VOWELS:
+            return "male", "solo", f"international_male_name ({first_name})"
 
-        # Суффикс -e для японских женских имен (Rie, Tomoe, Sanae), исключая любые мужские имена
-        if first_name not in WESTERN_MALE_NAMES and first_name not in JP_MALE_NAMES:
-            if first_name.endswith(("rie", "moe", "nae", "tae", "sae", "kae", "toe")):
-                return "female", "solo", "japanese_female_suffix (-e)"
+        if is_likely_japanese_name(first_name):
+            if first_name.endswith("mi") and not first_name.endswith(("fumi", "umi")):
+                return "female", "solo", "japanese_female_suffix (-mi)"
+            if first_name.endswith("ka") and not first_name.endswith("taka"):
+                return "female", "solo", "japanese_female_suffix (-ka)"
+            if first_name.endswith("na"):
+                return "female", "solo", "japanese_female_suffix (-na)"
+
+            # Суффикс -e для японских женских имен (Rie, Tomoe, Sanae), исключая любые мужские имена
+            if first_name not in WESTERN_MALE_NAMES and first_name not in JP_MALE_NAMES:
+                if first_name.endswith(("rie", "moe", "nae", "tae", "sae", "kae", "toe")):
+                    return "female", "solo", "japanese_female_suffix (-e)"
 
         return None
 
@@ -365,12 +405,17 @@ class GenderClassifier:
         """
         УРОВЕНЬ 4: Запрос в локальную Ollama (qwen2.5:7b) со строгим JSON ответом.
         """
-        prompt = f"""Determine gender for profile:
+        prompt = f"""Determine gender for profile based ONLY on explicit factual evidence in Bio or References:
 Name: {name}
 Bio: {bio_snippet}
 References clues: {pronoun_clues}
 
-Return ONLY JSON:
+CRITICAL RULES:
+1. If there are NO explicit factual clues (such as pronouns he/she/him/her, or relationship roles wife/husband/girlfriend/boyfriend) in Bio or References, output "unknown".
+2. NEVER guess gender based on name alone.
+3. Return ONLY valid JSON.
+
+JSON format:
 {{"gender": "male" | "female" | "couple" | "unknown", "confidence": 0.0-1.0, "reason": "short explanation"}}"""
 
         payload = {
@@ -379,12 +424,9 @@ Return ONLY JSON:
             "format": "json",
             "stream": False,
             "system": (
-                "You are a precise gender classifier for Couchsurfing profiles. "
-                "Determine if the person is male, female, couple, or unknown based on their Japanese/international name and context. "
-                "Rules:\n"
-                "1. Heterosexual context: Mentions of 'ex-girlfriend', 'girlfriend', or 'wife' by the user indicate male gender.\n"
-                "2. The name 'Tomo' is typically male/unisex, never classify as female unless bio explicitly says woman/girl.\n"
-                "3. Return ONLY valid JSON."
+                "You are a strict, evidence-based gender classifier for Couchsurfing profiles. "
+                "Classify gender ONLY when explicit factual clues are present in the text (pronouns, spouse/partner terms). "
+                "Never guess gender based on first name alone. If in doubt or evidence is lacking, return 'unknown'."
             ),
             "options": {"temperature": 0.1, "num_predict": 150},
         }
@@ -449,42 +491,9 @@ Return ONLY JSON:
             cap_gender = gender.capitalize()
             return cap_gender, host_type, source
 
-        # УРОВЕНЬ 3: Лингвистический парсинг японских и международных имен (БЕЗ ложных суффиксов)
-        l3_res = self._check_level3_linguistics(clean_name)
-        if l3_res:
-            gender, host_type, source = l3_res
-            cap_gender = gender.capitalize()
-            return cap_gender, host_type, source
-
-        # Проверка локального кэша перед тяжелым вызовом LLM (Уровень 4)
-        clean_name_lower = clean_name.lower()
-        if clean_name_lower in AMBIGUOUS_NAMES or not username:
-            import hashlib
-            bio_hash = hashlib.md5(((about_text or "") + ":" + (ref_text or "")).encode("utf-8")).hexdigest()[:8]
-            cache_key = f"{clean_name_lower}:{username.lower()}:{bio_hash}"
-        else:
-            cache_key = f"{clean_name_lower}:{username.lower()}"
-
-        if cache_key in self.cache:
-            c = self.cache[cache_key]
-            g = c.get("gender", "Unknown")
-            ht = "couple" if g == "Couple" else "solo"
-            return g, ht, f"cache ({c.get('reason', '')})"
-
-        # УРОВЕНЬ 4: Локальная LLM (qwen2.5:7b) ТОЛЬКО для оставшихся неоднозначных случаев
-        llm_gender, conf, llm_reason = self._query_ollama(
-            name=clean_name,
-            bio_snippet=about_text[:300] if about_text else "",
-            pronoun_clues=ref_text[:200] if ref_text else "",
-        )
-
-        cap_gender = "Couple" if llm_gender == "couple" else llm_gender.capitalize()
-        host_type = "couple" if cap_gender == "Couple" else "solo"
-        full_reason = f"ollama_llm ({llm_reason})"
-
-        self.cache[cache_key] = {"gender": cap_gender, "confidence": conf, "reason": full_reason}
-        self._save_cache()
-        return cap_gender, host_type, full_reason
+        # При отсутствии явных контекстных подтверждений в bio или references:
+        # Пол нельзя определять только по имени, суффиксу, национальности или фотографии.
+        return "Unknown", "solo", "insufficient_context (no explicit contextual confirmation in bio or references)"
 
     def classify_batch(self, hosts_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """

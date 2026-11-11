@@ -45,16 +45,16 @@ class ProfileAnalyzer:
         detected_interests = []
         interest_patterns = [
             ("Board games & tabletop", ["board game", "boardgame", "catan", "chess", "tabletop"]),
-            ("Education & science teaching", ["science teacher", "teacher", "education", "physics", "biology", "chemistry"]),
-            ("Film, directing & cinema", ["film", "cinema", "director", "cinematography", "movie", "35mm", "screenplay"]),
-            ("Photography & analog cameras", ["photo", "photography", "photographer", "camera", "analog", "35mm"]),
-            ("Music, vinyl & audio", ["vinyl", "record", "piano", "guitar", "jazz", "band", "acoustic", "synthesizer"]),
-            ("Culinary culture & cooking", ["cook", "culinary", "foodie", "ramen", "sushi", "baking", "wine", "sake", "chef"]),
+            ("Education & science teaching", ["science teacher", "teacher", "education", "physics", "biology", "chemistry", "researcher", "phd", "academic", "anthropolog", "student"]),
+            ("Film, directing & cinema", ["film", "cinema", "director", "cinematography", "movie", "35mm", "screenplay", "documentary"]),
+            ("Photography & analog cameras", ["photo", "photography", "photographer", "camera", "analog", "35mm", "street photography", "portrait"]),
+            ("Music, vinyl & instruments", ["vinyl", "record", "piano", "guitar", "jazz", "band", "acoustic", "synthesizer", "koto", "instrument", "instruments", "music", "musician", "shamisen", "singing", "drums"]),
+            ("Culinary culture & restaurants", ["cook", "cooking", "culinary", "foodie", "ramen", "sushi", "baking", "wine", "sake", "chef", "restaurant", "restaurants", "tasting", "delicious", "sweets", "tictac", "dining", "delicacies", "coffee", "tea"]),
             ("Reading & literature", ["reading", "books", "literature", "novels", "writing", "author"]),
-            ("Cycling, badminton & sports", ["cycling", "badminton", "biking", "running", "marathon", "tennis", "sports"]),
-            ("Architecture & design", ["architecture", "interior design", "sketching", "drawing", "illustration"]),
-            ("Trail hiking & nature", ["hike", "hiking", "trekking", "camping", "alps", "mountaineering", "climb"]),
-            ("Travel & cultural exchange", ["traveler", "backpacking", "cultural exchange", "countries", "nomad", "expats"]),
+            ("Sports, futsal & cycling", ["cycling", "badminton", "biking", "running", "marathon", "tennis", "sports", "sport", "soccer", "futsal", "football", "gym", "fitness", "climbing", "bouldering"]),
+            ("Architecture & design", ["architecture", "interior design", "sketching", "drawing", "illustration", "art", "museum", "gallery"]),
+            ("Trail hiking & nature", ["hike", "hiking", "trekking", "camping", "alps", "mountaineering", "climb", "mountain", "nature"]),
+            ("Travel & cultural exchange", ["traveler", "backpacking", "cultural exchange", "countries", "nomad", "expats", "practicing english", "learning english", "learning japanese", "language exchange", "languages", "bylocals", "recommendations", "guide"]),
         ]
 
         for label, kws in interest_patterns:
@@ -77,7 +77,7 @@ class ProfileAnalyzer:
             )
             if occ_match:
                 cand = occ_match.group(1).strip()
-                if not any(w in cand.lower() for w in ["year old", "couchsurfer", "guy", "person", "friendly", "living", "staying"]):
+                if not any(w in cand.lower() for w in ["year old", "couchsurfer", "guy", "person", "friendly", "living", "staying", "learning", "practicing", "playing", "planning", "trying"]):
                     occupation = cand
 
         # Определение языков
@@ -116,22 +116,36 @@ class ProfileAnalyzer:
             unique_c = list(dict.fromkeys(c.capitalize() for c in countries))[:3]
             hooks.append(f"Travel experience in {', '.join(unique_c)}")
 
-        # 2. Поиск увлечений и профессий
+        # 2. Поиск увлечений, активностей и специфических деталей
         lower_about = about.lower()
         if any(k in lower_about for k in ("board game", "boardgame", "catan", "chess")):
             hooks.append("Passion for board games and late-night strategy conversations")
         if any(k in lower_about for k in ("science teacher", "teaching", "education")):
             hooks.append("Experience as an educator and science teacher")
+        if any(k in lower_about for k in ("anthropolog", "researcher (holder of a ph", "phd")):
+            hooks.append("Cultural anthropology research and academic studies")
+        if any(k in lower_about for k in ("gap year", "round-the-world")):
+            hooks.append("Planning a round-the-world journey during gap year")
         if any(k in lower_about for k in ("badminton", "cycling", "bike", "biking")):
             hooks.append("Enthusiasm for cycling and badminton")
+        if any(k in lower_about for k in ("futsal", "soccer", "football")):
+            hooks.append("Playing futsal and soccer in free time")
         if any(k in lower_about for k in ("film", "cinema", "director", "movies", "cinematography")):
             hooks.append("Interest in film, cinematography and visual storytelling")
         if any(k in lower_about for k in ("photo", "photography", "camera", "analog", "35mm")):
             hooks.append("Passion for photography and capturing moments")
-        if any(k in lower_about for k in ("cook", "cooking", "ramen", "sushi", "chef", "wine", "sake", "foodie", "baking")):
-            hooks.append("Love for authentic culinary culture and home cooking")
-        if any(k in lower_about for k in ("piano", "music", "guitar", "ambient", "vinyl", "jazz")):
+        if any(k in lower_about for k in ("koto", "shamisen", "traditional instrument")):
+            hooks.append("Learning to play the koto, a traditional Japanese instrument")
+        elif any(k in lower_about for k in ("piano", "music", "guitar", "ambient", "vinyl", "jazz", "musician")):
             hooks.append("Musical interests (piano / acoustic / vinyl)")
+        if any(k in lower_about for k in ("restaurant", "restaurants", "tasting", "delicious offerings", "culinary")):
+            hooks.append("Exploring local restaurants and tasting delicious food")
+        elif any(k in lower_about for k in ("cook", "cooking", "ramen", "sushi", "chef", "wine", "sake", "foodie", "baking")):
+            hooks.append("Love for authentic culinary culture and home cooking")
+        if any(k in lower_about for k in ("tictac", "tic tac")):
+            hooks.append("Affection for Tic Tac sweets")
+        if any(k in lower_about for k in ("bylocals.jp", "bylocals", "recommendations in kyoto", "google map list")):
+            hooks.append("Curated local Kyoto recommendations and favorite spots (bylocals.jp)")
         if any(k in lower_about for k in ("developer", "software", "tech", "coding", "ai", "machine learning")):
             hooks.append("Tech background and passion for software/AI development")
         if any(k in lower_about for k in ("ski", "snowboard", "powder")):
@@ -140,7 +154,9 @@ class ProfileAnalyzer:
             hooks.append("Enthusiasm for mountains, trail hiking and alpine nature")
         if any(k in lower_about for k in ("motorcycle", "motorbike", "moto", "riding", "biker")):
             hooks.append("Love for motorcycles and road trips")
-        if any(k in lower_about for k in ("cultural exchange", "language exchange", "learn languages")):
+        if any(k in lower_about for k in ("practicing my english", "practicing english", "learning english")):
+            hooks.append("Practicing English and open cross-cultural communication")
+        elif any(k in lower_about for k in ("cultural exchange", "language exchange", "learn languages")):
             hooks.append("Focus on genuine peer-to-peer cultural and language exchange")
 
         # 3. Количество стран (если упомянуто число > 10)
@@ -169,7 +185,7 @@ class ProfileAnalyzer:
         elif "te_nepal_mountains" in fact_ids:
             return "High-Altitude Trekker: Bond over high-altitude Himalayan trekking (Thorong La 5416m, Everest Base Camp) and outdoor endurance."
         elif "prof_film_director_cannes" in fact_ids:
-            return "Cinematic & Visual Storyteller: Relate through VGIK film directing, Cannes 2024 participation, and visual creativity."
+            return "Cinematic & Visual Storyteller: Relate through film directing, Cannes 2024 participation, and visual creativity."
         elif "te_bmw_gs_moto" in fact_ids:
             return "Motorcycle & Alpine Roamer: Connect through BMW GS motorcycle journeys across the Alps and Morocco."
         elif "tech_fitness_ml_tools" in fact_ids:

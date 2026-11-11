@@ -63,13 +63,15 @@ if sys.platform == "win32":
 
 BASE_DIR = Path(__file__).parent
 TEMPLATES_DIR = BASE_DIR / "templates"
-OUTPUT_DIR = BASE_DIR / "output"
+OUTPUT_DIR = Path(os.environ.get("CS_OUTPUT_DIR", str(BASE_DIR / "output"))).resolve()
 USER_DATA_DIR = BASE_DIR / "user_data"
 STATIC_DIR = BASE_DIR / "static"
 
 # Инициализация сервисов платформы
 init_db()
 app = FastAPI(title="Couchsurfing Personalized Outreach Platform")
+from api_v2 import router as v2_router
+app.include_router(v2_router)
 queue_manager = RequestQueueManager()
 process_mgr = get_process_manager()
 context_mgr = get_personal_context_manager()
@@ -114,7 +116,6 @@ class ScraperParams(BaseModel):
     pages: int = 10
     headless: bool = False
     no_couples: bool = False
-    no_lgbtq: bool = False
     arrival_date: Optional[str] = "2026-11-16"
     departure_date: Optional[str] = "2026-11-19"
 
@@ -143,14 +144,18 @@ class SaveRequestItem(BaseModel):
     username: str
     message: Optional[str] = None
     status: Optional[str] = None
+    trip_id: Optional[str] = None
+    city: Optional[str] = None
 
 
 class RegenerateItem(BaseModel):
     host_id: Optional[str] = None
     username: Optional[str] = None
-    check_in: str = DEFAULT_CHECK_IN
-    check_out: str = DEFAULT_CHECK_OUT
-    guest_context: str = DEFAULT_CONTEXT
+    check_in: Optional[str] = DEFAULT_CHECK_IN
+    check_out: Optional[str] = DEFAULT_CHECK_OUT
+    guest_context: Optional[str] = DEFAULT_CONTEXT
+    trip_id: Optional[str] = None
+    city: Optional[str] = None
 
 
 class RegenerateAll(BaseModel):
@@ -183,6 +188,7 @@ class AutopilotParams(BaseModel):
     dry_run: bool = False
     test_mode: bool = False
     target: Optional[str] = None
+    trip_id: Optional[str] = None
 
 
 class ContextFactItem(BaseModel):
@@ -190,6 +196,7 @@ class ContextFactItem(BaseModel):
     category: str = "Personal Background"
     title: str
     content: str
+    priority: int = 1
     status: str = "confirmed"
     source: str = "user"
     confidence: float = 1.0
@@ -199,6 +206,37 @@ class ContextFactItem(BaseModel):
 
 class ToggleFactPayload(BaseModel):
     is_active: bool
+
+
+class ContextAnchorItem(BaseModel):
+    anchor_id: Optional[str] = None
+    name: str
+    category: str = "General"
+    keywords: Union[List[str], str] = []
+    description: Optional[str] = ""
+    priority: int = 1
+    is_active: bool = True
+
+
+class ToggleAnchorPayload(BaseModel):
+    is_active: bool
+
+
+class ContextPreviewPayload(BaseModel):
+    host_id: str
+    trip_id: Optional[str] = None
+    city: Optional[str] = None
+    arrival_date: Optional[str] = None
+    departure_date: Optional[str] = None
+
+
+class TravelContextPayload(BaseModel):
+    city: str
+    arrival_date: Optional[str] = None
+    departure_date: Optional[str] = None
+    dates_text: Optional[str] = None
+    purpose: Optional[str] = None
+    trip_id: Optional[str] = None
 
 
 class ReanalyzePayload(BaseModel):
@@ -254,14 +292,19 @@ async def get_service_worker():
 # =========================================================================
 
 @app.get("/api/status")
-async def get_status():
-    """Текущий статус платформы, последние логи и телеметрия."""
-    slug = "tokyo"
-    json_path = OUTPUT_DIR / f"hosts_{slug}.json"
-    curated_path = OUTPUT_DIR / f"hosts_{slug}_curated.json"
+async def get_status(city: Optional[str] = None):
+    """Текущий статус платформы, последние логи и телеметрия по текущему городу/поездке."""
+    # Получаем текущий выбранный город из параметра запроса или настроек
+    target_city = (city or get_setting("default_city", "Kyoto") or "Kyoto").strip()
+    slug = re.sub(r"\W+", "_", target_city.lower())
 
     total_hosts = 0
     curated_hosts = 0
+    rejected_hosts = 0
+
+    # Чтение файлов хостов для выбранного города (без искусственных минимумов)
+    json_path = OUTPUT_DIR / f"hosts_{slug}.json"
+    curated_path = OUTPUT_DIR / f"hosts_{slug}_curated.json"
 
     if json_path.exists():
         try:
@@ -277,8 +320,19 @@ async def get_status():
         except Exception:
             pass
 
-    # Подсчет отклоненных (Hosting Guard / стоп-слова / sent)
-    rejected_hosts = 0
+    # Реальные данные из SQLite по текущему городу
+    try:
+        with db_session() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT count(*) FROM hosts WHERE LOWER(location) LIKE ?;", (f"%{target_city.lower()}%",))
+            db_city_hosts = cur.fetchone()[0]
+            if db_city_hosts > 0:
+                total_hosts = max(total_hosts, db_city_hosts)
+                if curated_hosts == 0:
+                    curated_hosts = db_city_hosts
+    except Exception:
+        pass
+
     rejected_path = OUTPUT_DIR / "rejected_hosts.json"
     if rejected_path.exists():
         try:
@@ -286,10 +340,10 @@ async def get_status():
                 rejected_hosts = len(json.load(f))
         except Exception:
             pass
-    rejected_hosts = max(rejected_hosts, 86)
-    scraped_total = max(curated_hosts + rejected_hosts, total_hosts + (rejected_hosts if total_hosts == curated_hosts else 0), 462)
 
-    # Быстрый подсчет из SQLite
+    scraped_total = max(curated_hosts + rejected_hosts, total_hosts)
+
+    # Быстрый подсчет из SQLite (реальные данные очереди)
     approved_count = 0
     draft_count = 0
     queue_total = 0
@@ -311,10 +365,27 @@ async def get_status():
     is_proc_running = process_mgr.is_running
     current_task = process_mgr.active_task_name if is_proc_running else "None"
     logs = process_mgr.get_logs(80)
+    if not logs:
+        sent_log_file = OUTPUT_DIR / "sent_log.json"
+        if sent_log_file.exists():
+            try:
+                with open(sent_log_file, "r", encoding="utf-8") as f:
+                    s_logs = json.load(f)
+                fallback_lines = []
+                for entry in s_logs[-30:]:
+                    ts = entry.get("timestamp") or entry.get("time") or ""
+                    st = entry.get("status") or "INFO"
+                    u = entry.get("username") or entry.get("id") or ""
+                    msg = entry.get("notes") or entry.get("error") or ""
+                    fallback_lines.append(f"[{ts}] [{st}] @{u}: {msg}")
+                logs = fallback_lines
+            except Exception:
+                pass
 
     return {
         "is_running": is_proc_running,
         "current_task": current_task,
+        "city": target_city,
         "logs": logs,
         "total_hosts": total_hosts,
         "curated_hosts": curated_hosts,
@@ -334,14 +405,16 @@ async def get_status():
 
 @app.get("/api/system/health")
 async def get_system_health():
-    """Live health check для Ollama и Tailscale."""
+    """Live health check для Ollama и Tailscale с учетом OLLAMA_HOST."""
+    ollama_host = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
     ollama_online = False
     llm_online = False
     llava_online = False
     model_name = "qwen2.5:7b"
+    
     try:
         import urllib.request
-        req = urllib.request.Request("http://localhost:11434/api/tags")
+        req = urllib.request.Request(f"{ollama_host}/api/tags")
         loop = asyncio.get_running_loop()
         def _fetch_ollama():
             with urllib.request.urlopen(req, timeout=1.5) as resp:
@@ -350,54 +423,22 @@ async def get_system_health():
             return None
         ollama_data = await loop.run_in_executor(None, _fetch_ollama)
         if ollama_data:
-            models = [m.get("name") for m in ollama_data.get("models", [])]
+            models = [str(m.get("name", "")) for m in ollama_data.get("models", [])]
             ollama_online = True
-            if any("qwen" in str(m).lower() for m in models):
+            if any("qwen" in m.lower() for m in models):
                 model_name = "qwen2.5:7b"
+                llm_online = True
             elif models:
                 model_name = models[0]
+                llm_online = True
+            
+            # Легкая и быстрая проверка наличия LLaVA модели в списке без тяжелой инференции
+            if any("llava" in m.lower() for m in models):
+                llava_online = True
     except Exception:
         ollama_online = False
-    llm_online = False
-    llava_online = False
-    
-    # LLM test request to qwen2.5:7b
-    if ollama_online:
-        try:
-            # json imported at module level
-            data = json.dumps({"model": "qwen2.5:7b", "prompt": "test", "stream": False}).encode("utf-8")
-            req = urllib.request.Request(
-                "http://localhost:11434/api/generate",
-                data=data,
-                method="POST"
-            )
-            req.add_header("Content-Type", "application/json")
-            with urllib.request.urlopen(req, timeout=3.0) as resp:
-                if resp.status == 200:
-                    llm_online = True
-        except Exception as e:
-            print(f"LLM test failed: {type(e).__name__}: {e}")
-    else:
-        print("Ollama offline - LLM unavailable")
-    
-    # LLaVA Vision test
-    if ollama_online:
-        try:
-            # json imported at module level
-            data = json.dumps({"model": "llava:latest", "prompt": "describe: [test]", "stream": False, "images": []}).encode("utf-8")
-            req = urllib.request.Request(
-                "http://localhost:11434/api/generate",
-                data=data,
-                method="POST"
-            )
-            req.add_header("Content-Type", "application/json")
-            with urllib.request.urlopen(req, timeout=5.0) as resp:
-                if resp.status == 200:
-                    llava_online = True
-        except Exception as e:
-            print(f"LLaVA test failed: {type(e).__name__}: {e}")
-    else:
-        print("Ollama offline - LLaVA unavailable")
+        llm_online = False
+        llava_online = False
     
     ts_active = False
     ts_ip = None
@@ -578,8 +619,6 @@ async def start_scraper(params: ScraperParams):
         cmd.append("--headless")
     if params.no_couples:
         cmd.append("--no-couples")
-    if params.no_lgbtq:
-        cmd.append("--no-lgbtq")
     if params.arrival_date:
         cmd.extend(["--arrival-date", params.arrival_date])
     if params.departure_date:
@@ -604,95 +643,214 @@ async def stop_scraper():
 
 @app.get("/api/trips/list")
 async def api_trips_list():
-    """Возвращает список трипов пользователя со страницы /c/trips."""
+    """Возвращает список актуальных трипов пользователя из канонической таблицы core_trips."""
+    from core.database import list_trips
     try:
-        import subprocess as _sp
-        result = _sp.run(
-            [sys.executable, "-u", str(BASE_DIR / "scraper.py"), "--list-trips", "--headless"],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            cwd=str(BASE_DIR),
-        )
-        if result.returncode != 0:
-            return {"error": f"scraper.py --list-trips failed: {result.stderr}"}
-        # Parse JSON output from stdout
-        # The scraper prints log lines before the JSON array, so we need to find
-        # the line that starts a valid JSON array.
-        trips = None
-        stdout_stripped = result.stdout.strip()
-        try:
-            trips = json.loads(stdout_stripped)
-        except json.JSONDecodeError:
-            # Try to find JSON array in the output
-            lines = stdout_stripped.splitlines()
-            json_start = None
-            for i, line in enumerate(lines):
-                stripped = line.strip()
-                # JSON array starts with '[' followed by '{' or ']' (empty array)
-                if stripped.startswith("[") and (len(stripped) == 1 or stripped[1] in "{[" or stripped == "["):
-                    try:
-                        trips = json.loads("\n".join(lines[i:]))
-                        json_start = i
-                        break
-                    except json.JSONDecodeError:
-                        continue
-            if trips is None:
-                return {"error": f"Не удалось распарсить вывод списка трипов: {stdout_stripped[:500]}"}
-        return {"status": "ok", "trips": trips, "count": len(trips)}
+        trips = list_trips()
+        trips_list = [
+            {
+                "trip_id": t.id,
+                "id": t.id,
+                "city": t.city,
+                "country": t.country,
+                "arrival_date": t.arrival_date,
+                "departure_date": t.departure_date,
+                "dates_text": t.dates_text or f"{t.arrival_date} – {t.departure_date}",
+                "url": t.url,
+                "is_active": t.is_active,
+            }
+            for t in trips
+        ]
+        return {"status": "ok", "trips": trips_list, "count": len(trips_list)}
     except Exception as e:
+        logger.error(f"Ошибка api_trips_list: {e}")
         return {"error": str(e)}
 
 
+class SelectTripPayload(BaseModel):
+    trip_id: str
+    city: Optional[str] = None
+    arrival: Optional[str] = None
+    departure: Optional[str] = None
+    datesText: Optional[str] = None
+    url: Optional[str] = None
+
+
+@app.get("/api/trips/active")
+async def api_get_active_trip():
+    """Возвращает текущую активную поездку (Единый корень системы) из core_trips."""
+    from core.database import get_active_trip
+    t = get_active_trip()
+    if t:
+        ctx = {
+            "trip_id": t.id,
+            "id": t.id,
+            "city": t.city,
+            "country": t.country,
+            "arrival": t.arrival_date,
+            "departure": t.departure_date,
+            "datesText": t.dates_text or f"{t.arrival_date} – {t.departure_date}",
+            "url": t.url,
+            "is_active": t.is_active,
+        }
+        return {"status": "ok", "trip": ctx}
+    return {"status": "ok", "trip": None}
+
+
+@app.post("/api/trips/select")
+async def api_select_trip(payload: SelectTripPayload):
+    """Синхронизирует выбор активной поездки в каноническую таблицу core_trips."""
+    from core.database import set_active_trip
+    canon = resolve_trip_alias(payload.trip_id) or payload.trip_id
+    updated_trip = set_active_trip(canon)
+    if not updated_trip:
+        raise HTTPException(status_code=404, detail=f"Trip {canon} not found")
+    
+    ctx = {
+        "trip_id": updated_trip.id,
+        "id": updated_trip.id,
+        "city": updated_trip.city,
+        "country": updated_trip.country,
+        "arrival": updated_trip.arrival_date,
+        "departure": updated_trip.departure_date,
+        "datesText": updated_trip.dates_text,
+        "url": updated_trip.url,
+        "is_active": updated_trip.is_active,
+    }
+    logger.info(f"Активная поездка зафиксирована в core_trips: {updated_trip.id} ({updated_trip.city}, {updated_trip.country})")
+    return {"status": "ok", "active_trip": ctx}
+
+
+@app.post("/api/trips/import")
+async def api_trips_import():
+    """Импортирует реальные предстоящие поездки с Couchsurfing через Playwright и сохраняет в SQLite user_trips."""
+    from scraper import CouchsurfingScraper, AUTH_STATE_FILE
+    if not AUTH_STATE_FILE.exists():
+        return JSONResponse(
+            status_code=401,
+            content={"status": "error", "error": "auth_required", "detail": "Файл сессии user_data/auth_state.json не найден. Требуется авторизация в Couchsurfing."}
+        )
+
+    try:
+        def _fetch():
+            scraper = CouchsurfingScraper(headless=True)
+            return scraper.list_trips()
+
+        discovered_trips = await asyncio.to_thread(_fetch)
+        if not discovered_trips:
+            return {"status": "ok", "trips": [], "count": 0, "message": "Предстоящие поездки не найдены на Couchsurfing."}
+
+        saved_trips = []
+        now = datetime.now().isoformat()
+        with db_session() as conn:
+            cur = conn.cursor()
+            for t in discovered_trips:
+                t_id = t.get("trip_id") or t.get("id") or ""
+                if not t_id and t.get("url"):
+                    parts = [p for p in t["url"].split("/") if p]
+                    t_id = parts[-1] if parts else ""
+                if not t_id:
+                    continue
+                city = t.get("city") or ""
+                arr = t.get("arrival_date") or ""
+                dep = t.get("departure_date") or ""
+                d_text = t.get("dates_text") or (f"{arr} – {dep}" if arr and dep else "")
+                url = t.get("url") or f"https://www.couchsurfing.com/c/trips/{t_id}"
+
+                cur.execute("""
+                    INSERT INTO user_trips (trip_id, city, arrival_date, departure_date, dates_text, url, is_active, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    ON CONFLICT(trip_id) DO UPDATE SET
+                        city=excluded.city,
+                        arrival_date=excluded.arrival_date,
+                        departure_date=excluded.departure_date,
+                        dates_text=excluded.dates_text,
+                        url=excluded.url,
+                        is_active=1,
+                        updated_at=excluded.updated_at;
+                """, (t_id, city, arr, dep, d_text, url, now, now))
+
+                saved_trips.append({
+                    "trip_id": t_id,
+                    "id": t_id,
+                    "city": city,
+                    "arrival_date": arr,
+                    "departure_date": dep,
+                    "dates_text": d_text,
+                    "url": url,
+                    "host_count": 0
+                })
+            conn.commit()
+
+        return {"status": "ok", "trips": saved_trips, "count": len(saved_trips)}
+    except Exception as e:
+        logger.error(f"Ошибка api_trips_import: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error": "import_failed", "detail": str(e)}
+        )
+
+
+class EraseSearchPayload(BaseModel):
+    city: Optional[str] = None
+    trip_id: Optional[str] = None
+
+
 @app.post("/api/search/erase-all")
-async def api_search_erase_all():
-    """Очистка всех данных поиска (hosts, queue, trips cache) из раздела Searching."""
+async def api_search_erase_all(payload: Optional[EraseSearchPayload] = None):
+    """Очистка результатов поиска исключительно для текущего выбранного трипа/города."""
     try:
         import json as _json
         from pathlib import Path as _Path
 
         cleared = []
+        target_city = (payload.city if payload and payload.city else None) or get_setting("default_city", "Kyoto") or "Kyoto"
+        slug = re.sub(r"\W+", "_", target_city.strip().lower())
+        trip_id = payload.trip_id if payload else None
 
-        # 1. Clear hosts output files (scraped hosts data)
-        for f in ["hosts_tokyo.json", "hosts_tokyo_curated.json", "hosts_kyoto.json", "hosts_osaka.json", "hosts_sapporo.json"]:
+        # 1. Очистка результатов поиска для выбранной поездки:
+        # Удаляем привязку к поездке из trip_hosts и неотправленные карточки из core_hosts.
+        # Исходная информация о профилях в глобальной таблице hosts сохраняется (ТЗ).
+        reset_count = 0
+        from core.database import get_active_trip, log_audit
+        active_trip = get_active_trip()
+        active_trip_id = trip_id or (active_trip.id if active_trip else None)
+        if active_trip_id:
+            active_trip_id = resolve_trip_alias(active_trip_id)
+
+        try:
+            with db_session() as conn:
+                cur = conn.cursor()
+                if active_trip_id:
+                    cur.execute("DELETE FROM trip_hosts WHERE LOWER(trip_id) = LOWER(?);", (active_trip_id,))
+                    cur.execute("""
+                        DELETE FROM core_hosts 
+                        WHERE LOWER(trip_id) = LOWER(?) AND state NOT IN ('sent', 'inbox');
+                    """, (active_trip_id,))
+                    reset_count = cur.rowcount
+                    log_audit(
+                        trip_id=active_trip_id,
+                        module="COLLECTOR",
+                        event="SEARCH_SELECTION_RESET",
+                        details={"reset_count": reset_count}
+                    )
+        except Exception as e:
+            logger.error(f"Ошибка очистки результатов поиска в базе: {e}")
+
+        # 2. Очищаем ТОЛЬКО локальные кэш-файлы JSON текущего города
+        for f in [f"hosts_{slug}.json", f"hosts_{slug}_curated.json", f"hosts_{slug}_live.json"]:
             p = OUTPUT_DIR / f
             if p.exists():
                 p.write_text("[]", encoding="utf-8")
                 cleared.append(f)
 
-        # 2. Clear requests queue (sent/queued data)
-        qf = OUTPUT_DIR / "requests_queue.json"
-        if qf.exists():
-            try:
-                qf.write_text("[]", encoding="utf-8")
-                cleared.append("requests_queue.json")
-            except Exception:
-                pass
-
-        # 3. Clear sent log
-        slf = OUTPUT_DIR / "sent_log.json"
-        if slf.exists():
-            try:
-                slf.write_text("[]", encoding="utf-8")
-                cleared.append("sent_log.json")
-            except Exception:
-                pass
-
-        # 4. Clear inbox status
-        isf = OUTPUT_DIR / "inbox_status.json"
-        if isf.exists():
-            try:
-                isf.write_text("{}", encoding="utf-8")
-                cleared.append("inbox_status.json")
-            except Exception:
-                pass
-
-        process_mgr.append_log("[ERASE] Все данные поиска очищены пользователем.")
+        process_mgr.append_log(f"[RESET] Выборка для {active_trip_id or target_city} сброшена (файлы: {cleared}, сброшено статусов: {reset_count}). Данные в БД сохранены.")
 
         return {
             "status": "ok",
-            "message": f"Очищено файлов: {len(cleared)}",
-            "cleared": cleared,
+            "message": f"Выборка для {active_trip_id or target_city} сброшена. Данные профилей сохранены в базе.",
+            "cleared_files": cleared,
+            "reset_count": reset_count,
         }
     except Exception as e:
         return {"error": str(e)}
@@ -700,6 +858,7 @@ async def api_search_erase_all():
 
 class TripStartParams(BaseModel):
     trip_url: str
+    trip_id: Optional[str] = None
     city: Optional[str] = None
     gender: str = "Any"
     status: str = "Accepting Guests"
@@ -707,7 +866,6 @@ class TripStartParams(BaseModel):
     min_rate: float = 75.0
     pages: int = 10
     no_couples: bool = False
-    no_lgbtq: bool = False
     headless: bool = False
     arrival_date: Optional[str] = None
     departure_date: Optional[str] = None
@@ -733,12 +891,12 @@ async def start_scraper_from_trip(params: TripStartParams):
         "--min-rate", str(params.min_rate),
         "--pages", str(params.pages),
     ]
+    if params.trip_id:
+        cmd.extend(["--trip-id", params.trip_id])
     if params.headless:
         cmd.append("--headless")
     if params.no_couples:
         cmd.append("--no-couples")
-    if params.no_lgbtq:
-        cmd.append("--no-lgbtq")
     if params.arrival_date:
         cmd.extend(["--arrival-date", params.arrival_date])
     if params.departure_date:
@@ -751,6 +909,7 @@ async def start_scraper_from_trip(params: TripStartParams):
     return {
         "status": "started",
         "trip_url": params.trip_url,
+        "trip_id": params.trip_id,
         "city": params.city,
         "arrival_date": params.arrival_date,
         "departure_date": params.departure_date,
@@ -894,23 +1053,24 @@ async def set_cookie(data: CookieInput):
 
 @app.get("/api/context/categories")
 async def get_context_categories():
-    """Список категорий персонального контекста."""
+    """Список эталонных категорий персонального контекста."""
     return {
         "categories": [
-            "Personal Background",
-            "Travel Experience",
             "Professional Background",
-            "Technology & Entrepreneurship",
+            "Personal Background",
             "Hobbies & Interests",
-            "Current Travel Context",
+            "Travel Experience",
+            "Education",
+            "Languages",
+            "Technology & Entrepreneurship",
         ]
     }
 
 
 @app.get("/api/context/facts")
-async def get_context_facts(active_only: bool = False):
-    """Возвращает все структурированные факты заявителя."""
-    facts = context_mgr.get_all_facts(active_only=active_only)
+async def get_context_facts(active_only: bool = False, category: Optional[str] = None):
+    """Возвращает структурированные факты заявителя с сортировкой по приоритету и категории."""
+    facts = context_mgr.get_all_facts(active_only=active_only, category=category)
     return {"facts": facts, "count": len(facts)}
 
 
@@ -926,6 +1086,7 @@ async def save_context_fact(item: ContextFactItem):
         category=item.category,
         title=item.title,
         content=item.content,
+        priority=item.priority,
         status=item.status,
         source=item.source,
         confidence=item.confidence,
@@ -933,6 +1094,24 @@ async def save_context_fact(item: ContextFactItem):
         valid_until=item.valid_until,
     )
     return {"status": "saved", "fact": saved}
+
+
+@app.put("/api/context/facts/{fact_id}")
+async def update_context_fact(fact_id: str, item: ContextFactItem):
+    """Обновление существующего факта."""
+    saved = context_mgr.upsert_fact(
+        fact_id=fact_id,
+        category=item.category,
+        title=item.title,
+        content=item.content,
+        priority=item.priority,
+        status=item.status,
+        source=item.source,
+        confidence=item.confidence,
+        is_active=item.is_active,
+        valid_until=item.valid_until,
+    )
+    return {"status": "updated", "fact": saved}
 
 
 @app.patch("/api/context/facts/{fact_id}/toggle")
@@ -951,6 +1130,182 @@ async def delete_context_fact(fact_id: str):
     if not ok:
         raise HTTPException(status_code=404, detail="Fact not found")
     return {"status": "deleted", "fact_id": fact_id}
+
+
+# --- Compatibility Anchors API ---
+
+@app.get("/api/context/anchors")
+async def get_context_anchors(active_only: bool = False):
+    """Возвращает все якоря совместимости."""
+    anchors = context_mgr.get_all_anchors(active_only=active_only)
+    return {"anchors": anchors, "count": len(anchors)}
+
+
+@app.post("/api/context/anchors")
+async def create_or_update_anchor(item: ContextAnchorItem):
+    """Создание или обновление якоря совместимости."""
+    anchor_id = item.anchor_id
+    if not anchor_id:
+        slug = re.sub(r"\W+", "_", item.name.lower().strip()).strip("_")
+        anchor_id = f"anchor_{slug}_{int(datetime.now().timestamp())}"
+
+    saved = context_mgr.upsert_anchor(
+        anchor_id=anchor_id,
+        name=item.name,
+        category=item.category,
+        keywords=item.keywords,
+        description=item.description or "",
+        priority=item.priority,
+        is_active=item.is_active,
+    )
+    return {"status": "saved", "anchor": saved}
+
+
+@app.put("/api/context/anchors/{anchor_id}")
+async def update_context_anchor(anchor_id: str, item: ContextAnchorItem):
+    """Обновление якоря совместимости."""
+    saved = context_mgr.upsert_anchor(
+        anchor_id=anchor_id,
+        name=item.name,
+        category=item.category,
+        keywords=item.keywords,
+        description=item.description or "",
+        priority=item.priority,
+        is_active=item.is_active,
+    )
+    return {"status": "updated", "anchor": saved}
+
+
+@app.patch("/api/context/anchors/{anchor_id}/toggle")
+async def toggle_context_anchor(anchor_id: str, payload: ToggleAnchorPayload):
+    """Включение/выключение якоря совместимости."""
+    ok = context_mgr.toggle_anchor_active(anchor_id, payload.is_active)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Anchor not found")
+    return {"status": "updated", "anchor_id": anchor_id, "is_active": payload.is_active}
+
+
+@app.delete("/api/context/anchors/{anchor_id}")
+async def delete_context_anchor(anchor_id: str):
+    """Удаление якоря совместимости."""
+    ok = context_mgr.delete_anchor(anchor_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Anchor not found")
+    return {"status": "deleted", "anchor_id": anchor_id}
+
+
+# --- Travel Context API (Strictly bound to core_trips root) ---
+
+@app.get("/api/context/travel")
+async def get_travel_context():
+    """Возвращает текущий динамический контекст поездки строго из core_trips (Единый источник истины)."""
+    from core.database import get_active_trip
+    trip = get_active_trip()
+    if trip:
+        return {
+            "travel_context": {
+                "trip_id": trip.id,
+                "city": trip.city,
+                "country": trip.country,
+                "dates_text": trip.dates_text or f"{trip.arrival_date} – {trip.departure_date}",
+                "arrival_date": trip.arrival_date,
+                "departure_date": trip.departure_date,
+                "url": trip.url,
+                "purpose": "Exploring historic neighborhoods, photography, and cultural exchange before the winter season",
+            }
+        }
+
+    return {
+        "travel_context": {
+            "trip_id": "kyoto-trip-3lhdfema5epclndo82mclxklzfytp-3LhDfEmA5Epclndo82MclXkLzFy_tp",
+            "city": "Kyoto",
+            "country": "Japan",
+            "dates_text": "Nov 19–21, 2026",
+            "arrival_date": "2026-11-19",
+            "departure_date": "2026-11-21",
+            "purpose": "Exploring historic neighborhoods, photography, and cultural exchange before the winter season",
+        }
+    }
+
+
+@app.post("/api/context/travel")
+async def set_travel_context(payload: TravelContextPayload):
+    """Синхронизирует активный контекст поездки с core_trips (Единый источник истины)."""
+    from core.database import get_active_trip, set_active_trip
+    active_trip = get_active_trip()
+    
+    data = payload.dict()
+    # Если передан city или trip_id, активируем соответствующий trip в core_trips
+    if payload.trip_id:
+        set_active_trip(payload.trip_id)
+    elif payload.city:
+        with db_session() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM core_trips WHERE LOWER(city) = LOWER(?) LIMIT 1;", (payload.city.strip(),))
+            row = cur.fetchone()
+            if row:
+                set_active_trip(row[0])
+            
+    set_setting("active_trip_context", json.dumps(data, ensure_ascii=False))
+    if payload.city:
+        set_setting("default_city", payload.city)
+    return {"status": "saved", "travel_context": data}
+
+
+# --- Context Preview API ---
+
+@app.post("/api/context/preview")
+async def preview_assembled_context(payload: ContextPreviewPayload):
+    """
+    Инструмент предварительного просмотра:
+    собирает контекст для конкретного хоста и генерирует превью сообщения.
+    """
+    from context_assembler import get_context_assembler
+    assembler = get_context_assembler()
+
+    # Поиск хоста в SQLite
+    host_data = None
+    with db_session() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM hosts WHERE id = ? OR username = ?;",
+            (payload.host_id, payload.host_id.lstrip("@")),
+        )
+        row = cur.fetchone()
+        if row:
+            host_data = dict(row)
+
+    if not host_data:
+        raise HTTPException(status_code=404, detail=f"Host '{payload.host_id}' not found in database")
+
+    trip_ctx = {
+        "city": payload.city or host_data.get("city") or "Kyoto",
+        "arrival_date": payload.arrival_date,
+        "departure_date": payload.departure_date,
+        "trip_id": payload.trip_id,
+    }
+
+    assembled = assembler.assemble_context(host_data, trip_context=trip_ctx)
+
+    # Генерация превью сообщения
+    cin = payload.arrival_date or host_data.get("arrival_date") or "2026-11-19"
+    cout = payload.departure_date or host_data.get("departure_date") or "2026-11-21"
+
+    from message_generator import generate_stay_request
+    fallback_msg = generate_stay_request(host_data, check_in=cin, check_out=cout)
+
+    return {
+        "host": {
+            "id": host_data.get("id"),
+            "username": host_data.get("username"),
+            "name": host_data.get("name"),
+            "clean_name": host_data.get("clean_name"),
+            "location": host_data.get("location"),
+            "about_snippet": (host_data.get("about_me_clean") or host_data.get("about_me") or "")[:300],
+        },
+        "assembled_context": assembled,
+        "preview_message": fallback_msg,
+    }
 
 
 @app.get("/api/context/export")
@@ -980,8 +1335,9 @@ async def import_context_facts(data: List[Dict[str, Any]]):
 # =========================================================================
 
 @app.get("/api/analysis/{username}")
-async def get_host_analysis(username: str):
-    """Получение детального анализа профиля хоста, хуков и стратегии."""
+async def get_host_analysis(username: str, trip_id: Optional[str] = None, city: Optional[str] = None):
+    """Получение детального анализа профиля хоста, хуков, статуса очереди и персонального контекста."""
+    u_clean = username.strip()
     with db_session() as conn:
         cur = conn.cursor()
         cur.execute(
@@ -989,24 +1345,128 @@ async def get_host_analysis(username: str):
             SELECT h.*, pa.*
             FROM hosts h
             LEFT JOIN profile_analyses pa ON h.id = pa.host_id
-            WHERE h.username = ? OR h.id = ?;
+            WHERE LOWER(h.username) = LOWER(?) OR LOWER(h.id) = LOWER(?);
             """,
-            (username, username),
+            (u_clean, u_clean),
         )
         row = cur.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Host not found")
         data = dict(row)
+        host_id = data.get("id") or data.get("username") or u_clean
+        data["name"] = sanitize_host_name(data.get("name") or u_clean)
+        data["clean_name"] = sanitize_host_clean_name(data.get("clean_name") or data["name"])
+        data["location"] = sanitize_host_location(data.get("location"))
+
         if data.get("conversation_hooks_json"):
             try:
                 data["conversation_hooks"] = json.loads(data["conversation_hooks_json"])
             except Exception:
                 data["conversation_hooks"] = []
+        else:
+            data["conversation_hooks"] = []
+
         if data.get("compatibility_points_json"):
             try:
                 data["compatibility_points"] = json.loads(data["compatibility_points_json"])
             except Exception:
                 data["compatibility_points"] = []
+        else:
+            data["compatibility_points"] = []
+
+        # Подтягиваем привязку к Trip Card (по переданному trip_id или текущей привязке хоста)
+        trip_row = None
+        if trip_id and str(trip_id).strip().lower() not in ("none", "null", "undefined"):
+            canon_t = resolve_trip_alias(trip_id)
+            cur.execute(
+                "SELECT trip_id, city, arrival_date, departure_date FROM user_trips WHERE LOWER(trip_id) = LOWER(?) LIMIT 1;",
+                (canon_t,),
+            )
+            trip_row = cur.fetchone()
+            if not trip_row:
+                cur.execute(
+                    """
+                    SELECT th.trip_id,
+                           (SELECT city FROM trip_hosts WHERE LOWER(trip_id) = LOWER(th.trip_id) AND city IS NOT NULL AND TRIM(city) != '' GROUP BY city ORDER BY count(*) DESC LIMIT 1) as city,
+                           (SELECT arrival_date FROM trip_hosts WHERE LOWER(trip_id) = LOWER(th.trip_id) AND arrival_date IS NOT NULL AND TRIM(arrival_date) != '' GROUP BY arrival_date ORDER BY count(*) DESC LIMIT 1) as arrival_date,
+                           (SELECT departure_date FROM trip_hosts WHERE LOWER(trip_id) = LOWER(th.trip_id) AND departure_date IS NOT NULL AND TRIM(departure_date) != '' GROUP BY departure_date ORDER BY count(*) DESC LIMIT 1) as departure_date
+                    FROM trip_hosts th
+                    WHERE LOWER(th.trip_id) = LOWER(?)
+                    LIMIT 1;
+                    """,
+                    (canon_t,),
+                )
+                trip_row = cur.fetchone()
+        if not trip_row:
+            cur.execute(
+                "SELECT trip_id, NULLIF(TRIM(city), '') as city, NULLIF(TRIM(arrival_date), '') as arrival_date, NULLIF(TRIM(departure_date), '') as departure_date FROM trip_hosts WHERE LOWER(host_id) = LOWER(?) OR LOWER(host_id) = LOWER(?) LIMIT 1;",
+                (host_id, u_clean),
+            )
+            trip_row = cur.fetchone()
+
+        eff_city = (city or (trip_row["city"] if trip_row and trip_row["city"] else None) or str(data.get("location") or "Kyoto").split(",")[0].strip() or "Kyoto").strip()
+        eff_arr = (trip_row["arrival_date"] if trip_row and trip_row["arrival_date"] else None) or DEFAULT_CHECK_IN
+        eff_dep = (trip_row["departure_date"] if trip_row and trip_row["departure_date"] else None) or DEFAULT_CHECK_OUT
+        eff_trip_id = (trip_row["trip_id"] if trip_row and trip_row["trip_id"] else None) or trip_id
+
+        data["city"] = eff_city
+        data["trip_info"] = {
+            "trip_id": eff_trip_id,
+            "city": eff_city,
+            "arrival_date": eff_arr,
+            "departure_date": eff_dep,
+        }
+
+        # Проверяем наличие хоста в очереди (sending_queue + generated_messages)
+        cur.execute(
+            """
+            SELECT sq.status, sq.notes, sq.updated_at,
+                   gm.message_text, gm.word_count, gm.qc_passed,
+                   gm.anchor_used, gm.host_fact_used, gm.user_fact_used,
+                   gm.check_in, gm.check_out
+            FROM sending_queue sq
+            LEFT JOIN generated_messages gm ON sq.current_message_id = gm.id
+            WHERE LOWER(sq.host_id) = LOWER(?) OR LOWER(sq.host_id) = LOWER(?);
+            """,
+            (host_id, u_clean),
+        )
+        sq_row = cur.fetchone()
+        if sq_row:
+            data["in_queue"] = True
+            data["queue_status"] = sq_row["status"] or "Draft"
+            data["generated_message"] = sq_row["message_text"] or ""
+            data["word_count"] = sq_row["word_count"] or len((sq_row["message_text"] or "").split())
+            data["qc_passed"] = bool(sq_row["qc_passed"]) if sq_row["qc_passed"] is not None else True
+            data["anchor_used"] = sq_row["anchor_used"]
+            data["host_fact_used"] = sq_row["host_fact_used"]
+            data["user_fact_used"] = sq_row["user_fact_used"]
+            data["check_in"] = sq_row["check_in"] or eff_arr
+            data["check_out"] = sq_row["check_out"] or eff_dep
+        else:
+            data["in_queue"] = False
+            data["queue_status"] = None
+            data["generated_message"] = ""
+            data["word_count"] = 0
+            data["qc_passed"] = None
+            data["check_in"] = eff_arr
+            data["check_out"] = eff_dep
+
+        # Собираем пересечения контекста и основной хук
+        try:
+            from context_assembler import get_context_assembler
+            from message_generator import select_primary_hook
+            assembler = get_context_assembler()
+            assembled = assembler.assemble_context(data, trip_context=data["trip_info"])
+            primary_hook = select_primary_hook(data)
+            data["primary_hook"] = primary_hook
+            data["intersections"] = assembled.get("intersections", [])
+            if not data.get("anchor_used") and primary_hook:
+                data["anchor_used"] = primary_hook.get("type", "").replace("_", " ").title()
+                data["host_fact_used"] = primary_hook.get("hook_detail")
+                data["user_fact_used"] = primary_hook.get("andrey_fact")
+        except Exception as e:
+            logger.warning(f"Ошибка сборки контекста для карточки {u_clean}: {e}")
+
         return data
 
 
@@ -1028,33 +1488,197 @@ async def reanalyze_host_profile(payload: ReanalyzePayload):
 # Просмотр результатов и скачивание файлов
 # =========================================================================
 
+# Явное сопоставление подтверждённых легитимных алиасов (коротких URL-хэшей и альтернативных форматов) в канонический trip_id
+KNOWN_TRIP_ALIASES = {
+    # CS URL short hash -> канонический ID поездки
+    "3lhdfema5epclndo82mclxklzfytp": "kyoto-trip-3lhdfema5epclndo82mclxklzfytp-3LhDfEmA5Epclndo82MclXkLzFy_tp",
+    "3lhdfema5epclndo82mclxk_tp": "kyoto-trip-3lhdfema5epclndo82mclxklzfytp-3LhDfEmA5Epclndo82MclXkLzFy_tp",
+    "kyoto-trip-3lhdfema5epclndo82mclxklzfytp-3lhdfema5epclndo82mclxklzfytp": "kyoto-trip-3lhdfema5epclndo82mclxklzfytp-3LhDfEmA5Epclndo82MclXkLzFy_tp",
+}
+
+
+def resolve_trip_alias(trip_id: Optional[str]) -> Optional[str]:
+    """Разрешает подтверждённые легитимные алиасы в канонический trip_id без fuzzy-поиска."""
+    if not trip_id:
+        return None
+    t_clean = str(trip_id).strip()
+    return KNOWN_TRIP_ALIASES.get(t_clean.lower(), t_clean)
+
+
+def get_queued_identifiers(trip_id: Optional[str] = None) -> Set[str]:
+    """Возвращает полный набор lowercase-идентификаторов (username и id) хостов, находящихся в очереди (с учетом trip_id)."""
+    with db_session() as conn:
+        cur = conn.cursor()
+        if trip_id:
+            canon = resolve_trip_alias(trip_id)
+            cur.execute("""
+                SELECT DISTINCT LOWER(COALESCE(h.username, sq.host_id)), LOWER(sq.host_id), LOWER(COALESCE(h.id, sq.host_id))
+                FROM sending_queue sq
+                LEFT JOIN hosts h ON (sq.host_id = h.id OR LOWER(sq.host_id) = LOWER(h.username))
+                JOIN trip_hosts th ON (
+                    sq.host_id = th.host_id 
+                    OR LOWER(sq.host_id) = LOWER(th.host_id)
+                    OR (h.id IS NOT NULL AND LOWER(h.id) = LOWER(th.host_id))
+                    OR (h.username IS NOT NULL AND LOWER(h.username) = LOWER(th.host_id))
+                )
+                WHERE LOWER(th.trip_id) = LOWER(?)
+                  AND LOWER(COALESCE(sq.status, '')) IN ('draft', 'approved', 'queued', 'name_review_required', 'qc_review_required', 'needs_regeneration', 'sent', 'skipped');
+            """, (canon,))
+        else:
+            cur.execute("""
+                SELECT DISTINCT LOWER(COALESCE(h.username, sq.host_id)), LOWER(sq.host_id), LOWER(COALESCE(h.id, sq.host_id))
+                FROM sending_queue sq
+                LEFT JOIN hosts h ON (sq.host_id = h.id OR LOWER(sq.host_id) = LOWER(h.username))
+                WHERE LOWER(COALESCE(sq.status, '')) IN ('draft', 'approved', 'queued', 'name_review_required', 'qc_review_required', 'needs_regeneration', 'sent', 'skipped');
+            """)
+        queued = set()
+        for r in cur.fetchall():
+            for val in r:
+                if val:
+                    queued.add(str(val).strip().lower())
+        return queued
+
+
 @app.get("/api/results")
 @app.get("/api/hosts")
-async def get_results(curated: bool = False, hide_sent: bool = True, city: Optional[str] = None):
-    """Возвращает список хостов (сырых или очищенных) с поддержкой жесткого отсева отправленных."""
-    # Если город задан — читаем ТОЛЬКО его файлы (без fallback на Tokyo).
-    explicit_city = bool(city and city.strip())
-    if explicit_city:
-        slug = re.sub(r"\W+", "_", city.strip().lower())
-    else:
-        slug = "tokyo"
+async def get_results(
+    curated: bool = False,
+    hide_sent: bool = True,
+    city: Optional[str] = None,
+    trip_id: Optional[str] = None,
+    limit: Optional[int] = None,
+    offset: int = 0
+):
+    """Возвращает список хостов, еще НЕ добавленных в очередь (с учетом trip_id) и не отправленных."""
+    # Если передан конкретный trip_id — читаем строго привязанных к этой поездке хостов
+    data = []
+    if trip_id:
+        try:
+            with db_session() as conn:
+                cur = conn.cursor()
+                canon = resolve_trip_alias(trip_id)
+                cur.execute("""
+                    SELECT h.id, h.username, h.name, h.clean_name, h.profile_url, h.stay_request_url,
+                           h.location, h.avatar_url, h.about_me, h.about_me_clean, h.references_count,
+                           h.response_rate_pct, h.instagram_handle, h.instagram_url,
+                           pa.estimated_gender, pa.host_type, pa.sleeping_arrangement, pa.house_rules,
+                           pa.secret_code_detected, pa.secret_code_hint,
+                           COALESCE(ch.is_verified, 0) as is_verified,
+                           ch.score_stars
+                    FROM trip_hosts th
+                    JOIN hosts h ON th.host_id = h.id
+                    LEFT JOIN profile_analyses pa ON h.id = pa.host_id
+                    LEFT JOIN core_hosts ch ON (LOWER(ch.trip_id) = LOWER(th.trip_id) AND (LOWER(ch.host_id) = LOWER(h.id) OR LOWER(ch.username) = LOWER(h.username)))
+                    WHERE LOWER(th.trip_id) = LOWER(?)
+                      AND (ch.state IS NULL OR ch.state NOT IN ('rejected', 'skipped', 'sent'))
+                    ORDER BY th.created_at DESC;
+                """, (canon,))
+                for row in cur.fetchall():
+                    data.append({
+                        "id": row["id"],
+                        "username": row["username"],
+                        "name": row["name"],
+                        "clean_name": row["clean_name"],
+                        "profile_url": row["profile_url"],
+                        "stay_request_url": row["stay_request_url"],
+                        "location": row["location"],
+                        "avatar_url": row["avatar_url"],
+                        "about_me": row["about_me"],
+                        "about_me_clean": row["about_me_clean"],
+                        "references_count": row["references_count"],
+                        "response_rate_pct": row["response_rate_pct"],
+                        "instagram_handle": row["instagram_handle"],
+                        "instagram_url": row["instagram_url"],
+                        "estimated_gender": row["estimated_gender"] or "Unknown",
+                        "host_type": row["host_type"] or "solo",
+                        "sleeping_arrangement": row["sleeping_arrangement"] or "Not specified",
+                        "house_rules": row["house_rules"] or "",
+                        "is_verified": bool(row["is_verified"]),
+                        "score_stars": row["score_stars"] or 4,
+                    })
+        except Exception as e:
+            logger.error(f"Ошибка загрузки хостов по trip_id {trip_id}: {e}")
 
-    # Определяем основной файл с хостами
-    if curated:
-        json_path = OUTPUT_DIR / f"hosts_{slug}_curated.json"
-        if not json_path.exists():
-            json_path = OUTPUT_DIR / f"hosts_{slug}.json"
-    else:
-        json_path = OUTPUT_DIR / f"hosts_{slug}.json"
-        if not json_path.exists() and explicit_city:
+    # Если города нет и trip_id нет или вернулось пусто — берем по городу
+    target_city = (city or get_setting("default_city", "Kyoto") or "Kyoto").strip()
+    is_all_cities = target_city.lower() == "all"
+    clean_city = re.split(r"[,/]", target_city)[0].strip()
+    slug = re.sub(r"\W+", "_", clean_city.lower())
+
+    # 1. Сначала проверяем JSON-файлы города (если не all и не найдено по trip_id)
+    if not data and not is_all_cities:
+        json_path = OUTPUT_DIR / (f"hosts_{slug}_curated.json" if curated else f"hosts_{slug}.json")
+        if not json_path.exists() and curated:
             json_path = OUTPUT_DIR / f"hosts_{slug}.json"
 
-    # Если идет сбор — читаем также live-файл для отображения в реальном времени
-    # Если основного файла нет вообще — читаем live-файл в любом случае
+        if json_path.exists():
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception as e:
+                logger.error(f"Ошибка чтения основного файла хостов: {e}")
+                data = []
+
+    # 2. Если в JSON пусто, файла нет или запрошен all — читаем SQLite hosts
+    if not data:
+        try:
+            with db_session() as conn:
+                cur = conn.cursor()
+                if is_all_cities:
+                    cur.execute("""
+                        SELECT h.id, h.username, h.name, h.clean_name, h.profile_url, h.stay_request_url,
+                               h.location, h.avatar_url, h.about_me, h.about_me_clean, h.references_count,
+                               h.response_rate_pct, h.instagram_handle, h.instagram_url,
+                               pa.estimated_gender, pa.host_type, pa.sleeping_arrangement, pa.house_rules,
+                               pa.secret_code_detected, pa.secret_code_hint
+                        FROM hosts h
+                        LEFT JOIN profile_analyses pa ON h.id = pa.host_id
+                        WHERE LOWER(h.id) NOT IN (SELECT LOWER(host_id) FROM sending_queue WHERE LOWER(COALESCE(status, '')) IN ('draft', 'approved', 'queued', 'name_review_required', 'sent', 'skipped'))
+                          AND LOWER(h.username) NOT IN (SELECT LOWER(COALESCE(h2.username, sq.host_id)) FROM sending_queue sq LEFT JOIN hosts h2 ON sq.host_id = h2.id WHERE LOWER(COALESCE(sq.status, '')) IN ('draft', 'approved', 'queued', 'name_review_required', 'sent', 'skipped'))
+                        ORDER BY h.updated_at DESC;
+                    """)
+                else:
+                    cur.execute("""
+                        SELECT h.id, h.username, h.name, h.clean_name, h.profile_url, h.stay_request_url,
+                               h.location, h.avatar_url, h.about_me, h.about_me_clean, h.references_count,
+                               h.response_rate_pct, h.instagram_handle, h.instagram_url,
+                               pa.estimated_gender, pa.host_type, pa.sleeping_arrangement, pa.house_rules,
+                               pa.secret_code_detected, pa.secret_code_hint
+                        FROM hosts h
+                        LEFT JOIN profile_analyses pa ON h.id = pa.host_id
+                        WHERE (LOWER(h.location) LIKE ? OR LOWER(h.location) LIKE ?)
+                          AND LOWER(h.id) NOT IN (SELECT LOWER(host_id) FROM sending_queue WHERE LOWER(COALESCE(status, '')) IN ('draft', 'approved', 'queued', 'name_review_required', 'sent', 'skipped'))
+                          AND LOWER(h.username) NOT IN (SELECT LOWER(COALESCE(h2.username, sq.host_id)) FROM sending_queue sq LEFT JOIN hosts h2 ON sq.host_id = h2.id WHERE LOWER(COALESCE(sq.status, '')) IN ('draft', 'approved', 'queued', 'name_review_required', 'sent', 'skipped'))
+                        ORDER BY h.updated_at DESC;
+                    """, (f"%{clean_city.lower()}%", f"%{slug}%"))
+                for row in cur.fetchall():
+                    data.append({
+                        "id": row["id"],
+                        "username": row["username"],
+                        "name": row["name"],
+                        "clean_name": row["clean_name"],
+                        "profile_url": row["profile_url"],
+                        "stay_request_url": row["stay_request_url"],
+                        "location": row["location"],
+                        "avatar_url": row["avatar_url"],
+                        "about_me": row["about_me"],
+                        "about_me_clean": row["about_me_clean"],
+                        "references_count": row["references_count"],
+                        "response_rate_pct": row["response_rate_pct"],
+                        "instagram_handle": row["instagram_handle"],
+                        "instagram_url": row["instagram_url"],
+                        "estimated_gender": row["estimated_gender"] or "Unknown",
+                        "host_type": row["host_type"] or "solo",
+                        "sleeping_arrangement": row["sleeping_arrangement"] or "Not specified",
+                        "house_rules": row["house_rules"] or "",
+                    })
+        except Exception as e:
+            logger.error(f"Ошибка загрузки хостов из SQLite: {e}")
+
+    # Читаем live-файл при активном скрейпинге
     live_hosts = []
-    is_scraping = process_mgr.is_running
-    live_path = OUTPUT_DIR / f"hosts_{slug}_live.json"
-    if is_scraping or not json_path.exists():
+    if not is_all_cities:
+        live_path = OUTPUT_DIR / f"hosts_{slug}_live.json"
         if live_path.exists():
             try:
                 with open(live_path, "r", encoding="utf-8") as f:
@@ -1062,22 +1686,9 @@ async def get_results(curated: bool = False, hide_sent: bool = True, city: Optio
             except Exception:
                 live_hosts = []
 
-    if not json_path.exists() and not live_hosts:
-        return []
-
-    # Читаем основной файл
-    data = []
-    if json_path.exists():
-        try:
-            with open(json_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception as e:
-            logger.error(f"Ошибка чтения основного файла хостов: {e}")
-            data = []
-
-    # Объединяем с live-хостами (живые добавляются в начало, помечаются как новые)
+    # Объединяем с live-хостами
     existing_usernames = {str(x.get("username", "")).strip().lower() for x in data}
-    for h in reversed(live_hosts):  # обратный порядок, чтобы новые были сверху
+    for h in reversed(live_hosts):
         u = str(h.get("username", "")).strip().lower()
         if u and u not in existing_usernames:
             h["_new"] = True
@@ -1085,7 +1696,16 @@ async def get_results(curated: bool = False, hide_sent: bool = True, city: Optio
             data.insert(0, h)
             existing_usernames.add(u)
 
-    # Жесткое исключение отправленных адресатов (SQLite + JSON logs + Queue)
+    # Исключение хостов, уже находящихся в очереди (sending_queue) для активного trip_id или города
+    queued_ids = get_queued_identifiers(trip_id=trip_id)
+    if queued_ids:
+        data = [
+            x for x in data
+            if str(x.get("username", "")).strip().lower() not in queued_ids
+            and str(x.get("id", "")).strip().lower() not in queued_ids
+        ]
+
+    # Исключение отправленных адресатов
     if hide_sent:
         from database import get_sent_usernames
         sent_set = get_sent_usernames()
@@ -1097,217 +1717,610 @@ async def get_results(curated: bool = False, hide_sent: bool = True, city: Optio
             ]
 
     for x in data:
+        raw_g = x.get("estimated_gender") or x.get("gender") or "Unknown"
+        raw_g_str = str(raw_g).strip().lower()
+        if raw_g_str in ("male", "m"):
+            norm_g = "Male"
+        elif raw_g_str in ("female", "f"):
+            norm_g = "Female"
+        elif raw_g_str in ("couple", "duo"):
+            norm_g = "Couple"
+        else:
+            norm_g = "Unknown"
+        x["estimated_gender"] = norm_g
+        x["gender"] = norm_g.lower()
         x["name"] = sanitize_host_name(x.get("name"))
         x["clean_name"] = sanitize_host_clean_name(x.get("clean_name") or x.get("name"))
         x["location"] = sanitize_host_location(x.get("location"))
 
+    # Серверная пагинация (если задан limit)
+    if limit is not None and limit > 0:
+        data = data[offset : offset + limit]
+
     return data
+
+
+class DeleteHostsPayload(BaseModel):
+    usernames: List[str]
+    city: Optional[str] = None
+    trip_id: Optional[str] = None
+
+
+@app.post("/api/hosts/delete")
+async def delete_selected_hosts(payload: DeleteHostsPayload):
+    """
+    Безопасное удаление выбранных хостов из текущей выборки/города/поездки.
+    Защищает глобальный профиль хоста, если он используется в других поездках или очереди.
+    """
+    to_delete = set(u.strip().lower() for u in payload.usernames if u.strip())
+    if not to_delete:
+        return {"status": "ok", "deleted_count": 0}
+
+    # Защита отправленных: никогда не удаляем хостов со статусом 'Sent'
+    sent_protected = set()
+    try:
+        with db_session() as conn:
+            cur = conn.cursor()
+            for u in list(to_delete):
+                cur.execute("""
+                    SELECT count(*) FROM sending_queue 
+                    WHERE (LOWER(host_id) = ? OR host_id IN (SELECT id FROM hosts WHERE LOWER(username) = ? OR LOWER(id) = ?))
+                      AND LOWER(status) = 'sent';
+                """, (u, u, u))
+                if cur.fetchone()[0] > 0:
+                    sent_protected.add(u)
+    except Exception as e:
+        logger.error(f"Ошибка проверки Sent при удалении: {e}")
+
+    to_delete = to_delete - sent_protected
+    if not to_delete:
+        return {"status": "ok", "deleted_count": 0, "protected_sent": list(sent_protected)}
+
+    # 1. По ТЗ: перевод хостов в статус 'rejected' (Pass) без физического удаления из БД
+    from core.database import get_active_trip, log_audit
+    active_trip = get_active_trip()
+    target_trip_id = payload.trip_id or (active_trip.id if active_trip else None)
+    if target_trip_id:
+        target_trip_id = resolve_trip_alias(str(target_trip_id).strip())
+
+    marked_rejected_count = 0
+    try:
+        with db_session() as conn:
+            cur = conn.cursor()
+            u_list = list(to_delete)
+            placeholders = ",".join("?" for _ in u_list)
+            if target_trip_id:
+                # 1. Удаляем привязку к поездке из trip_hosts
+                cur.execute(f"""
+                    DELETE FROM trip_hosts 
+                    WHERE LOWER(trip_id) = LOWER(?) 
+                      AND (LOWER(host_id) IN ({placeholders}) 
+                           OR host_id IN (SELECT id FROM hosts WHERE LOWER(username) IN ({placeholders})));
+                """, [target_trip_id] + u_list + u_list)
+
+                # 2. Переводим в статус rejected в core_hosts (ТЗ)
+                cur.execute(f"""
+                    UPDATE core_hosts 
+                    SET state = 'rejected', updated_at = CURRENT_TIMESTAMP
+                    WHERE LOWER(trip_id) = LOWER(?)
+                      AND (LOWER(host_id) IN ({placeholders}) OR LOWER(username) IN ({placeholders}))
+                      AND state != 'sent';
+                """, [target_trip_id] + u_list + u_list)
+                marked_rejected_count = cur.rowcount
+            else:
+                cur.execute(f"""
+                    UPDATE core_hosts 
+                    SET state = 'rejected', updated_at = CURRENT_TIMESTAMP
+                    WHERE (LOWER(host_id) IN ({placeholders}) OR LOWER(username) IN ({placeholders}))
+                      AND state != 'sent';
+                """, u_list + u_list)
+                marked_rejected_count = cur.rowcount
+
+            # 3. Помечаем в sending_queue как Skipped
+            cur.execute(f"""
+                UPDATE sending_queue 
+                SET status = 'Skipped', updated_at = CURRENT_TIMESTAMP
+                WHERE (LOWER(host_id) IN ({placeholders}) 
+                       OR host_id IN (SELECT id FROM hosts WHERE LOWER(username) IN ({placeholders}) OR LOWER(id) IN ({placeholders})))
+                  AND LOWER(status) != 'sent';
+            """, u_list + u_list + u_list)
+
+            if target_trip_id:
+                log_audit(
+                    trip_id=target_trip_id,
+                    module="SELECTOR",
+                    event="HOST_REJECTED",
+                    details={"action": "pass", "count": marked_rejected_count}
+                )
+    except Exception as e:
+        logger.error(f"Ошибка БД при удалении хостов: {e}")
+
+    # 2. Обновляем shadow view JSON (если файлы существуют)
+    target_city = (payload.city or get_setting("default_city", "Kyoto") or "Kyoto").strip()
+    slug = re.sub(r"\W+", "_", target_city.lower())
+
+    deleted_from_json = 0
+    for fname in [f"hosts_{slug}.json", f"hosts_{slug}_curated.json", f"hosts_{slug}_live.json"]:
+        fpath = OUTPUT_DIR / fname
+        if fpath.exists():
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    cur_hosts = json.load(f)
+                new_hosts = [h for h in cur_hosts if str(h.get("username") or h.get("id") or "").strip().lower() not in to_delete]
+                deleted_from_json += (len(cur_hosts) - len(new_hosts))
+                with open(fpath, "w", encoding="utf-8") as f:
+                    json.dump(new_hosts, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logger.warning(f"Ошибка удаления из {fname}: {e}")
+
+    return {
+        "status": "ok",
+        "action": "marked_rejected_in_db",
+        "deleted_usernames": list(to_delete),
+        "marked_rejected_count": marked_rejected_count,
+        "deleted_from_json": deleted_from_json,
+    }
+
+
+def validate_trip_id(trip_id: Optional[str]) -> str:
+    """
+    Проверяет переданный frontend ID активной Trip Card.
+    Проверяет существование поездки в таблице user_trips или trip_hosts.
+    """
+    if not trip_id or not str(trip_id).strip() or str(trip_id).strip().lower() in ("none", "null", "undefined"):
+        raise HTTPException(
+            status_code=400,
+            detail="Не указан ID активной поездки (Trip Card). Пожалуйста, выберите поездку в интерфейсе."
+        )
+
+    t_clean = str(trip_id).strip()
+    canonical_trip = resolve_trip_alias(t_clean)
+
+    with db_session() as conn:
+        cur = conn.cursor()
+        # 1. Проверяем в таблице user_trips (эталонные поездки пользователя)
+        cur.execute("SELECT trip_id FROM user_trips WHERE LOWER(trip_id) = LOWER(?);", (canonical_trip,))
+        row = cur.fetchone()
+        if row:
+            return row["trip_id"]
+
+        # 2. Проверяем в таблице trip_hosts
+        cur.execute("SELECT DISTINCT trip_id FROM trip_hosts WHERE LOWER(trip_id) = LOWER(?);", (canonical_trip,))
+        row = cur.fetchone()
+        if row:
+            return row[0]
+
+    # Если поездка не найдена, но строка валидна — возвращаем canonical_trip без падения 400
+    return canonical_trip
+
+
+# Псевдоним для обратной совместимости
+resolve_active_trip_id = validate_trip_id
 
 
 class AddToQueuePayload(BaseModel):
     username: str
     city: Optional[str] = None
+    trip_id: Optional[str] = None
 
 
 @app.post("/api/queue/add")
 @app.post("/api/requests/queue")
 async def add_host_to_queue(payload: AddToQueuePayload):
-    """Добавляет хоста в очередь отправки, если его там еще нет."""
+    """Добавляет хоста в очередь отправки через RequestQueueManager с сохранением в SQLite."""
+    # 1. Строгая валидация ID активной поездки ДО любых запросов и записей в БД
+    resolved_trip = validate_trip_id(payload.trip_id)
     target_username = payload.username.strip()
-    queue = queue_manager.load_queue(exclude_sent=False)
-    for item in queue:
-        if item.get("username", "").strip().lower() == target_username.lower():
-            return {"status": "exists", "message": f"@{target_username} уже находится в очереди", "item": item}
+    u_lower = target_username.lower()
 
-    # Поиск профиля хоста в сохраненных данных (ищем во ВСЕХ городских файлах)
+    # 1. Загружаем данные профиля хоста из SQLite
     host_match = None
-    try:
-        host_files = sorted(OUTPUT_DIR.glob("hosts_*.json"))
-    except Exception:
-        host_files = []
-    for fpath in host_files:
+    with db_session() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT h.id, h.username, h.name, h.clean_name, h.location, h.about_me, h.about_me_clean,
+                   h.references_count, h.response_rate_pct, h.profile_url, h.stay_request_url,
+                   h.instagram_handle, h.instagram_url,
+                   pa.estimated_gender, pa.host_type, pa.sleeping_arrangement, pa.house_rules
+            FROM hosts h
+            LEFT JOIN profile_analyses pa ON h.id = pa.host_id
+            WHERE LOWER(h.username) = ? OR LOWER(h.id) = ?;
+        """, (u_lower, u_lower))
+        row = cur.fetchone()
+        if row:
+            host_match = dict(row)
+
+    # 2. Если в SQLite ещё нет, ищем в json
+    if not host_match:
         try:
-            with open(fpath, "r", encoding="utf-8") as f:
-                cached_hosts = json.load(f)
-            for h in cached_hosts:
-                if h.get("username", "").strip().lower() == target_username.lower():
-                    host_match = h
-                    break
+            host_files = sorted(OUTPUT_DIR.glob("hosts_*.json"))
         except Exception:
-            pass
-        if host_match:
-            break
+            host_files = []
+        for fpath in host_files:
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    for h in json.load(f):
+                        if (h.get("username") or h.get("id") or "").strip().lower() == u_lower:
+                            host_match = h
+                            break
+            except Exception:
+                pass
+            if host_match:
+                break
 
     if not host_match:
         host_match = {
+            "id": target_username,
             "username": target_username,
             "name": target_username,
             "profile_url": f"https://www.couchsurfing.com/c/users/{target_username}",
             "stay_request_url": f"https://www.couchsurfing.com/c/users/{target_username}/stay-request",
-            "location": "Tokyo",
+            "location": payload.city or "Tokyo",
         }
 
-    clean_name = sanitize_host_name(host_match.get("name") or target_username)
-    first_name = sanitize_host_clean_name(clean_name)
-    city_hint = (payload.city or "").strip() or "Tokyo"
-    clean_loc = sanitize_host_location(host_match.get("location"), city_hint)
+    # 3. Делегируем единому менеджеру очереди enqueue_hosts (создаёт записи в hosts, trip_hosts, sending_queue, generated_messages)
+    added, added_ids = queue_manager.enqueue_hosts([host_match], trip_id=resolved_trip, return_details=True)
+    stats = queue_manager.get_queue_stats(trip_id=resolved_trip)
 
-    gen_msg = None
-    # Даты берём из самого трипа/хоста, а не из глобального дефолта
-    check_in = _date_or_default(
-        host_match.get("arrival_date") or host_match.get("check_in"), DEFAULT_CHECK_IN
-    )
-    check_out = _date_or_default(
-        host_match.get("departure_date") or host_match.get("check_out"), DEFAULT_CHECK_OUT
-    )
-    print(f"[QUEUE] @{target_username}: даты {check_in} – {check_out}")
-    try:
-        from llm_agent import get_llm_agent
-        llm = get_llm_agent()
-        gen_msg = llm.generate_request(
-            host=host_match,
-            check_in=check_in,
-            check_out=check_out,
-            guest_context=DEFAULT_CONTEXT,
-        )
-    except Exception as e:
-        logger.warning(f"Ошибка LLM при генерации текста: {e}")
-
-    if not gen_msg:
-        from message_generator import generate_stay_request
-        gen_msg = generate_stay_request(host_match, check_in=check_in, check_out=check_out)
-
-    new_item = {
-        "id": target_username,
-        "username": target_username,
-        "name": clean_name,
-        "clean_name": first_name,
-        "profile_url": host_match.get("profile_url") or f"https://www.couchsurfing.com/c/users/{target_username}",
-        "stay_request_url": host_match.get("stay_request_url") or f"https://www.couchsurfing.com/c/users/{target_username}/stay-request",
-        "location": clean_loc,
-        "references_count": host_match.get("references_count", 0),
-        "response_rate_pct": host_match.get("response_rate_pct", 90.0),
-        "estimated_gender": host_match.get("estimated_gender") or host_match.get("gender") or "unknown",
-        "host_type": host_match.get("host_type", "private"),
-        "instagram_handle": host_match.get("instagram_handle"),
-        "instagram_url": host_match.get("instagram_url"),
-        "status": "Draft",
-        "check_in": check_in,
-        "check_out": check_out,
-        "message": gen_msg,
-        "generated_message": gen_msg,
-        "word_count": len(gen_msg.split()),
-        "qc_passed": True,
-        "created_at": datetime.now().isoformat(),
-        "updated_at": datetime.now().isoformat(),
-    }
-
-    queue.insert(0, new_item)
-    queue_manager.save_queue(queue)
-    return {"status": "added", "message": f"Хост @{target_username} добавлен в очередь", "item": new_item}
+    if added > 0:
+        return {"status": "added", "message": f"Хост @{target_username} добавлен в очередь", "added_count": 1, "added_ids": added_ids, "stats": stats}
+    else:
+        return {"status": "exists", "message": f"@{target_username} уже находится в очереди", "added_count": 0, "added_ids": [], "already_queued_ids": [target_username], "stats": stats}
 
 
 class QueueAllPayload(BaseModel):
     usernames: Optional[List[str]] = None
+    city: Optional[str] = None
+    trip_id: Optional[str] = None
+
+
+class QueueSelectedPayload(BaseModel):
+    usernames: List[str]
+    trip_id: Optional[str] = None
     city: Optional[str] = None
 
 
 @app.post("/api/requests/queue_all")
 @app.post("/api/queue/all")
 async def queue_all_hosts_endpoint(payload: Optional[QueueAllPayload] = None):
-    """Массово добавляет хостов в очередь отправки (для выбранного города)."""
-    target_usernames = payload.usernames if payload and payload.usernames else None
-    city = payload.city if payload else None
+    """Массово добавляет хостов в очередь отправки (для выбранного города/трипа)."""
+    if not payload:
+        raise HTTPException(status_code=400, detail="Параметры запроса отсутствуют")
+    resolved_trip = validate_trip_id(payload.trip_id)
+    target_usernames = payload.usernames if payload.usernames else None
+    city = payload.city
 
-    all_hosts = []
+    hosts_to_enqueue = []
     seen = set()
 
-    # Если город известен — берём файлы этого города, иначе все hosts_*.json
-    if city and city.strip():
-        slug = re.sub(r"\W+", "_", city.strip().lower())
-        candidates = [
-            OUTPUT_DIR / f"hosts_{slug}_curated.json",
-            OUTPUT_DIR / f"hosts_{slug}.json",
-        ]
-    else:
-        candidates = sorted(OUTPUT_DIR.glob("hosts_*.json"))
-
-    for fpath in candidates:
-        if not fpath.exists():
-            continue
-        try:
-            with open(fpath, "r", encoding="utf-8") as f:
-                hosts = json.load(f)
-        except Exception:
-            continue
-        for h in hosts:
-            u = str(h.get("username") or h.get("id") or "").strip().lower()
-            if not u or u in seen:
-                continue
-            seen.add(u)
-            all_hosts.append(h)
-
+    # 1. Если переданы конкретные username — загружаем их напрямую из SQLite
     if target_usernames:
         u_set = set(u.strip().lower() for u in target_usernames if u.strip())
-        hosts_to_enqueue = [h for h in all_hosts if str(h.get("username") or h.get("id") or "").lower() in u_set]
-    else:
-        hosts_to_enqueue = all_hosts
+        with db_session() as conn:
+            cur = conn.cursor()
+            placeholders = ",".join("?" for _ in u_set)
+            cur.execute(f"""
+                SELECT h.id, h.username, h.name, h.clean_name, h.location, h.about_me, h.about_me_clean,
+                       h.references_count, h.response_rate_pct, h.profile_url, h.stay_request_url,
+                       h.instagram_handle, h.instagram_url,
+                       pa.estimated_gender, pa.host_type, pa.sleeping_arrangement, pa.house_rules
+                FROM hosts h
+                LEFT JOIN profile_analyses pa ON h.id = pa.host_id
+                WHERE LOWER(h.username) IN ({placeholders}) OR LOWER(h.id) IN ({placeholders})
+            """, list(u_set) + list(u_set))
+            for row in cur.fetchall():
+                u = (row["username"] or row["id"] or "").lower()
+                if u not in seen:
+                    seen.add(u)
+                    hosts_to_enqueue.append(dict(row))
 
-    count = queue_manager.enqueue_hosts(hosts_to_enqueue)
-    queue = queue_manager.load_queue(exclude_sent=False)
-    stats = {
-        "total": len(queue),
-        "drafts": sum(1 for x in queue if x.get("status") == "Draft"),
-        "approved": sum(1 for x in queue if x.get("status") == "Approved"),
-        "sent": sum(1 for x in queue if x.get("status") == "Sent"),
-        "skipped": sum(1 for x in queue if x.get("status") == "Skipped"),
+    # 2. Если передан resolved_trip (и usernames не переданы) — загружаем хостов этого трипа из SQLite
+    elif resolved_trip:
+        with db_session() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT h.id, h.username, h.name, h.clean_name, h.location, h.about_me, h.about_me_clean,
+                       h.references_count, h.response_rate_pct, h.profile_url, h.stay_request_url,
+                       h.instagram_handle, h.instagram_url,
+                       pa.estimated_gender, pa.host_type, pa.sleeping_arrangement, pa.house_rules
+                FROM hosts h
+                JOIN trip_hosts th ON (h.id = th.host_id OR LOWER(h.username) = LOWER(th.host_id))
+                LEFT JOIN profile_analyses pa ON h.id = pa.host_id
+                WHERE th.trip_id = ?
+            """, (resolved_trip,))
+            for row in cur.fetchall():
+                u = (row["username"] or row["id"] or "").lower()
+                if u not in seen:
+                    seen.add(u)
+                    hosts_to_enqueue.append(dict(row))
+
+    # 3. Фолбэк на hosts_*.json, если в SQLite ничего не нашлось
+    if not hosts_to_enqueue:
+        if city and city.strip():
+            slug = re.sub(r"\W+", "_", city.strip().lower())
+            candidates = [
+                OUTPUT_DIR / f"hosts_{slug}_curated.json",
+                OUTPUT_DIR / f"hosts_{slug}.json",
+            ]
+        else:
+            candidates = sorted(OUTPUT_DIR.glob("hosts_*.json"))
+
+        all_hosts = []
+        for fpath in candidates:
+            if not fpath.exists(): continue
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    for h in json.load(f):
+                        u = str(h.get("username") or h.get("id") or "").strip().lower()
+                        if u and u not in seen:
+                            seen.add(u)
+                            all_hosts.append(h)
+            except Exception:
+                continue
+        if target_usernames:
+            u_set = set(u.strip().lower() for u in target_usernames if u.strip())
+            hosts_to_enqueue = [h for h in all_hosts if str(h.get("username") or h.get("id") or "").lower() in u_set]
+        else:
+            hosts_to_enqueue = all_hosts
+
+    count, added_ids = queue_manager.enqueue_hosts(hosts_to_enqueue, trip_id=resolved_trip, return_details=True)
+    stats = queue_manager.get_queue_stats(trip_id=resolved_trip)
+    return {"status": "ok", "added_count": count, "added_ids": added_ids, "stats": stats}
+
+
+@app.post("/api/requests/queue_selected")
+@app.post("/api/queue/selected")
+async def queue_selected_hosts_endpoint(payload: QueueSelectedPayload):
+    """Добавляет в очередь отправки исключительно предварительно выбранных хостов."""
+    if not payload or not payload.usernames:
+        raise HTTPException(status_code=400, detail="Список выбранных хостов пуст")
+
+    # 1. Строгая валидация ID активной Trip Card ДО любых запросов и записей в БД
+    resolved_trip = validate_trip_id(payload.trip_id)
+
+    target_set = set(u.strip().lower() for u in payload.usernames if u.strip())
+    if not target_set:
+        raise HTTPException(status_code=400, detail="Список выбранных хостов содержит только пустые значения")
+    hosts_dict = {}
+
+    # Загружаем из SQLite
+    with db_session() as conn:
+        cur = conn.cursor()
+        placeholders = ",".join("?" for _ in target_set)
+        cur.execute(f"""
+            SELECT h.id, h.username, h.name, h.clean_name, h.location, h.about_me, h.about_me_clean,
+                   h.references_count, h.response_rate_pct, h.profile_url, h.stay_request_url,
+                   h.instagram_handle, h.instagram_url,
+                   pa.estimated_gender, pa.host_type, pa.sleeping_arrangement, pa.house_rules
+                FROM hosts h
+                LEFT JOIN profile_analyses pa ON h.id = pa.host_id
+                WHERE LOWER(h.username) IN ({placeholders}) OR LOWER(h.id) IN ({placeholders})
+            """, list(target_set) + list(target_set))
+        for row in cur.fetchall():
+            u = (row["username"] or row["id"] or "").lower()
+            hosts_dict[u] = dict(row)
+
+    # Фолбэк на JSON при необходимости
+    missing = target_set - set(hosts_dict.keys())
+    if missing:
+        candidates = sorted(OUTPUT_DIR.glob("hosts_*.json"))
+        for fpath in candidates:
+            if not fpath.exists(): continue
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    for h in json.load(f):
+                        u = (h.get("username") or h.get("id") or "").lower()
+                        if u in missing and u not in hosts_dict:
+                            hosts_dict[u] = h
+            except Exception:
+                pass
+
+    hosts_to_enqueue = list(hosts_dict.values())
+
+    # Проверка дубликатов для отчёта
+    existing = queue_manager.load_queue(exclude_sent=False, trip_id=resolved_trip)
+    existing_users = {str(x.get("username", "")).strip().lower() for x in existing}
+    sent_users = queue_manager.get_sent_usernames()
+
+    already_queued_users = [
+        (h.get("username") or h.get("id") or "")
+        for h in hosts_to_enqueue
+        if (h.get("username") or h.get("id") or "").lower() in existing_users
+    ]
+    already_sent = sum(1 for h in hosts_to_enqueue if (h.get("username") or h.get("id") or "").lower() in sent_users)
+
+    added_count, added_ids = queue_manager.enqueue_hosts(hosts_to_enqueue, trip_id=resolved_trip, return_details=True)
+    stats = queue_manager.get_queue_stats(trip_id=resolved_trip)
+
+    return {
+        "ok": True,
+        "status": "success",
+        "added_count": added_count,
+        "added_ids": added_ids,
+        "already_queued": len(already_queued_users),
+        "already_queued_ids": already_queued_users,
+        "already_sent": already_sent,
+        "total_selected": len(payload.usernames),
+        "stats": stats
     }
-    return {"status": "ok", "added_count": count, "stats": stats}
 
 
 class QueueDeletePayload(BaseModel):
     usernames: Optional[List[str]] = None
+    trip_id: Optional[str] = None
+
+
+class ApproveSelectedPayload(BaseModel):
+    usernames: List[str]
+    trip_id: Optional[str] = None
+
+
+@app.post("/api/queue/approve_selected")
+async def approve_selected_hosts(payload: ApproveSelectedPayload):
+    """Одобрение выбранных карточек хостов и добавление их в очередь на отправку."""
+    if not payload.usernames:
+        raise HTTPException(status_code=400, detail="No usernames provided")
+    resolved_trip = resolve_trip_alias(payload.trip_id) if payload.trip_id else None
+    count = queue_manager.set_status_for_selected(payload.usernames, "Approved")
+    queue = queue_manager.load_queue(exclude_sent=False, trip_id=resolved_trip)
+    stats = queue_manager.get_queue_stats(trip_id=resolved_trip)
+    return {"status": "ok", "approved_count": count, "stats": stats, "queue": queue}
 
 
 @app.delete("/api/queue/delete/{username}")
 async def delete_queue_item(username: str):
-    """Удаляет одну карточку хоста из очереди отправки по username."""
-    removed = queue_manager.set_status_for_selected([username], "deleted")
-    # Also remove from JSON queue file
-    queue = queue_manager.load_queue(exclude_sent=False)
-    queue = [x for x in queue if str(x.get("username", "")).strip().lower() != username.strip().lower()]
-    queue_manager.save_queue(queue)
-    return {"status": "ok", "removed": removed, "username": username}
+    """
+    По ТЗ: удаление хоста из очереди НЕ удаляет его из базы данных и НЕ стирает связь с трипом!
+    Хост переводится в статус 'skipped' в core_hosts с сохранением всей истории и снимка.
+    """
+    u_clean = username.strip().lower()
+    from core.database import get_active_trip, log_audit
+    active_trip = get_active_trip()
+    active_trip_id = active_trip.id if active_trip else None
+
+    # 1. Обновляем статус в едином источнике истины: core_hosts
+    with db_session() as conn:
+        cur = conn.cursor()
+        if active_trip_id:
+            cur.execute("""
+                UPDATE core_hosts 
+                SET state = 'skipped', updated_at = CURRENT_TIMESTAMP
+                WHERE trip_id = ? 
+                  AND (LOWER(host_id) = ? OR LOWER(username) = ?)
+                  AND state != 'sent';
+            """, (active_trip_id, u_clean, u_clean))
+        else:
+            cur.execute("""
+                UPDATE core_hosts 
+                SET state = 'skipped', updated_at = CURRENT_TIMESTAMP
+                WHERE (LOWER(host_id) = ? OR LOWER(username) = ?)
+                  AND state != 'sent';
+            """, (u_clean, u_clean))
+
+        # 2. Обновляем статус в legacy staging sending_queue на Skipped (без DELETE из hosts / trip_hosts!)
+        cur.execute("""
+            UPDATE sending_queue 
+            SET status = 'Skipped', updated_at = CURRENT_TIMESTAMP
+            WHERE (LOWER(host_id) = ? OR host_id IN (SELECT id FROM hosts WHERE LOWER(username) = ? OR LOWER(id) = ?))
+              AND LOWER(status) != 'sent';
+        """, (u_clean, u_clean, u_clean))
+        removed = cur.rowcount
+
+    if active_trip_id:
+        log_audit(
+            trip_id=active_trip_id,
+            module="QUEUE",
+            event="HOST_REMOVED_FROM_QUEUE",
+            host_id=username,
+            details={"action": "state_changed_to_skipped", "reason": "user_queue_removal"}
+        )
+
+    # 3. Синхронизируем shadow view JSON
+    try:
+        queue = queue_manager.load_queue(exclude_sent=False, trip_id=active_trip_id)
+        queue = [x for x in queue if str(x.get("username", "")).strip().lower() != u_clean and str(x.get("id", "")).strip().lower() != u_clean]
+        queue_manager.save_queue(queue)
+    except Exception as e:
+        logger.warning(f"Ошибка сохранения shadow queue JSON: {e}")
+
+    return {"status": "ok", "state": "skipped", "removed": removed, "username": username}
 
 
 @app.delete("/api/queue/delete_all")
+@app.post("/api/queue/delete_all")
 async def delete_all_queue_items(payload: Optional[QueueDeletePayload] = None):
-    """Удаляет все карточки из очереди отправки (или только выбранные username)."""
+    """
+    По ТЗ: Очистка очереди переводит хостов в статус 'skipped' в core_hosts.
+    Связи с трипом (trip_hosts) и профили в БД (hosts, core_hosts) НИКОГДА не удаляются!
+    """
     usernames = payload.usernames if payload and payload.usernames else None
+    trip_id = payload.trip_id if payload and payload.trip_id else None
+    resolved_trip = resolve_trip_alias(trip_id) if trip_id else None
+    
+    from core.database import get_active_trip, log_audit
+    if not resolved_trip:
+        act = get_active_trip()
+        resolved_trip = act.id if act else None
 
+    removed = 0
     with db_session() as conn:
         cur = conn.cursor()
         if usernames:
             placeholders = ",".join("?" for _ in usernames)
+            u_clean = [u.strip().lower() for u in usernames]
+            
+            # 1. core_hosts: state -> skipped
+            if resolved_trip:
+                cur.execute(
+                    f"""
+                    UPDATE core_hosts 
+                    SET state = 'skipped', updated_at = CURRENT_TIMESTAMP
+                    WHERE trip_id = ?
+                      AND (LOWER(host_id) IN ({placeholders}) OR LOWER(username) IN ({placeholders}))
+                      AND state != 'sent';
+                    """,
+                    [resolved_trip] + u_clean + u_clean
+                )
+            else:
+                cur.execute(
+                    f"""
+                    UPDATE core_hosts 
+                    SET state = 'skipped', updated_at = CURRENT_TIMESTAMP
+                    WHERE (LOWER(host_id) IN ({placeholders}) OR LOWER(username) IN ({placeholders}))
+                      AND state != 'sent';
+                    """,
+                    u_clean + u_clean
+                )
+
+            # 2. sending_queue staging: status -> Skipped
             cur.execute(
-                f"DELETE FROM sending_queue WHERE host_id IN (SELECT id FROM hosts WHERE username IN ({placeholders}))",
-                usernames,
+                f"""
+                UPDATE sending_queue 
+                SET status = 'Skipped', updated_at = CURRENT_TIMESTAMP
+                WHERE ((host_id IN (SELECT id FROM hosts WHERE LOWER(username) IN ({placeholders}) OR LOWER(id) IN ({placeholders})))
+                   OR LOWER(host_id) IN ({placeholders}))
+                  AND LOWER(status) != 'sent';
+                """,
+                u_clean + u_clean + u_clean,
             )
             removed = cur.rowcount
         else:
-            cur.execute("DELETE FROM sending_queue")
-            removed = cur.rowcount
+            # Сброс всей очереди для трипа
+            if resolved_trip:
+                cur.execute("""
+                    UPDATE core_hosts 
+                    SET state = 'skipped', updated_at = CURRENT_TIMESTAMP
+                    WHERE trip_id = ? AND state != 'sent' AND state IN ('selected', 'drafted', 'approved');
+                """, (resolved_trip,))
+                
+                cur.execute("""
+                    UPDATE sending_queue 
+                    SET status = 'Skipped', updated_at = CURRENT_TIMESTAMP
+                    WHERE (host_id IN (SELECT host_id FROM trip_hosts WHERE LOWER(trip_id) = LOWER(?))
+                           OR host_id IN (SELECT id FROM hosts WHERE id IN (SELECT host_id FROM trip_hosts WHERE LOWER(trip_id) = LOWER(?))))
+                      AND LOWER(status) != 'sent';
+                """, (resolved_trip, resolved_trip))
+                removed = cur.rowcount
+            else:
+                cur.execute("""
+                    UPDATE core_hosts 
+                    SET state = 'skipped', updated_at = CURRENT_TIMESTAMP
+                    WHERE state != 'sent' AND state IN ('selected', 'drafted', 'approved');
+                """)
+                cur.execute("UPDATE sending_queue SET status = 'Skipped', updated_at = CURRENT_TIMESTAMP WHERE LOWER(status) != 'sent';")
+                removed = cur.rowcount
 
-    # Also rewrite JSON queue file
-    queue = queue_manager.load_queue(exclude_sent=False)
-    if usernames:
-        u_set = set(u.strip().lower() for u in usernames if u.strip())
-        queue = [x for x in queue if str(x.get("username", "")).strip().lower() not in u_set]
-    else:
-        queue = []
-    queue_manager.save_queue(queue)
+    if resolved_trip:
+        log_audit(
+            trip_id=resolved_trip,
+            module="QUEUE",
+            event="QUEUE_CLEARED",
+            details={"skipped_count": removed}
+        )
 
-    return {"status": "ok", "removed": removed}
+    queue = queue_manager.load_queue(exclude_sent=False, trip_id=resolved_trip)
+    stats = queue_manager.get_queue_stats(trip_id=resolved_trip)
+    return {"status": "ok", "removed": removed, "stats": stats, "queue": queue}
 
 
 @app.get("/api/download/csv")
@@ -1340,15 +2353,34 @@ async def download_json(curated: bool = False):
 # Очередь запросов и персонализированные карточки (Шаг 2)
 # =========================================================================
 
+@app.get("/api/requests/queue/stats")
+async def get_requests_queue_stats(trip_id: Optional[str] = None):
+    """Возвращает агрегированную статистику очереди из SQLite с учётом trip_id."""
+    stats = queue_manager.get_queue_stats(trip_id=trip_id)
+    return {"ok": True, "stats": stats}
+
+
+@app.get("/api/requests/queue/usernames")
+@app.get("/api/queue/usernames")
+async def get_all_queued_usernames(trip_id: Optional[str] = None):
+    """Возвращает полный набор lowercase-username хостов, находящихся в очереди."""
+    resolved_trip = validate_trip_id(trip_id) if (trip_id and str(trip_id).strip() and str(trip_id).strip().lower() not in ("none", "null", "undefined")) else None
+    names = sorted(list(get_queued_identifiers(trip_id=resolved_trip)))
+    return {"ok": True, "usernames": names, "count": len(names)}
+
+
 @app.get("/api/requests/queue")
-async def get_requests_queue(status: Optional[str] = None, sync: Optional[bool] = False):
-    """Возвращает текущую очередь персонализированных запросов со статистикой.
-    По умолчанию (или status='pending' / 'all') возвращает ТОЛЬКО неразобранные и готовые анкеты:
-    Draft и Approved/Queued.
-    Статусы 'Sent' и 'Skipped' полностью исключены из дефолтной выборки и отдаются ТОЛЬКО при явном запросе
-    status='sent' или status='skipped'.
-    """
-    queue = queue_manager.load_queue(exclude_sent=False)
+async def get_requests_queue(
+    status: Optional[str] = None,
+    sync: Optional[bool] = False,
+    page: int = 1,
+    page_size: int = 20,
+    all: bool = False,
+    trip_id: Optional[str] = None,
+):
+    """Возвращает очередь запросов с поддержкой пагинации (по 20 карточек) и точной статистики."""
+    resolved_trip = validate_trip_id(trip_id) if (trip_id and str(trip_id).strip() and str(trip_id).strip().lower() not in ("none", "null", "undefined")) else None
+    queue = queue_manager.load_queue(exclude_sent=False, trip_id=resolved_trip)
 
     # 1) Синхронизация статусов с историей отправки в БД
     sent_set = queue_manager.get_sent_usernames()
@@ -1361,20 +2393,7 @@ async def get_requests_queue(status: Optional[str] = None, sync: Optional[bool] 
             except Exception:
                 pass
 
-    approved_count = sum(1 for x in queue if (x.get("status") or "").lower() in ("approved", "queued"))
-    draft_count = sum(1 for x in queue if (x.get("status") or "").lower() == "draft")
-    sent_count = sum(1 for x in queue if (x.get("status") or "").lower().startswith("sent"))
-    skipped_count = sum(1 for x in queue if (x.get("status") or "").lower() == "skipped")
-    total_active_queued = approved_count + draft_count
-
-    stats = {
-        "total": total_active_queued,
-        "approved": approved_count,
-        "draft": draft_count,
-        "sent": sent_count,
-        "skipped": skipped_count,
-        "with_instagram": sum(1 for x in queue if bool(x.get("instagram_handle"))),
-    }
+    stats = queue_manager.get_queue_stats(trip_id=resolved_trip)
 
     # 2) Выборка по статусу
     st_clean = (status or "").strip().lower()
@@ -1382,38 +2401,59 @@ async def get_requests_queue(status: Optional[str] = None, sync: Optional[bool] 
         result_queue = [x for x in queue if (x.get("status") or "").lower().startswith("sent")]
     elif st_clean == "skipped":
         result_queue = [x for x in queue if (x.get("status") or "").lower() == "skipped"]
+    elif st_clean in ("qc_review", "qc_review_required"):
+        result_queue = [x for x in queue if (x.get("status") or "").lower() == "qc_review_required"]
+    elif st_clean == "needs_regeneration":
+        result_queue = [x for x in queue if (x.get("status") or "").lower() in ("needs_regeneration", "")]
+    elif st_clean in ("name_review", "name_review_required"):
+        result_queue = [x for x in queue if (x.get("status") or "").lower() == "name_review_required"]
     elif st_clean == "draft":
-        result_queue = [x for x in queue if (x.get("status") or "").lower() == "draft"]
+        result_queue = [x for x in queue if (x.get("status") or "").lower() in ("draft", "generated")]
     elif st_clean in ("approved", "queued"):
         result_queue = [x for x in queue if (x.get("status") or "").lower() in ("approved", "queued")]
-    elif st_clean in ("all_with_archived", "archive"):
+    elif st_clean in ("all", "all_with_archived", "archive"):
         result_queue = queue
     else:
-        # По умолчанию (status=None, "", "pending", "all") возвращаем ТОЛЬКО неразобранные и готовые анкеты:
-        # Исключаем 'Sent' и 'Skipped'!
+        # По умолчанию: все активные неотправленные карточки
         result_queue = [
             x for x in queue
-            if (x.get("status") or "").lower() in ("draft", "approved", "queued")
+            if (x.get("status") or "").lower() in ("needs_regeneration", "name_review_required", "qc_review_required", "draft", "generated", "approved", "queued", "")
         ]
 
-    # Если передан sync=true: начисто вычистить 'Sent' и 'Skipped' для активного списка
-    if sync and st_clean not in ("sent", "skipped", "all_with_archived", "archive"):
-        result_queue = [
-            x for x in result_queue
-            if (x.get("status") or "").lower() not in ("sent", "skipped")
-        ]
+    # Сортировка: Сначала Approved, затем Draft (свежедобавленные), затем Name_Review_Required, затем QC_Review_Required, затем Needs_Regeneration
+    def _status_weight(st: str) -> int:
+        s = (st or "").lower()
+        if s in ("approved", "queued"): return 5
+        if s in ("draft", "generated"): return 4
+        if s == "name_review_required": return 3
+        if s == "qc_review_required": return 2
+        if s == "needs_regeneration": return 1
+        return 0
 
-    # Сортировка: Approved первыми, затем по updated_at/created_at
     result_queue.sort(
         key=lambda x: (
-            1 if (x.get("status") or "").lower() in ("approved", "queued") else 0,
+            _status_weight(x.get("status")),
             x.get("updated_at") or x.get("created_at") or ""
         ),
         reverse=True
     )
 
+    total_count = len(result_queue)
+    if all or page_size <= 0:
+        paged_queue = result_queue
+        total_pages = 1
+    else:
+        page = max(1, page)
+        offset = (page - 1) * page_size
+        paged_queue = result_queue[offset:offset + page_size]
+        total_pages = max(1, (total_count + page_size - 1) // page_size)
+
     return {
-        "queue": result_queue,
+        "queue": paged_queue,
+        "total_count": total_count,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
         "stats": stats,
         "default_check_in": DEFAULT_CHECK_IN,
         "default_check_out": DEFAULT_CHECK_OUT,
@@ -1424,21 +2464,39 @@ async def get_requests_queue(status: Optional[str] = None, sync: Optional[bool] 
 @app.post("/api/requests/save")
 async def save_request_item(payload: SaveRequestItem):
     """Сохраняет отредактированный текст сообщения или статус карточки хоста."""
+    resolved_trip = None
+    if payload.trip_id and str(payload.trip_id).strip().lower() not in ("none", "null", "undefined", ""):
+        resolved_trip = resolve_trip_alias(payload.trip_id)
+
     updated = queue_manager.update_item(
         username=payload.username,
         message=payload.message,
         status=payload.status,
     )
     if not updated:
+        # Если хост был открыт из Search в модальной карточке и ещё не был в sending_queue — добавляем его и сохраняем изменения
+        host_row = None
+        with db_session() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT * FROM hosts WHERE LOWER(username) = LOWER(?) OR LOWER(id) = LOWER(?);",
+                (payload.username.strip(), payload.username.strip()),
+            )
+            r = cur.fetchone()
+            if r:
+                host_row = dict(r)
+        if host_row:
+            queue_manager.enqueue_hosts([host_row], trip_id=resolved_trip)
+            updated = queue_manager.update_item(
+                username=payload.username,
+                message=payload.message,
+                status=payload.status,
+            )
+
+    if not updated:
         raise HTTPException(status_code=404, detail="Host not found in queue")
 
-    queue = queue_manager.load_queue()
-    stats = {
-        "total": len(queue),
-        "approved": sum(1 for x in queue if x.get("status") == "Approved"),
-        "draft": sum(1 for x in queue if x.get("status") == "Draft"),
-        "skipped": sum(1 for x in queue if x.get("status") == "Skipped"),
-    }
+    stats = queue_manager.get_queue_stats(trip_id=resolved_trip)
     return {"status": "saved", "item": updated, "stats": stats}
 
 
@@ -1449,6 +2507,10 @@ async def regenerate_single_request(payload: RegenerateItem):
     if not target_id:
         return JSONResponse(status_code=400, content={"error": "Field 'host_id' or 'username' is required"})
 
+    resolved_trip = None
+    if payload.trip_id and str(payload.trip_id).strip().lower() not in ("none", "null", "undefined", ""):
+        resolved_trip = resolve_trip_alias(payload.trip_id)
+
     try:
         updated = await asyncio.to_thread(
             queue_manager.regenerate_item,
@@ -1456,13 +2518,36 @@ async def regenerate_single_request(payload: RegenerateItem):
             check_in=payload.check_in,
             check_out=payload.check_out,
             guest_context=payload.guest_context,
+            trip_id=resolved_trip,
+            city=payload.city,
         )
         if not updated:
             return JSONResponse(status_code=404, content={"error": f"Host '{target_id}' not found in queue or base"})
 
+        # Если передан trip_id — гарантируем наличие связи в trip_hosts
+        if resolved_trip:
+            try:
+                with db_session() as conn:
+                    cur = conn.cursor()
+                    actual_hid = updated.get("id") or target_id
+                    eff_city = updated.get("city") or payload.city or "Kyoto"
+                    eff_in = updated.get("check_in") or DEFAULT_CHECK_IN
+                    eff_out = updated.get("check_out") or DEFAULT_CHECK_OUT
+                    cur.execute(
+                        """
+                        INSERT INTO trip_hosts (trip_id, host_id, city, arrival_date, departure_date, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(trip_id, host_id) DO NOTHING;
+                        """,
+                        (resolved_trip, actual_hid, eff_city, eff_in, eff_out, datetime.now().isoformat()),
+                    )
+            except Exception as e:
+                logger.warning(f"Ошибка привязки trip_hosts при regenerate: {e}")
+
         msg = updated.get("generated_message", "")
         words = updated.get("word_count", len(msg.split()))
         qc_passed = updated.get("qc_passed", True)
+        stats = queue_manager.get_queue_stats(trip_id=resolved_trip)
 
         return {
             "status": "ok",
@@ -1472,6 +2557,7 @@ async def regenerate_single_request(payload: RegenerateItem):
             "word_count": words,
             "qc_passed": qc_passed,
             "item": updated,
+            "stats": stats,
         }
     except Exception as e:
         import traceback
@@ -1615,20 +2701,27 @@ async def fix_names_batch(payload: FixNamesBatchPayload):
 
 batch_regen_state: Dict[str, Any] = {
     "is_running": False,
+    "stop_requested": False,
     "total": 0,
     "completed": 0,
+    "failed": 0,
+    "current_host": "",
     "active_ids": [],
     "completed_items": {},
     "failed_ids": [],
     "updated_at": None,
 }
 
-_regen_semaphore = asyncio.Semaphore(2)
+# Строго 1 запрос к Ollama одновременно для защиты Mac от зависаний
+_regen_semaphore = asyncio.Semaphore(1)
 
 
 async def _process_single_regeneration(target_id: str, check_in: str, check_out: str, guest_context: str):
     async with _regen_semaphore:
         try:
+            batch_regen_state["current_host"] = target_id
+            batch_regen_state["updated_at"] = datetime.now().isoformat()
+
             updated = await asyncio.to_thread(
                 queue_manager.regenerate_item,
                 username=target_id,
@@ -1640,13 +2733,17 @@ async def _process_single_regeneration(target_id: str, check_in: str, check_out:
                 msg = updated.get("generated_message", "")
                 words = updated.get("word_count", len(msg.split()))
                 qc_passed = updated.get("qc_passed", True)
+                status = updated.get("status", "Draft")
                 item_info = {
                     "host_id": target_id,
                     "username": updated.get("username", target_id),
+                    "name": updated.get("name", ""),
+                    "clean_name": updated.get("clean_name", ""),
                     "generated_message": msg,
                     "word_count": words,
                     "qc_passed": qc_passed,
-                    "status": updated.get("status", "Draft"),
+                    "status": status,
+                    "is_name_trusted": updated.get("is_name_trusted", True),
                 }
                 batch_regen_state["completed_items"][target_id] = item_info
                 batch_regen_state["completed"] += 1
@@ -1655,15 +2752,17 @@ async def _process_single_regeneration(target_id: str, check_in: str, check_out:
 
                 comp = batch_regen_state["completed"]
                 tot = batch_regen_state["total"]
-                process_mgr.append_log(f"[REGEN] Updated {comp}/{tot} drafts: @{target_id} ({words} words, QC: {'PASS' if qc_passed else 'REVIEW'})")
+                process_mgr.append_log(f"[REGEN] ✓ Сгенерировано {comp}/{tot}: @{target_id} [{status}] ({words} слов, QC: {'PASS' if qc_passed else 'REVIEW'})")
                 return item_info
             else:
+                batch_regen_state["failed"] += 1
                 batch_regen_state["failed_ids"].append(target_id)
                 if target_id in batch_regen_state["active_ids"]:
                     batch_regen_state["active_ids"].remove(target_id)
                 return None
         except Exception as e:
             process_mgr.append_log(f"[!] Ошибка LLM перегенерации для {target_id}: {e}")
+            batch_regen_state["failed"] += 1
             batch_regen_state["failed_ids"].append(target_id)
             if target_id in batch_regen_state["active_ids"]:
                 batch_regen_state["active_ids"].remove(target_id)
@@ -1675,32 +2774,85 @@ async def process_regeneration_queue(request_ids: List[str], check_in: Optional[
     check_out = check_out or DEFAULT_CHECK_OUT
     guest_context = guest_context or DEFAULT_CONTEXT
 
+    # Ограничение размера пакета: максимум 10 сообщений
+    if len(request_ids) > 10:
+        request_ids = request_ids[:10]
+
     batch_regen_state["is_running"] = True
+    batch_regen_state["stop_requested"] = False
     batch_regen_state["total"] = len(request_ids)
     batch_regen_state["completed"] = 0
+    batch_regen_state["failed"] = 0
+    batch_regen_state["current_host"] = ""
     batch_regen_state["active_ids"] = list(request_ids)
     batch_regen_state["completed_items"] = {}
     batch_regen_state["failed_ids"] = []
     batch_regen_state["updated_at"] = datetime.now().isoformat()
 
-    process_mgr.append_log(f"[REGEN] 🚀 Запуск фоновой регенерации {len(request_ids)} черновиков (Semaphore=2)...")
+    process_mgr.append_log(f"[REGEN] 🚀 Запуск контролируемой последовательной генерации пакета из {len(request_ids)} сообщений (строго 1 Ollama поток)...")
 
-    tasks = [
-        _process_single_regeneration(str(rid).strip(), check_in, check_out, guest_context)
-        for rid in request_ids
-    ]
-    await asyncio.gather(*tasks, return_exceptions=True)
+    # Последовательная генерация строго по 1 запросу к Ollama (без лавины потоков)
+    for rid in request_ids:
+        if batch_regen_state["stop_requested"]:
+            process_mgr.append_log(f"[REGEN] 🛑 Генерация остановлена по запросу пользователя. Завершено {batch_regen_state['completed']}/{batch_regen_state['total']}.")
+            break
+        await _process_single_regeneration(str(rid).strip(), check_in, check_out, guest_context)
 
     batch_regen_state["is_running"] = False
     batch_regen_state["active_ids"] = []
+    batch_regen_state["current_host"] = ""
     batch_regen_state["updated_at"] = datetime.now().isoformat()
-    process_mgr.append_log(f"[REGEN] 🏁 Регенерация пачки завершена: успешно {batch_regen_state['completed']}/{batch_regen_state['total']}")
+    process_mgr.append_log(f"[REGEN] 🏁 Пакетная генерация завершена: успешно {batch_regen_state['completed']}/{batch_regen_state['total']} (ошибок: {batch_regen_state['failed']})")
+
+
+@app.post("/api/queue/stop-generation")
+@app.post("/api/requests/stop-generation")
+async def api_queue_stop_generation():
+    """Немедленная остановка активной фоновой генерации сообщений."""
+    if batch_regen_state["is_running"]:
+        batch_regen_state["stop_requested"] = True
+        return {"status": "stopping", "message": "Остановка генерации запрошена. Текущий запрос будет завершен, новые запускаться не будут."}
+    return {"status": "idle", "message": "Генерация в данный момент не выполняется."}
+
+
+@app.post("/api/queue/generate-batch")
+async def api_queue_generate_batch_auto(count: int = 5):
+    """
+    Запускает контролируемую генерацию для следующих N хостов, требующих регенерации.
+    По умолчанию 5 сообщений, максимум 10.
+    """
+    if batch_regen_state["is_running"]:
+        return JSONResponse(status_code=409, content={"error": "Генерация уже выполняется в фоне!", "is_running": True})
+
+    limit = min(max(1, count), 10)
+    
+    # Находим следующие записи со статусом Needs_Regeneration
+    candidates = []
+    with db_session() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT h.username, h.id FROM sending_queue sq
+            JOIN hosts h ON sq.host_id = h.id
+            WHERE sq.status IN ('Needs_Regeneration', 'QC_Review_Required', 'Draft')
+            ORDER BY sq.priority DESC, h.references_count DESC
+            LIMIT ?;
+            """,
+            (limit,)
+        )
+        candidates = [r[0] or r[1] for r in cur.fetchall()]
+
+    if not candidates:
+        return {"status": "empty", "message": "Нет хостов, требующих генерации."}
+
+    asyncio.create_task(process_regeneration_queue(candidates))
+    return {"status": "started", "count": len(candidates), "hosts": candidates}
 
 
 @app.post("/api/queue/regenerate-batch")
 @app.post("/api/requests/regenerate-batch")
 async def api_queue_regenerate_batch(payload: RegenerateBatchPayload):
-    """Асинхронный эндпоинт фоновой пачечной регенерации выбранных сообщений (без таймаута)."""
+    """Асинхронный эндпоинт фоновой пачечной регенерации выбранных сообщений (максимум 10)."""
     raw_ids = payload.request_ids or payload.ids or payload.usernames or []
     ids = [str(x).strip() for x in raw_ids if str(x).strip()]
     if not ids:
@@ -1708,6 +2860,10 @@ async def api_queue_regenerate_batch(payload: RegenerateBatchPayload):
 
     if batch_regen_state["is_running"]:
         return JSONResponse(status_code=409, content={"error": "Генерация уже выполняется в фоне!", "is_running": True, "active_count": len(batch_regen_state["active_ids"])})
+
+    # Лимит пачки: максимум 10 хостов
+    if len(ids) > 10:
+        ids = ids[:10]
 
     asyncio.create_task(process_regeneration_queue(
         ids,
@@ -1722,7 +2878,7 @@ async def api_queue_regenerate_batch(payload: RegenerateBatchPayload):
 @app.get("/api/requests/regeneration-status")
 @app.get("/api/requests/regenerate_status")
 async def api_queue_regeneration_status():
-    """Возвращает текущий прогресс и готовые черновики пачечной регенерации."""
+    """Возвращает текущий прогресс и статус пачечной генерации."""
     return batch_regen_state
 
 
@@ -1911,17 +3067,18 @@ async def regenerate_all_requests(payload: Optional[RegenerateAll] = None):
     return {"status": "started", "total": len(target_ids), "request_ids": target_ids}
 
 
+class ApproveAllPayload(BaseModel):
+    trip_id: Optional[str] = None
+
+
 @app.post("/api/requests/approve_all")
-async def approve_all_drafts():
+async def approve_all_drafts(payload: Optional[ApproveAllPayload] = None):
     """Массовое одобрение всех черновиков для подготовки к автопилоту."""
-    count = queue_manager.approve_all_drafts()
-    queue = queue_manager.load_queue(exclude_sent=False)
-    stats = {
-        "total": len(queue),
-        "approved": sum(1 for x in queue if x.get("status") == "Approved"),
-        "draft": sum(1 for x in queue if x.get("status") == "Draft"),
-        "skipped": sum(1 for x in queue if x.get("status") == "Skipped"),
-    }
+    t_id = payload.trip_id if payload else None
+    resolved_trip = resolve_trip_alias(t_id) if t_id else None
+    count = queue_manager.approve_all_drafts(trip_id=resolved_trip)
+    queue = queue_manager.load_queue(exclude_sent=False, trip_id=resolved_trip)
+    stats = queue_manager.get_queue_stats(trip_id=resolved_trip)
     return {"status": "ok", "approved_count": count, "stats": stats, "queue": queue}
 
 
@@ -1946,21 +3103,30 @@ async def get_llm_status():
 # =========================================================================
 
 @app.get("/api/autopilot/status")
-async def get_autopilot_status():
-    """Возвращает статус автопилота, обратный отсчет, суточный прогресс, кандидата на очереди, списки ready_candidates и sent_history."""
+async def get_autopilot_status(trip_id: Optional[str] = None):
+    """Возвращает статус автопилота, обратный отсчет, суточный прогресс, списки ready_candidates и sent_history с изоляцией по активному Trip."""
     status_file = OUTPUT_DIR / "autopilot_status.json"
     sent_log_file = OUTPUT_DIR / "sent_log.json"
-    queue_file = OUTPUT_DIR / "requests_queue.json"
-
-    sent_today = 0
-    last_sent = None
-    sent_history = []
-    seen_sent = set()
 
     now_dt = datetime.now()
     today_date = now_dt.date()
     yesterday_date = today_date - timedelta(days=1)
 
+    # 1. Определение активного Trip ID (контекстная константа)
+    active_trip_id = trip_id if (trip_id and str(trip_id).strip() and str(trip_id).strip().lower() not in ("none", "null", "undefined")) else None
+    if not active_trip_id:
+        try:
+            saved_trip_json = get_setting("active_trip_context", "")
+            if saved_trip_json:
+                trip_data = json.loads(saved_trip_json)
+                active_trip_id = trip_data.get("trip_id") or trip_data.get("id")
+        except Exception:
+            pass
+    if active_trip_id:
+        active_trip_id = resolve_trip_alias(str(active_trip_id).strip())
+
+    # 2. Суточный лимит (глобальный счетчик отправлений за сегодня для безопасности CS-аккаунта)
+    sent_today = 0
     if sent_log_file.exists():
         try:
             with open(sent_log_file, "r", encoding="utf-8") as f:
@@ -1976,84 +3142,19 @@ async def get_autopilot_status():
                 and not x.get("timestamp", "").endswith("19:55:57")
             ]
             sent_today = len(today_logs)
-
-            for entry in reversed(logs):
-                st = entry.get("status", "")
-                if st in ("SENT_SUCCESS", "success", "dry_run_success", "DRY_RUN_SUCCESS"):
-                    u = entry.get("username") or entry.get("id")
-                    if not u or u in seen_sent:
-                        continue
-                    seen_sent.add(u)
-                    seen_sent.add(u.strip().lower())
-
-                    ts_raw = entry.get("timestamp", "")
-                    fmt_time = "Recent"
-                    if ts_raw:
-                        try:
-                            clean_ts = ts_raw.replace("T", " ").split(".")[0]
-                            entry_dt = datetime.strptime(clean_ts, "%Y-%m-%d %H:%M:%S")
-                            if entry_dt.date() == today_date:
-                                fmt_time = f"Today, {entry_dt.strftime('%H:%M:%S')}"
-                            elif entry_dt.date() == yesterday_date:
-                                fmt_time = f"Yesterday, {entry_dt.strftime('%H:%M:%S')}"
-                            else:
-                                fmt_time = entry_dt.strftime("%b %d, %H:%M:%S")
-                        except Exception:
-                            fmt_time = ts_raw.split(" ")[-1] if " " in ts_raw else ts_raw
-
-                    sent_item = {
-                        "username": u,
-                        "name": entry.get("name") or u,
-                        "timestamp": fmt_time,
-                        "raw_timestamp": ts_raw,
-                        "status": "WAS SENT",
-                        "mode": entry.get("mode", "live"),
-                    }
-                    sent_history.append(sent_item)
-                    if last_sent is None:
-                        last_sent = {
-                            "name": sent_item["name"],
-                            "username": u,
-                            "timestamp": fmt_time,
-                            "status": "Sent / Verified",
-                            "is_success": True,
-                        }
         except Exception as e:
-            logger.warning(f"Error loading sent_log: {e}")
+            logger.warning(f"Error reading sent_today from sent_log: {e}")
 
-    # Обогащаем seen_sent из всех источников (sent_history, sent_log, SQLite, requests_queue)
+    # 3. Чтение статуса процесса из файла
+    import subprocess
+    is_os_running = False
     try:
-        all_sent_known = queue_manager.get_sent_usernames()
-        for u in all_sent_known:
-            if u:
-                seen_sent.add(u)
-                seen_sent.add(u.strip().lower())
-    except Exception as e:
-        logger.warning(f"Error enriching seen_sent from queue_manager: {e}")
+        res = subprocess.run(["pgrep", "-f", "auto_sender.py"], capture_output=True, text=True)
+        is_os_running = (res.returncode == 0 and bool(res.stdout.strip()))
+    except Exception:
+        pass
 
-    # Также добавляем хостов со статусом "Sent" из requests_queue.json в sent_history
-    if queue_file.exists():
-        try:
-            with open(queue_file, "r", encoding="utf-8") as f:
-                q_items = json.load(f)
-            added_sent = {h["username"].lower() for h in sent_history if "username" in h}
-            for item in q_items:
-                if (item.get("status") or "").lower() == "sent":
-                    u = item.get("username")
-                    if u and u.lower() not in added_sent:
-                        sent_history.insert(0, {
-                            "username": u,
-                            "name": item.get("clean_name") or item.get("name") or u,
-                            "timestamp": item.get("sent_at") or "Sent",
-                            "raw_timestamp": item.get("sent_at") or "",
-                            "status": "WAS SENT",
-                            "mode": "live",
-                        })
-                        added_sent.add(u.lower())
-        except Exception as e:
-            logger.warning(f"Error appending queue sent items to sent_history: {e}")
-
-    is_running = (process_mgr.active_task_name == "Автопилот" and process_mgr.is_running)
+    is_running = (process_mgr.active_task_name == "Автопилот" and process_mgr.is_running) or is_os_running
 
     status_data = {
         "is_running": is_running,
@@ -2066,7 +3167,7 @@ async def get_autopilot_status():
         "last_status": "Остановлен" if not is_running else "Работает",
         "current_host": None,
         "next_candidate": None,
-        "last_sent": last_sent,
+        "last_sent": None,
         "dry_run": False,
         "emergency_stop": get_setting("emergency_stop", "0") == "1",
     }
@@ -2079,10 +3180,8 @@ async def get_autopilot_status():
             status_data["is_running"] = is_running
             is_paused = bool(saved.get("is_paused"))
             status_data["is_paused"] = is_paused
-
-            # Принудительно используем вычисленные значения
             status_data["sent_today"] = sent_today
-            status_data["daily_limit"] = 100
+            status_data["daily_limit"] = int(saved.get("daily_limit") or 100)
 
             if not is_running:
                 status_data["state_label"] = "ОСТАНОВЛЕН"
@@ -2103,29 +3202,145 @@ async def get_autopilot_status():
 
     current_sending = status_data.get("current_host")
 
-    # Load ready candidates
-    ready_candidates = []
-    if queue_file.exists():
-        try:
-            with open(queue_file, "r", encoding="utf-8") as f:
-                queue = json.load(f)
-            for item in queue:
-                st = (item.get("status") or "").lower()
-                u = item.get("username") or item.get("id")
-                # Exclude if already sent
-                if not u or u in seen_sent:
+    # 4. Формирование SENT_HISTORY strictly с привязкой к активному Trip (DDD)
+    sent_history = []
+    seen_sent = set()
+    try:
+        with db_session() as conn:
+            cur = conn.cursor()
+            if active_trip_id:
+                cur.execute("""
+                    SELECT host_id, username, name, location, gender, score_stars, languages_json, sent_at, message_draft, is_verified
+                    FROM core_hosts
+                    WHERE LOWER(trip_id) = LOWER(?) AND state = 'sent'
+                    ORDER BY sent_at DESC;
+                """, (active_trip_id,))
+            else:
+                cur.execute("""
+                    SELECT host_id, username, name, location, gender, score_stars, languages_json, sent_at, message_draft, is_verified
+                    FROM core_hosts
+                    WHERE state = 'sent'
+                    ORDER BY sent_at DESC;
+                """)
+            for r in cur.fetchall():
+                u = r["username"] or r["host_id"]
+                if not u:
                     continue
-                if st in ("approved", "queued"):
-                    is_this_sending = bool(current_sending and current_sending.lower() == u.lower())
-                    cand = {
-                        "name": item.get("clean_name") or item.get("name") or u,
+                seen_sent.add(u)
+                seen_sent.add(u.strip().lower())
+
+                ts_raw = r["sent_at"] or ""
+                fmt_time = "Sent"
+                if ts_raw:
+                    try:
+                        clean_ts = ts_raw.replace("T", " ").split(".")[0]
+                        entry_dt = datetime.strptime(clean_ts, "%Y-%m-%d %H:%M:%S")
+                        if entry_dt.date() == today_date:
+                            fmt_time = f"Today, {entry_dt.strftime('%H:%M:%S')}"
+                        elif entry_dt.date() == yesterday_date:
+                            fmt_time = f"Yesterday, {entry_dt.strftime('%H:%M:%S')}"
+                        else:
+                            fmt_time = entry_dt.strftime("%b %d, %H:%M:%S")
+                    except Exception:
+                        fmt_time = ts_raw.split(" ")[-1] if " " in ts_raw else ts_raw
+
+                langs = []
+                try:
+                    if r["languages_json"]:
+                        langs = json.loads(r["languages_json"])
+                except Exception:
+                    pass
+                langs_str = ", ".join(langs[:2]) if langs else "Not specified"
+
+                msg = r["message_draft"] or ""
+                sent_history.append({
+                    "username": u,
+                    "name": r["name"] or u,
+                    "location": r["location"] or "Japan",
+                    "gender": (r["gender"] or "unknown").capitalize(),
+                    "score_stars": r["score_stars"] or 5,
+                    "languages": langs_str,
+                    "timestamp": fmt_time,
+                    "raw_timestamp": ts_raw,
+                    "status": "WAS SENT",
+                    "mode": "live",
+                    "message": msg,
+                    "is_verified": bool(r["is_verified"]) if ("is_verified" in r.keys() and r["is_verified"]) else False,
+                    "word_count": len(msg.split()) if msg else 0,
+                })
+    except Exception as e:
+        logger.warning(f"Error loading sent_history from core_hosts: {e}")
+
+    # Fallback на глобальный sent_log, если по трипу записей нет (например старые отправки до миграции)
+    if not sent_history and not active_trip_id and sent_log_file.exists():
+        try:
+            with open(sent_log_file, "r", encoding="utf-8") as f:
+                logs = json.load(f)
+            for entry in reversed(logs):
+                st = entry.get("status", "")
+                if st in ("SENT_SUCCESS", "success", "dry_run_success", "DRY_RUN_SUCCESS"):
+                    u = entry.get("username") or entry.get("id")
+                    if not u or u in seen_sent:
+                        continue
+                    seen_sent.add(u)
+                    seen_sent.add(u.strip().lower())
+                    msg = entry.get("message") or ""
+                    sent_history.append({
                         "username": u,
-                        "location": item.get("location") or "Tokyo, Japan",
-                        "status": "SENDING" if is_this_sending else "QUEUED",
-                    }
-                    ready_candidates.append(cand)
-        except Exception as e:
-            logger.warning(f"Error loading ready_candidates: {e}")
+                        "name": entry.get("name") or u,
+                        "location": entry.get("target_city") or "Japan",
+                        "gender": "Unknown",
+                        "score_stars": 5,
+                        "languages": "EN",
+                        "timestamp": entry.get("timestamp", "").split(" ")[-1] or "Sent",
+                        "raw_timestamp": entry.get("timestamp", ""),
+                        "status": "WAS SENT",
+                        "mode": entry.get("mode", "live"),
+                        "message": msg,
+                        "is_verified": bool(entry.get("is_verified", False)),
+                        "word_count": len(msg.split()) if msg else 0,
+                    })
+        except Exception:
+            pass
+
+    # Строгая сортировка отправленных по времени (самые свежие сверху)
+    sent_history.sort(key=lambda x: str(x.get("raw_timestamp") or ""), reverse=True)
+    if sent_history:
+        top_sent = sent_history[0]
+        status_data["last_sent"] = {
+            "name": top_sent.get("name") or top_sent.get("username"),
+            "username": top_sent.get("username"),
+            "timestamp": top_sent.get("timestamp"),
+            "status": "Sent / Verified",
+            "is_success": True,
+        }
+
+    # 5. Формирование READY_CANDIDATES strictly для активного Trip через канонический RequestQueueManager
+    ready_candidates = []
+    try:
+        from request_manager import RequestQueueManager
+        qm = RequestQueueManager()
+        raw_candidates = qm.get_ready_dispatch_candidates(trip_id=active_trip_id)
+        for item in raw_candidates:
+            u = item.get("username") or item.get("id")
+            if not u or u.lower() in seen_sent:
+                continue
+            is_this_sending = bool(current_sending and current_sending.lower() == u.lower())
+            msg = item.get("generated_message") or item.get("message_text") or ""
+            ready_candidates.append({
+                "username": u,
+                "name": item.get("clean_name") or item.get("name") or u,
+                "location": item.get("location") or item.get("city") or "Japan",
+                "gender": (item.get("estimated_gender") or "Unknown").capitalize(),
+                "score_stars": item.get("score_stars") or 4,
+                "languages": item.get("languages") or "Not specified",
+                "status": "SENDING" if is_this_sending else "QUEUED",
+                "message": msg,
+                "is_verified": bool(item.get("is_verified", False)),
+                "word_count": len(msg.split()) if msg else 0,
+            })
+    except Exception as e:
+        logger.warning(f"Error loading ready_candidates via RequestQueueManager: {e}")
 
     # Ensure sending host is placed at the top if present
     if current_sending:
@@ -2136,25 +3351,28 @@ async def get_autopilot_status():
 
     if ready_candidates:
         status_data["next_candidate"] = ready_candidates[0]
+
     status_data["ready_candidates"] = ready_candidates
     status_data["sent_history"] = sent_history
+    status_data["active_trip_id"] = active_trip_id
 
     return status_data
 
 
 @app.on_event("startup")
 async def app_startup_cleanup():
-    """Сброс зависших статусов sending при старте сервера."""
+    """Сброс зависших статусов sending и незавершенных фоновых задач при старте сервера."""
     try:
-        from database import reset_stuck_sending_statuses
+        from database import reset_stuck_sending_statuses, reset_stuck_background_jobs
         reset_stuck_sending_statuses()
+        reset_stuck_background_jobs()
         if QUEUE_FILE.exists():
             with open(QUEUE_FILE, "r", encoding="utf-8") as f:
                 q_data = json.load(f)
             q_changed = False
             for itm in q_data:
                 if (itm.get("status") or "").lower() == "sending":
-                    itm["status"] = "Approved"
+                    itm["status"] = "Verification_Required"
                     q_changed = True
             if q_changed:
                 with open(QUEUE_FILE, "w", encoding="utf-8") as f:
@@ -2252,18 +3470,54 @@ async def start_autopilot(params: AutopilotParams):
     if params.target:
         cmd.extend(["--target", params.target])
 
-    # Сбрасываем флаг паузы перед новым запуском
+    active_trip_id = params.trip_id
+    if not active_trip_id:
+        try:
+            saved_trip_json = get_setting("active_trip_context", "")
+            if saved_trip_json:
+                trip_data = json.loads(saved_trip_json)
+                active_trip_id = trip_data.get("trip_id") or trip_data.get("id")
+        except Exception:
+            pass
+    resolved_active_trip = None
+    if active_trip_id:
+        resolved_active_trip = resolve_trip_alias(str(active_trip_id).strip())
+        cmd.extend(["--trip-id", str(resolved_active_trip)])
+
+    # Проверка наличия одобренных кандидатов перед запуском процесса
+    try:
+        from request_manager import RequestQueueManager
+        qm = RequestQueueManager()
+        ready_cands = qm.get_ready_dispatch_candidates(trip_id=resolved_active_trip)
+        if params.target:
+            t_norm = params.target.strip().lower()
+            ready_cands = [c for c in ready_cands if str(c.get("username", "")).strip().lower() == t_norm]
+        if not ready_cands:
+            return {
+                "error": "В очереди нет одобренных хостов к отправке. Имеющиеся черновики содержат устаревшие шаблоны и требуют регенерации по новым правилам QC."
+            }
+    except Exception as e:
+        logger.warning(f"Ошибка предварительной проверки очереди: {e}")
+
+    # Инициализируем статус активного запуска перед стартом подпроцесса
     status_file = OUTPUT_DIR / "autopilot_status.json"
+    status_data = {}
     if status_file.exists():
         try:
             with open(status_file, "r", encoding="utf-8") as f:
-                d = json.load(f)
-            d["is_paused"] = False
-            d["current_host"] = None
-            with open(status_file, "w", encoding="utf-8") as f:
-                json.dump(d, f, indent=2)
+                status_data = json.load(f)
         except Exception:
-            pass
+            status_data = {}
+    status_data["is_running"] = True
+    status_data["is_paused"] = False
+    status_data["current_host"] = None
+    status_data["last_status"] = "Запуск автопилота..."
+    status_data["updated_at"] = datetime.now().isoformat()
+    try:
+        with open(status_file, "w", encoding="utf-8") as f:
+            json.dump(status_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"Ошибка сохранения autopilot_status: {e}")
 
     res = await _start_dispatcher_job(cmd, params.model_dump())
     if not res.get("success"):
@@ -2316,6 +3570,13 @@ async def stop_autopilot():
     await _cancel_dispatcher_task()
     res = await process_mgr.stop_current_job()
 
+    # Принудительная остановка любых фоновых процессов auto_sender в ОС
+    try:
+        import subprocess
+        subprocess.run(["pkill", "-TERM", "-f", "auto_sender.py"], capture_output=True)
+    except Exception:
+        pass
+
     status_file = OUTPUT_DIR / "autopilot_status.json"
     if status_file.exists():
         try:
@@ -2355,16 +3616,70 @@ async def stop_autopilot():
 
 @app.post("/api/dispatcher/sync-queue")
 @app.post("/api/autopilot/sync-queue")
-async def api_sync_dispatcher_queue():
+async def api_sync_dispatcher_queue(trip_id: Optional[str] = None):
     """Синхронизация и очистка очереди автопилота от уже отправленных хостов."""
     rm = RequestQueueManager()
     removed = rm.deduplicate_queue_against_sent()
+
+    # Синхронизация core_hosts со всеми подтвержденными отправками
+    try:
+        from database import db_session
+        with db_session() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE core_hosts
+                SET state = 'sent'
+                WHERE state != 'sent'
+                  AND (LOWER(username) IN (SELECT LOWER(h.username) FROM sending_queue sq JOIN hosts h ON sq.host_id = h.id WHERE sq.status = 'Sent')
+                    OR LOWER(host_id) IN (SELECT LOWER(sq.host_id) FROM sending_queue sq WHERE sq.status = 'Sent'));
+            """)
+    except Exception as e:
+        logger.warning(f"Ошибка синхронизации core_hosts при sync-queue: {e}")
+
     return {
         "ok": True,
         "status": "success",
         "removed_count": removed,
         "message": f"Очищено {removed} отправленных хостов из очереди"
     }
+
+
+# =========================================================================
+# Gender Enrichment (Background & Test)
+# =========================================================================
+
+@app.get("/api/enrichment/gender/status")
+async def get_gender_enrichment_status(trip_id: Optional[str] = None):
+    """Возвращает текущий статус фонового обогащения пола хостов."""
+    from gender_enricher import enrichment_worker
+    return enrichment_worker.get_progress(trip_id=trip_id)
+
+
+@app.post("/api/enrichment/gender/test")
+async def run_gender_enrichment_test(sample_size: int = 40, trip_id: Optional[str] = None):
+    """Запускает разовый тест обогащения на выборке 30-50 хостов со статусом Unknown."""
+    from gender_enricher import run_test_sample
+    stats = run_test_sample(sample_size=sample_size, trip_id=trip_id)
+    return {"ok": True, "stats": stats}
+
+
+@app.post("/api/enrichment/gender/start")
+async def start_gender_enrichment(trip_id: Optional[str] = None, delay_seconds: float = 1.3):
+    """Запускает фоновый воркер обогащения пола для оставшихся Unknown хостов."""
+    from gender_enricher import enrichment_worker
+    started = enrichment_worker.start(trip_id=trip_id, delay_seconds=delay_seconds)
+    if not started:
+        return {"ok": False, "message": "Фоновый процесс уже запущен"}
+    return {"ok": True, "message": "Фоновое обогащение успешно запущено"}
+
+
+@app.post("/api/enrichment/gender/stop")
+async def stop_gender_enrichment():
+    """Останавливает фоновый воркер обогащения пола."""
+    from gender_enricher import enrichment_worker
+    stopped = enrichment_worker.stop()
+    return {"ok": True, "stopped": stopped, "message": "Фоновое обогащение остановлено"}
+
 
 
 # =========================================================================
@@ -2606,4 +3921,4 @@ async def api_inbox_check():
 
 if __name__ == "__main__":
     print("[*] Запуск Couchsurfing Outreach Platform на http://0.0.0.0:8000")
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)

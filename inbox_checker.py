@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from playwright.sync_api import sync_playwright
 
 BASE_DIR = Path(__file__).parent
-OUTPUT_DIR = BASE_DIR / "output"
+OUTPUT_DIR = Path(os.environ.get("CS_OUTPUT_DIR", str(BASE_DIR / "output"))).resolve()
 USER_DATA_DIR = BASE_DIR / "user_data"
 AUTH_STATE_FILE = USER_DATA_DIR / "auth_state.json"
 CHAT_URL = "https://www.couchsurfing.com/c/chat"
