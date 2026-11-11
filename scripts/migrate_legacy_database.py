@@ -209,6 +209,13 @@ def run_migration(db_path: Path, dry_run: bool = False) -> Dict[str, Any]:
                     status_code = rec.get("status_code", 200)
                     t_id = rec.get("trip_id") or active_trip_id
 
+                    st_raw = str(rec.get("status") or "").upper()
+                    is_success = st_raw in ("SENT_SUCCESS", "DRY_RUN_SUCCESS", "SUCCESS")
+                    is_already = st_raw == "ALREADY_SENT"
+                    is_failed = st_raw in ("FAILED", "ERROR")
+                    init_state = "sent" if is_success else ("skipped" if is_already else "uncertain")
+                    init_sent_at = sent_at if is_success else None
+
                     # Проверяем реальный host_id в hosts или core_hosts
                     cur.execute("SELECT id FROM hosts WHERE LOWER(username) = LOWER(?) LIMIT 1;", (u_name,))
                     ref_h = cur.fetchone()
@@ -229,9 +236,9 @@ def run_migration(db_path: Path, dry_run: bool = False) -> Dict[str, Any]:
                                 cur.execute(
                                     """
                                     INSERT OR IGNORE INTO core_hosts (host_id, trip_id, username, name, location, state, priority, sent_at, created_at, updated_at)
-                                    VALUES (?, ?, ?, ?, 'Japan', 'sent', 10, ?, ?, ?);
+                                    VALUES (?, ?, ?, ?, 'Japan', ?, 10, ?, ?, ?);
                                     """,
-                                    (final_h_id, t_id, u_name, u_name, sent_at, now_iso, now_iso),
+                                    (final_h_id, t_id, u_name, u_name, init_state, init_sent_at, now_iso, now_iso),
                                 )
                                 cur.execute(
                                     """
@@ -245,29 +252,58 @@ def run_migration(db_path: Path, dry_run: bool = False) -> Dict[str, Any]:
                         "SELECT id FROM sending_history WHERE LOWER(username) = LOWER(?) AND timestamp = ?;",
                         (u_name, sent_at),
                     )
+                    st_raw = str(rec.get("status") or "").upper()
+                    is_success = st_raw in ("SENT_SUCCESS", "DRY_RUN_SUCCESS", "SUCCESS")
+                    is_already = st_raw == "ALREADY_SENT"
+                    is_failed = st_raw in ("FAILED", "ERROR")
+
+                    hist_status = rec.get("status") or ("SENT_SUCCESS" if is_success else "UNKNOWN")
+                    hist_mode = "error" if is_failed else ("skipped" if is_already else rec.get("mode", "migration"))
+                    err_det = rec.get("error")
+                    notes_txt = rec.get("notes") or ("migrated from sent_log.json" if not err_det else f"migrated: {err_det}")
+
                     if not cur.fetchone():
                         if not dry_run:
                             cur.execute(
                                 """
                                 INSERT INTO sending_history (
-                                    host_id, username, status, http_status, mode, notes, timestamp
-                                ) VALUES (?, ?, 'sent', ?, 'migration', 'migrated from sent_log.json', ?);
+                                    host_id, username, status, http_status, mode, notes, error_details, timestamp
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
                                 """,
-                                (final_h_id, u_name, status_code, sent_at),
+                                (final_h_id, u_name, hist_status, status_code, hist_mode, notes_txt, err_det, sent_at),
                             )
                         stats["sent_history_migrated_from_json"] += 1
 
-                    # Синхронизируем статус в core_hosts
+                    # Синхронизируем статус в core_hosts ТОЛЬКО при подтверждённом успехе
                     if not dry_run:
-                        cur.execute(
-                            """
-                            UPDATE core_hosts
-                            SET state = 'sent', sent_at = ?
-                            WHERE LOWER(username) = LOWER(?) AND state != 'sent';
-                            """,
-                            (sent_at, u_name),
-                        )
-                        stats["core_hosts_state_synced_sent"] += cur.rowcount
+                        if is_success:
+                            cur.execute(
+                                """
+                                UPDATE core_hosts
+                                SET state = 'sent', sent_at = ?
+                                WHERE LOWER(username) = LOWER(?) AND state != 'sent';
+                                """,
+                                (sent_at, u_name),
+                            )
+                            stats["core_hosts_state_synced_sent"] += cur.rowcount
+                        elif is_already:
+                            cur.execute(
+                                """
+                                UPDATE core_hosts
+                                SET state = 'skipped', qc_notes = 'Already sent on Couchsurfing'
+                                WHERE LOWER(username) = LOWER(?) AND state NOT IN ('sent', 'skipped');
+                                """,
+                                (u_name,),
+                            )
+                        elif is_failed:
+                            cur.execute(
+                                """
+                                UPDATE core_hosts
+                                SET state = 'uncertain', qc_notes = ?
+                                WHERE LOWER(username) = LOWER(?) AND state NOT IN ('sent', 'uncertain');
+                                """,
+                                (f"Migration: sending attempt FAILED ({err_det})", u_name),
+                            )
 
             except Exception as e:
                 logger.error(f"Ошибка при обработке sent_log.json: {e}")
@@ -294,7 +330,21 @@ def run_migration(db_path: Path, dry_run: bool = False) -> Dict[str, Any]:
             elif q_status == "skipped":
                 target_state = HostState.SKIPPED.value
             elif q_status == "sent":
-                target_state = HostState.SENT.value
+                # Не устанавливаем sent вслепую без подтверждения в sending_history
+                cur.execute(
+                    """
+                    SELECT 1 FROM sending_history
+                    WHERE (LOWER(username) = LOWER(?) OR host_id = ?)
+                      AND UPPER(status) IN ('SENT_SUCCESS', 'DRY_RUN_SUCCESS', 'SUCCESS')
+                      AND LOWER(mode) != 'error'
+                    LIMIT 1;
+                    """,
+                    (u_name, h_id),
+                )
+                if cur.fetchone():
+                    target_state = HostState.SENT.value
+                else:
+                    target_state = HostState.UNCERTAIN.value
 
             if target_state and not dry_run:
                 cur.execute(

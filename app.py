@@ -3134,7 +3134,7 @@ async def get_autopilot_status(trip_id: Optional[str] = None):
 
     current_sending = status_data.get("current_host")
 
-    # 4. Формирование SENT_HISTORY strictly с привязкой к активному Trip (DDD)
+    # 4. Формирование SENT_HISTORY strictly по подтверждённым отправкам из sending_history (DDD)
     sent_history = []
     seen_sent = set()
     try:
@@ -3142,24 +3142,68 @@ async def get_autopilot_status(trip_id: Optional[str] = None):
             cur = conn.cursor()
             if active_trip_id:
                 cur.execute("""
-                    SELECT host_id, username, name, location, gender, score_stars, languages_json, sent_at, message_draft, is_verified
-                    FROM core_hosts
-                    WHERE LOWER(trip_id) = LOWER(?) AND state = 'sent'
-                    ORDER BY sent_at DESC;
+                    SELECT 
+                        sh.id as history_id,
+                        sh.host_id,
+                        sh.username,
+                        sh.status as sending_status,
+                        sh.mode as sending_mode,
+                        sh.timestamp as sent_at,
+                        sh.notes as sending_notes,
+                        ch.name,
+                        ch.location,
+                        ch.gender,
+                        ch.score_stars,
+                        ch.languages_json,
+                        ch.message_draft,
+                        ch.is_verified,
+                        ch.state as host_state
+                    FROM sending_history sh
+                    JOIN core_hosts ch ON (
+                        (ch.host_id = sh.host_id OR LOWER(ch.username) = LOWER(sh.username))
+                        AND LOWER(ch.trip_id) = LOWER(?)
+                    )
+                    WHERE UPPER(sh.status) IN ('SENT_SUCCESS', 'DRY_RUN_SUCCESS', 'SUCCESS', 'SENT')
+                      AND UPPER(sh.status) NOT IN ('FAILED', 'UNCERTAIN', 'ALREADY_SENT')
+                      AND LOWER(sh.mode) != 'error'
+                    ORDER BY sh.timestamp DESC, sh.id DESC;
                 """, (active_trip_id,))
             else:
                 cur.execute("""
-                    SELECT host_id, username, name, location, gender, score_stars, languages_json, sent_at, message_draft, is_verified
-                    FROM core_hosts
-                    WHERE state = 'sent'
-                    ORDER BY sent_at DESC;
+                    SELECT 
+                        sh.id as history_id,
+                        sh.host_id,
+                        sh.username,
+                        sh.status as sending_status,
+                        sh.mode as sending_mode,
+                        sh.timestamp as sent_at,
+                        sh.notes as sending_notes,
+                        ch.name,
+                        ch.location,
+                        ch.gender,
+                        ch.score_stars,
+                        ch.languages_json,
+                        ch.message_draft,
+                        ch.is_verified,
+                        ch.state as host_state
+                    FROM sending_history sh
+                    LEFT JOIN core_hosts ch ON (
+                        ch.host_id = sh.host_id OR LOWER(ch.username) = LOWER(sh.username)
+                    )
+                    WHERE UPPER(sh.status) IN ('SENT_SUCCESS', 'DRY_RUN_SUCCESS', 'SUCCESS', 'SENT')
+                      AND UPPER(sh.status) NOT IN ('FAILED', 'UNCERTAIN', 'ALREADY_SENT')
+                      AND LOWER(sh.mode) != 'error'
+                    ORDER BY sh.timestamp DESC, sh.id DESC;
                 """)
             for r in cur.fetchall():
                 u = r["username"] or r["host_id"]
                 if not u:
                     continue
+                u_norm = u.strip().lower()
+                if u_norm in seen_sent:
+                    continue
                 seen_sent.add(u)
-                seen_sent.add(u.strip().lower())
+                seen_sent.add(u_norm)
 
                 ts_raw = r["sent_at"] or ""
                 fmt_time = "Sent"
@@ -3185,6 +3229,9 @@ async def get_autopilot_status(trip_id: Optional[str] = None):
                 langs_str = ", ".join(langs[:2]) if langs else "Not specified"
 
                 msg = r["message_draft"] or ""
+                if not msg and r["sending_notes"] and len(str(r["sending_notes"])) > 20 and not str(r["sending_notes"]).startswith("Stay request sent"):
+                    msg = str(r["sending_notes"])
+
                 sent_history.append({
                     "username": u,
                     "name": r["name"] or u,
@@ -3195,24 +3242,24 @@ async def get_autopilot_status(trip_id: Optional[str] = None):
                     "timestamp": fmt_time,
                     "raw_timestamp": ts_raw,
                     "status": "WAS SENT",
-                    "mode": "live",
+                    "mode": r["sending_mode"] or "live",
                     "message": msg,
                     "is_verified": bool(r["is_verified"]) if ("is_verified" in r.keys() and r["is_verified"]) else False,
                     "word_count": len(msg.split()) if msg else 0,
                 })
     except Exception as e:
-        logger.warning(f"Error loading sent_history from core_hosts: {e}")
+        logger.warning(f"Error loading sent_history from sending_history: {e}")
 
-    # Fallback на глобальный sent_log, если по трипу записей нет (например старые отправки до миграции)
+    # Fallback на глобальный sent_log только при полном отсутствии данных в БД и без активного Trip
     if not sent_history and not active_trip_id and sent_log_file.exists():
         try:
             with open(sent_log_file, "r", encoding="utf-8") as f:
                 logs = json.load(f)
             for entry in reversed(logs):
-                st = entry.get("status", "")
-                if st in ("SENT_SUCCESS", "success", "dry_run_success", "DRY_RUN_SUCCESS"):
+                st = (entry.get("status") or "").upper()
+                if st in ("SENT_SUCCESS", "SUCCESS", "DRY_RUN_SUCCESS"):
                     u = entry.get("username") or entry.get("id")
-                    if not u or u in seen_sent:
+                    if not u or u in seen_sent or u.strip().lower() in seen_sent:
                         continue
                     seen_sent.add(u)
                     seen_sent.add(u.strip().lower())
@@ -3237,6 +3284,39 @@ async def get_autopilot_status(trip_id: Optional[str] = None):
 
     # Строгая сортировка отправленных по времени (самые свежие сверху)
     sent_history.sort(key=lambda x: str(x.get("raw_timestamp") or ""), reverse=True)
+
+    # 4b. Сверка (Reconciliation) core_hosts vs sending_history
+    unconfirmed_sent = []
+    try:
+        with db_session() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT ch.trip_id, ch.host_id, ch.username, ch.name, ch.sent_at
+                FROM core_hosts ch
+                WHERE ch.state = 'sent'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM sending_history sh
+                      WHERE (LOWER(sh.username) = LOWER(ch.username) OR (sh.host_id IS NOT NULL AND sh.host_id = ch.host_id))
+                        AND UPPER(sh.status) IN ('SENT_SUCCESS', 'DRY_RUN_SUCCESS', 'SUCCESS')
+                        AND LOWER(sh.mode) != 'error'
+                  );
+            """)
+            for r in cur.fetchall():
+                unconfirmed_sent.append({
+                    "trip_id": r["trip_id"],
+                    "host_id": r["host_id"],
+                    "username": r["username"],
+                    "name": r["name"],
+                    "sent_at": r["sent_at"],
+                })
+    except Exception as e:
+        logger.warning(f"Error checking reconciliation: {e}")
+
+    status_data["reconciliation"] = {
+        "status": "OK" if not unconfirmed_sent else "DISCREPANCY",
+        "unconfirmed_sent_count": len(unconfirmed_sent),
+        "unconfirmed_hosts": unconfirmed_sent,
+    }
     if sent_history:
         top_sent = sent_history[0]
         status_data["last_sent"] = {

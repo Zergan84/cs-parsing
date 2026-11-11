@@ -80,6 +80,7 @@ def _init_mock_db(db_path: Path):
                 name TEXT NOT NULL,
                 location TEXT NOT NULL,
                 state TEXT NOT NULL DEFAULT 'discovered',
+                sent_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY (trip_id) REFERENCES core_trips(id) ON DELETE CASCADE

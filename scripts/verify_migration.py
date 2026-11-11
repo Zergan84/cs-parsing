@@ -75,10 +75,12 @@ def verify_migration(db_path: Path, sent_log_path: Optional[Path] = None) -> Dic
             "sending_history_fields": {"total": 0, "verified": 0, "discrepancies": []},
             "sent_log_to_db": {"total": 0, "verified": 0, "discrepancies": []},
             "sent_state_in_core": {"total": 0, "verified": 0, "discrepancies": []},
+            "unconfirmed_sent_in_core": {"total": 0, "verified": 0, "discrepancies": []},
             "inbox_conversations": {"total": 0, "verified": 0, "discrepancies": []},
         },
         "invariants": {
             "sent_hosts_in_draft_or_approved": 0,
+            "unconfirmed_sent_hosts": 0,
             "core_hosts_pk_duplicates": 0,
             "core_trips_pk_duplicates": 0,
             "multiple_active_trips": 0,
@@ -326,7 +328,41 @@ def verify_migration(db_path: Path, sent_log_path: Optional[Path] = None) -> Dic
                 else:
                     report["per_record_checks"]["sent_state_in_core"]["verified"] += 1
 
-        # 9. Per-Record Check: inbox_conversations -> core_hosts
+        # 9. Per-Record Check: Reconciliation core_hosts.state == 'sent' -> sending_history SENT_SUCCESS
+        if "core_hosts" in tables and "sending_history" in tables:
+            cur.execute("""
+                SELECT ch.trip_id, ch.host_id, ch.username
+                FROM core_hosts ch
+                WHERE ch.state = 'sent';
+            """)
+            core_sent_all = cur.fetchall()
+            report["per_record_checks"]["unconfirmed_sent_in_core"]["total"] = len(core_sent_all)
+
+            cur.execute("""
+                SELECT LOWER(username), host_id
+                FROM sending_history
+                WHERE UPPER(status) IN ('SENT_SUCCESS', 'DRY_RUN_SUCCESS', 'SUCCESS')
+                  AND LOWER(mode) != 'error';
+            """)
+            confirmed_history = cur.fetchall()
+            confirmed_users = {r[0] for r in confirmed_history if r[0]}
+            confirmed_hids = {r[1] for r in confirmed_history if r[1]}
+
+            for csa in core_sent_all:
+                u_c = (csa["username"] or "").strip().lower()
+                hid_c = (csa["host_id"] or "").strip()
+                if u_c in confirmed_users or hid_c in confirmed_hids:
+                    report["per_record_checks"]["unconfirmed_sent_in_core"]["verified"] += 1
+                else:
+                    _record_discrepancy("unconfirmed_sent_in_core", "FIELD_MISMATCH", {
+                        "trip_id": csa["trip_id"],
+                        "host_id": hid_c,
+                        "username": u_c,
+                        "error": "Host marked as 'sent' in core_hosts but lacks confirmed SENT_SUCCESS in sending_history",
+                    })
+            report["invariants"]["unconfirmed_sent_hosts"] = len(report["per_record_checks"]["unconfirmed_sent_in_core"]["discrepancies"])
+
+        # 10. Per-Record Check: inbox_conversations -> core_hosts
         if "inbox_conversations" in tables:
             cur.execute("SELECT * FROM inbox_conversations;")
             inbox_rows = cur.fetchall()

@@ -267,6 +267,85 @@ class TestConsolidationDefectFixes(unittest.TestCase):
                 self.assertEqual(row["state"], "skipped")
                 self.assertIn("Manually messaged by user", row["qc_notes"])
 
+    # 9. ТЕСТ: Правый стакан строится по confirmed dispatches из sending_history, исключая FAILED и не подтверждённые записи
+    def test_sent_history_requires_confirmed_dispatch_in_sending_history(self):
+        from unittest.mock import patch
+        from fastapi.testclient import TestClient
+        from app import app
+        from core.models import Trip
+
+        client = TestClient(app)
+        mock_trip = Trip(id=TEST_TRIP_ID, url="", city="Sapporo", country="Japan", arrival_date="2026-12-01", departure_date="2026-12-05")
+
+        with get_connection(self.db_path) as conn:
+            # Хост 1: state='sent' в core_hosts, но НЕТ записи в sending_history (фантом)
+            conn.execute("""
+                INSERT INTO core_hosts (trip_id, host_id, username, name, location, state, created_at, updated_at)
+                VALUES (?, 'ghost_host_1', 'ghost_user', 'Ghost User', 'Sapporo', 'sent', '2026-11-10', '2026-11-10');
+            """, (TEST_TRIP_ID,))
+
+            # Хост 2: попытка отправки завершилась FAILED
+            conn.execute("""
+                INSERT INTO core_hosts (trip_id, host_id, username, name, location, state, created_at, updated_at)
+                VALUES (?, 'failed_host_2', 'failed_user', 'Failed User', 'Sapporo', 'uncertain', '2026-11-10', '2026-11-10');
+            """, (TEST_TRIP_ID,))
+            conn.execute("""
+                INSERT INTO sending_history (host_id, username, status, http_status, mode, notes, error_details, timestamp)
+                VALUES ('failed_host_2', 'failed_user', 'FAILED', 500, 'error', 'Network error', 'DNS failed', '2026-11-10 14:00:00');
+            """)
+
+            # Хост 3: подтверждённая отправка SENT_SUCCESS
+            conn.execute("""
+                INSERT INTO core_hosts (trip_id, host_id, username, name, location, state, sent_at, message_draft, created_at, updated_at)
+                VALUES (?, 'confirmed_host_3', 'confirmed_user', 'Confirmed User', 'Sapporo', 'sent', '2026-11-10 15:00:00', 'Hello from Sapporo!', '2026-11-10', '2026-11-10');
+            """, (TEST_TRIP_ID,))
+            conn.execute("""
+                INSERT INTO sending_history (host_id, username, status, http_status, mode, notes, timestamp)
+                VALUES ('confirmed_host_3', 'confirmed_user', 'SENT_SUCCESS', 200, 'live', 'Sent verified', '2026-11-10 15:00:00');
+            """)
+
+        with patch("app.db_session", side_effect=lambda: get_connection(self.db_path)), \
+             patch("database.db_session", side_effect=lambda: get_connection(self.db_path)), \
+             patch("core.queue.db_session", side_effect=lambda: get_connection(self.db_path)), \
+             patch("core.database.get_active_trip", return_value=mock_trip):
+
+            res = client.get(f"/api/autopilot/status?trip_id={TEST_TRIP_ID}")
+            self.assertEqual(res.status_code, 200)
+            data = res.json()
+
+            sent_hist = data.get("sent_history", [])
+            sent_usernames = [s["username"] for s in sent_hist]
+
+            # Подтверждённый хост отображается в правом стакане
+            self.assertIn("confirmed_user", sent_usernames)
+            # Фантомный хост без sending_history НЕ отображается
+            self.assertNotIn("ghost_user", sent_usernames)
+            # Неудачная отправка (FAILED) НЕ отображается
+            self.assertNotIn("failed_user", sent_usernames)
+
+            # Сверка (reconciliation) выявляет расхождение для ghost_user
+            rec = data.get("reconciliation", {})
+            self.assertEqual(rec.get("status"), "DISCREPANCY")
+            self.assertEqual(rec.get("unconfirmed_sent_count"), 1)
+            unconfirmed_usernames = [u["username"] for u in rec.get("unconfirmed_hosts", [])]
+            self.assertIn("ghost_user", unconfirmed_usernames)
+
+    # 10. ТЕСТ: Верификатор миграции выявляет расхождение unconfirmed_sent_in_core
+    def test_verify_migration_detects_unconfirmed_sent_hosts(self):
+        from scripts.verify_migration import verify_migration
+
+        with get_connection(self.db_path) as conn:
+            conn.execute("""
+                INSERT INTO core_hosts (trip_id, host_id, username, name, location, state, created_at, updated_at)
+                VALUES (?, 'unconfirmed_h', 'unconfirmed_user_test', 'Unconfirmed', 'Sapporo', 'sent', '2026-11-10', '2026-11-10');
+            """, (TEST_TRIP_ID,))
+
+        v_rep = verify_migration(self.db_path)
+        self.assertFalse(v_rep["checks_passed"])
+        self.assertGreaterEqual(len(v_rep["per_record_checks"]["unconfirmed_sent_in_core"]["discrepancies"]), 1)
+        disc_users = [d["username"] for d in v_rep["per_record_checks"]["unconfirmed_sent_in_core"]["discrepancies"]]
+        self.assertIn("unconfirmed_user_test", disc_users)
+
 
 if __name__ == "__main__":
     unittest.main()
