@@ -1564,118 +1564,17 @@ class CouchsurfingScraper:
         if not active_trip_id and getattr(self, "arrival_date", None) and getattr(self, "departure_date", None):
             active_trip_id = f"trip_{clean_city.lower()}_{self.arrival_date}_{self.departure_date}"
 
+        # DDD Pipeline Ingestion (core_hosts & core_host_snapshots) - единый источник истины
         try:
-            from database import db_session
-            with db_session() as conn:
-                cur = conn.cursor()
-                for h in hosts_to_save:
-                    raw_uname = str(h.get("username") or h.get("id") or "").strip()
-                    if not raw_uname:
-                        continue
-
-                    # Дедупликация: проверяем, существует ли уже хост по username или id
-                    existing = cur.execute("SELECT id FROM hosts WHERE username = ? OR id = ?", (raw_uname, raw_uname)).fetchone()
-                    host_pk = existing[0] if existing else raw_uname
-
-                    cur.execute("""
-                        INSERT INTO hosts (
-                            id, username, name, clean_name, profile_url, stay_request_url,
-                            location, avatar_url, about_me, about_me_clean,
-                            references_count, response_rate_pct, instagram_handle, instagram_url,
-                            first_scraped_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                        ON CONFLICT(id) DO UPDATE SET
-                            name=coalesce(excluded.name, hosts.name),
-                            clean_name=coalesce(excluded.clean_name, hosts.clean_name),
-                            profile_url=coalesce(excluded.profile_url, hosts.profile_url),
-                            location=coalesce(excluded.location, hosts.location),
-                            about_me=coalesce(excluded.about_me, hosts.about_me),
-                            about_me_clean=coalesce(excluded.about_me_clean, hosts.about_me_clean),
-                            references_count=coalesce(excluded.references_count, hosts.references_count),
-                            response_rate_pct=coalesce(excluded.response_rate_pct, hosts.response_rate_pct),
-                            updated_at=CURRENT_TIMESTAMP;
-                    """, (
-                        host_pk,
-                        raw_uname,
-                        h.get("name") or raw_uname,
-                        h.get("clean_name") or h.get("name") or raw_uname,
-                        h.get("profile_url") or f"https://www.couchsurfing.com/c/users/{raw_uname}",
-                        h.get("stay_request_url") or "",
-                        h.get("location") or clean_city,
-                        h.get("avatar_url") or "",
-                        h.get("about_me") or "",
-                        h.get("about_me_clean") or h.get("about_me") or "",
-                        h.get("references_count") or 0,
-                        h.get("response_rate_pct") or 90.0,
-                        h.get("instagram_handle") or "",
-                        h.get("instagram_url") or "",
-                    ))
-
-                    raw_gender = h.get("gender") or h.get("estimated_gender") or "Unknown"
-                    cap_gender = raw_gender.capitalize() if str(raw_gender).lower() in ("male", "female", "couple") else "Unknown"
-
-                    cur.execute("""
-                        INSERT INTO profile_analyses (
-                            host_id, estimated_gender, host_type, can_host_overnight,
-                            hosting_verdict_reason, hosting_confidence, sleeping_arrangement,
-                            house_rules, secret_code_detected, secret_code_hint,
-                            conversation_hooks_json, compatibility_points_json,
-                            conversation_strategy, compatibility_score, analyzed_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                        ON CONFLICT(host_id) DO UPDATE SET
-                            estimated_gender=coalesce(excluded.estimated_gender, profile_analyses.estimated_gender),
-                            host_type=coalesce(excluded.host_type, profile_analyses.host_type),
-                            can_host_overnight=coalesce(excluded.can_host_overnight, profile_analyses.can_host_overnight),
-                            hosting_verdict_reason=coalesce(excluded.hosting_verdict_reason, profile_analyses.hosting_verdict_reason),
-                            hosting_confidence=coalesce(excluded.hosting_confidence, profile_analyses.hosting_confidence),
-                            sleeping_arrangement=coalesce(excluded.sleeping_arrangement, profile_analyses.sleeping_arrangement),
-                            house_rules=coalesce(excluded.house_rules, profile_analyses.house_rules),
-                            secret_code_detected=coalesce(excluded.secret_code_detected, profile_analyses.secret_code_detected),
-                            secret_code_hint=coalesce(excluded.secret_code_hint, profile_analyses.secret_code_hint),
-                            conversation_hooks_json=coalesce(excluded.conversation_hooks_json, profile_analyses.conversation_hooks_json),
-                            compatibility_points_json=coalesce(excluded.compatibility_points_json, profile_analyses.compatibility_points_json),
-                            conversation_strategy=coalesce(excluded.conversation_strategy, profile_analyses.conversation_strategy),
-                            compatibility_score=coalesce(excluded.compatibility_score, profile_analyses.compatibility_score),
-                            analyzed_at=CURRENT_TIMESTAMP;
-                    """, (
-                        host_pk,
-                        cap_gender,
-                        h.get("host_type") or "solo",
-                        1 if h.get("can_host_overnight", True) else 0,
-                        h.get("hosting_verdict_reason") or "",
-                        float(h.get("hosting_confidence") or 1.0),
-                        h.get("sleeping_arrangement") or "Not specified",
-                        h.get("house_rules") or "",
-                        1 if h.get("secret_code_detected") else 0,
-                        h.get("secret_code_hint") or "",
-                        json.dumps(h.get("conversation_hooks") or [], ensure_ascii=False),
-                        json.dumps(h.get("compatibility_points") or [], ensure_ascii=False),
-                        h.get("conversation_strategy") or "",
-                        float(h["compatibility_score"]) if h.get("compatibility_score") is not None else None,
-                    ))
-
-                    if active_trip_id:
-                        cur.execute("""
-                            INSERT OR IGNORE INTO trip_hosts (trip_id, host_id, city, arrival_date, departure_date, created_at)
-                            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP);
-                        """, (
-                            active_trip_id,
-                            host_pk,
-                            clean_city,
-                            getattr(self, "arrival_date", None) or "",
-                            getattr(self, "departure_date", None) or "",
-                        ))
-
-            # DDD Pipeline Ingestion (core_hosts & core_host_snapshots)
-            try:
-                from core.database import get_active_trip
-                from core.collector import CollectorEngine
-                active_trip = get_active_trip()
-                if active_trip:
-                    collector = CollectorEngine(trip_id=active_trip.id)
-                    collector.ingest_batch(hosts_to_save)
-            except Exception as e:
-                print(f"[!] Предупреждение DDD: не удалось сохранить в core_hosts: {e}")
+            from core.database import get_active_trip
+            from core.collector import CollectorEngine
+            active_trip = get_active_trip()
+            target_trip = active_trip.id if active_trip else active_trip_id
+            if target_trip:
+                collector = CollectorEngine(trip_id=target_trip)
+                collector.ingest_batch(hosts_to_save)
+        except Exception as e:
+            print(f"[!] Предупреждение DDD: не удалось сохранить в core_hosts: {e}")
         except Exception as e:
             print(f"[!] Ошибка сохранения хостов в SQLite: {e}")
             raise

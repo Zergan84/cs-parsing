@@ -28,6 +28,7 @@ class HostState(str, Enum):
     SENT = "sent"              # Успешно доставлено в CS API
     INBOX = "inbox"            # Хост ответил (активный диалог)
     SKIPPED = "skipped"        # Пропущен
+    UNCERTAIN = "uncertain"    # Неизвестный/неподтвержденный исход отправки (требует ручной проверки)
 
 
 class QueueStatus(str, Enum):
@@ -43,6 +44,7 @@ class QueueStatus(str, Enum):
     SKIPPED = "Skipped"
     FAILED = "Failed"
     DECLINED = "Declined"
+    UNCERTAIN = "Uncertain"
 
 
 class AcceptingState(str, Enum):

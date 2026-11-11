@@ -158,16 +158,31 @@ class AutopilotEngine:
             )
             return cur.lastrowid or 0
 
-    def mark_as_sent(self, host_id: str, http_status: int = 200, notes: Optional[str] = None) -> bool:
-        """Фиксирует успешную отправку запроса в `core_hosts`, `sending_history` и `core_audit_logs`."""
+    def mark_as_sent(self, host_id: str, http_status: int, notes: Optional[str] = None) -> bool:
+        """
+        Атомарно и идемпотентно фиксирует успешную отправку запроса в `core_hosts`, `sending_history` и `core_audit_logs`.
+        Требует обязательного проверенного HTTP-кода (200-299).
+        """
+        if not (200 <= http_status <= 299):
+            raise ValueError(f"mark_as_sent requires 2xx http_status, got {http_status}. Use mark_as_uncertain instead.")
+
         now_iso = datetime.now().isoformat()
         with get_connection(self.db_file) as conn:
             cur = conn.cursor()
+            # Проверка идемпотентности: если уже отправлен, повторно не пишем
+            cur.execute(
+                "SELECT state FROM core_hosts WHERE trip_id = ? AND (host_id = ? OR LOWER(username) = LOWER(?));",
+                (self.trip_id, host_id, host_id),
+            )
+            row = cur.fetchone()
+            if row and row["state"] == "sent":
+                return True
+
             cur.execute(
                 """
                 UPDATE core_hosts
-                SET state = 'sent', sent_at = ?, updated_at = ?
-                WHERE trip_id = ? AND (host_id = ? OR username = ?);
+                SET state = 'sent', sent_at = COALESCE(sent_at, ?), updated_at = ?
+                WHERE trip_id = ? AND (host_id = ? OR LOWER(username) = LOWER(?)) AND state != 'sent';
                 """,
                 (now_iso, now_iso, self.trip_id, host_id, host_id),
             )
@@ -188,6 +203,59 @@ class AutopilotEngine:
                 event="REQUEST_SENT_VERIFIED",
                 host_id=host_id,
                 details={"http_status": http_status, "notes": notes},
+                db_file=self.db_file,
+            )
+        return affected
+
+    def mark_as_uncertain(
+        self,
+        host_id: str,
+        error_details: Optional[str] = None,
+        http_status: Optional[int] = None,
+        proof_screenshot: Optional[str] = None,
+        before_screenshot: Optional[str] = None,
+        notes: Optional[str] = None,
+    ) -> bool:
+        """
+        Фиксирует неизвестный/неподтвержденный исход отправки (таймаут, HTTP 500, сетевой сбой).
+        Переводит host в state = 'uncertain', исключая его из автоматической очереди.
+        """
+        now_iso = datetime.now().isoformat()
+        clean_notes = notes or (f"HTTP {http_status}: {error_details}" if http_status else (error_details or "Uncertain outcome"))
+
+        with get_connection(self.db_file) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE core_hosts
+                SET state = 'uncertain',
+                    attempts = COALESCE(attempts, 0) + 1,
+                    qc_notes = ?,
+                    updated_at = ?
+                WHERE trip_id = ? AND (host_id = ? OR LOWER(username) = LOWER(?)) AND state != 'sent';
+                """,
+                (f"UNCERTAIN: {clean_notes}", now_iso, self.trip_id, host_id, host_id),
+            )
+            affected = cur.rowcount > 0
+
+        if affected:
+            self.record_sending_attempt(
+                host_id_or_username=host_id,
+                status="UNCERTAIN",
+                mode="live",
+                http_status=http_status,
+                proof_screenshot=proof_screenshot,
+                before_screenshot=before_screenshot,
+                notes=clean_notes,
+                error_details=error_details,
+                timestamp=now_iso,
+            )
+            log_audit(
+                trip_id=self.trip_id,
+                module="AUTOPILOT",
+                event="REQUEST_SEND_UNCERTAIN",
+                host_id=host_id,
+                details={"http_status": http_status, "error_details": error_details, "notes": clean_notes},
                 db_file=self.db_file,
             )
         return affected

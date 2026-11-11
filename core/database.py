@@ -575,7 +575,7 @@ def init_core_tables(db_file: Optional[Path | str] = None) -> None:
             )
 
         cur.execute(
-            "UPDATE sending_queue SET status = 'Verification_Required', notes = 'Recovered from interrupted sending' WHERE LOWER(status) = 'sending';"
+            "UPDATE core_hosts SET state = 'uncertain', qc_notes = 'Recovered from interrupted sending' WHERE LOWER(state) = 'sending';"
         )
 
         cur.execute("SELECT COUNT(*) FROM compatibility_anchors;")
@@ -783,7 +783,7 @@ def reset_stuck_sending_statuses(db_file: Optional[Path | str] = None) -> int:
         with get_connection(db_file) as conn:
             cur = conn.cursor()
             cur.execute(
-                "UPDATE sending_queue SET status = 'Verification_Required', notes = 'Stuck sending status recovered to verification' WHERE LOWER(status) = 'sending';"
+                "UPDATE core_hosts SET state = 'uncertain', qc_notes = 'Stuck sending status recovered to verification' WHERE LOWER(state) = 'sending';"
             )
             return cur.rowcount
     except Exception as e:
@@ -1062,13 +1062,11 @@ def mark_host_declined(host_username: str, db_file: Optional[Path | str] = None)
         cur = conn.cursor()
         cur.execute(
             """
-            UPDATE sending_queue
-            SET status = 'Declined', updated_at = ?
-            WHERE host_id IN (
-                SELECT id FROM hosts WHERE LOWER(username) = LOWER(?) OR LOWER(id) = LOWER(?)
-            ) OR LOWER(host_id) = LOWER(?);
+            UPDATE core_hosts
+            SET state = 'skipped', qc_notes = 'Declined', updated_at = ?
+            WHERE LOWER(username) = LOWER(?) OR LOWER(host_id) = LOWER(?);
             """,
-            (now_iso, u, u, u),
+            (now_iso, u, u),
         )
 
 

@@ -823,7 +823,6 @@ async def api_search_erase_all(payload: Optional[EraseSearchPayload] = None):
             with db_session() as conn:
                 cur = conn.cursor()
                 if active_trip_id:
-                    cur.execute("DELETE FROM trip_hosts WHERE LOWER(trip_id) = LOWER(?);", (active_trip_id,))
                     cur.execute("""
                         DELETE FROM core_hosts 
                         WHERE LOWER(trip_id) = LOWER(?) AND state NOT IN ('sent', 'inbox');
@@ -1782,14 +1781,6 @@ async def delete_selected_hosts(payload: DeleteHostsPayload):
             u_list = list(to_delete)
             placeholders = ",".join("?" for _ in u_list)
             if target_trip_id:
-                # 1. Удаляем привязку к поездке из trip_hosts
-                cur.execute(f"""
-                    DELETE FROM trip_hosts 
-                    WHERE LOWER(trip_id) = LOWER(?) 
-                      AND (LOWER(host_id) IN ({placeholders}) 
-                           OR host_id IN (SELECT id FROM hosts WHERE LOWER(username) IN ({placeholders})));
-                """, [target_trip_id] + u_list + u_list)
-
                 # 2. Переводим в статус rejected в core_hosts (ТЗ)
                 cur.execute(f"""
                     UPDATE core_hosts 
@@ -2179,14 +2170,6 @@ async def delete_queue_item(username: str):
                 WHERE (LOWER(host_id) = ? OR LOWER(username) = ?)
                   AND state != 'sent';
             """, (u_clean, u_clean))
-
-        # 2. Обновляем статус в legacy staging sending_queue на Skipped (без DELETE из hosts / trip_hosts!)
-        cur.execute("""
-            UPDATE sending_queue 
-            SET status = 'Skipped', updated_at = CURRENT_TIMESTAMP
-            WHERE (LOWER(host_id) = ? OR host_id IN (SELECT id FROM hosts WHERE LOWER(username) = ? OR LOWER(id) = ?))
-              AND LOWER(status) != 'sent';
-        """, (u_clean, u_clean, u_clean))
         removed = cur.rowcount
 
     if active_trip_id:
@@ -2254,19 +2237,7 @@ async def delete_all_queue_items(payload: Optional[QueueDeletePayload] = None):
                     """,
                     u_clean + u_clean
                 )
-
-            # 2. sending_queue staging: status -> Skipped
-            cur.execute(
-                f"""
-                UPDATE sending_queue 
-                SET status = 'Skipped', updated_at = CURRENT_TIMESTAMP
-                WHERE ((host_id IN (SELECT id FROM hosts WHERE LOWER(username) IN ({placeholders}) OR LOWER(id) IN ({placeholders})))
-                   OR LOWER(host_id) IN ({placeholders}))
-                  AND LOWER(status) != 'sent';
-                """,
-                u_clean + u_clean + u_clean,
-            )
-            removed = cur.rowcount
+                removed = cur.rowcount
         else:
             # Сброс всей очереди для трипа
             if resolved_trip:
@@ -2275,14 +2246,6 @@ async def delete_all_queue_items(payload: Optional[QueueDeletePayload] = None):
                     SET state = 'skipped', updated_at = CURRENT_TIMESTAMP
                     WHERE trip_id = ? AND state != 'sent' AND state IN ('selected', 'drafted', 'approved');
                 """, (resolved_trip,))
-                
-                cur.execute("""
-                    UPDATE sending_queue 
-                    SET status = 'Skipped', updated_at = CURRENT_TIMESTAMP
-                    WHERE (host_id IN (SELECT host_id FROM trip_hosts WHERE LOWER(trip_id) = LOWER(?))
-                           OR host_id IN (SELECT id FROM hosts WHERE id IN (SELECT host_id FROM trip_hosts WHERE LOWER(trip_id) = LOWER(?))))
-                      AND LOWER(status) != 'sent';
-                """, (resolved_trip, resolved_trip))
                 removed = cur.rowcount
             else:
                 cur.execute("""
@@ -2290,7 +2253,6 @@ async def delete_all_queue_items(payload: Optional[QueueDeletePayload] = None):
                     SET state = 'skipped', updated_at = CURRENT_TIMESTAMP
                     WHERE state != 'sent' AND state IN ('selected', 'drafted', 'approved');
                 """)
-                cur.execute("UPDATE sending_queue SET status = 'Skipped', updated_at = CURRENT_TIMESTAMP WHERE LOWER(status) != 'sent';")
                 removed = cur.rowcount
 
     if resolved_trip:
@@ -2506,26 +2468,6 @@ async def regenerate_single_request(payload: RegenerateItem):
         )
         if not updated:
             return JSONResponse(status_code=404, content={"error": f"Host '{target_id}' not found in queue or base"})
-
-        # Если передан trip_id — гарантируем наличие связи в trip_hosts
-        if resolved_trip:
-            try:
-                with db_session() as conn:
-                    cur = conn.cursor()
-                    actual_hid = updated.get("id") or target_id
-                    eff_city = updated.get("city") or payload.city or "Kyoto"
-                    eff_in = updated.get("check_in") or DEFAULT_CHECK_IN
-                    eff_out = updated.get("check_out") or DEFAULT_CHECK_OUT
-                    cur.execute(
-                        """
-                        INSERT INTO trip_hosts (trip_id, host_id, city, arrival_date, departure_date, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(trip_id, host_id) DO NOTHING;
-                        """,
-                        (resolved_trip, actual_hid, eff_city, eff_in, eff_out, datetime.now().isoformat()),
-                    )
-            except Exception as e:
-                logger.warning(f"Ошибка привязки trip_hosts при regenerate: {e}")
 
         msg = updated.get("generated_message", "")
         words = updated.get("word_count", len(msg.split()))
@@ -2983,12 +2925,11 @@ async def api_queue_batch_update_dates(payload: BatchUpdateDatesPayload):
             with db_session() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
-                    UPDATE generated_messages 
-                    SET message_text = ?, check_in = ?, check_out = ?, word_count = ?, qc_passed = ?
-                    WHERE host_id = ? AND is_active = 1
-                """, (new_msg, iso_in, iso_out, words, 1 if qc_passed else 0, item.get("username") or item.get("id")))
-                if city:
-                    cursor.execute("UPDATE hosts SET location = ? WHERE username = ? OR id = ?", (city, item.get("username"), item.get("id")))
+                    UPDATE core_hosts
+                    SET message_draft = ?, qc_passed = ?, location = COALESCE(?, location), updated_at = CURRENT_TIMESTAMP
+                    WHERE (LOWER(username) = LOWER(?) OR LOWER(host_id) = LOWER(?))
+                      AND state != 'sent';
+                """, (new_msg, 1 if qc_passed else 0, city if city else None, item.get("username") or item.get("id"), item.get("username") or item.get("id")))
                 conn.commit()
         except Exception as e:
             logger.warning(f"Error updating SQLite dates for {u}: {e}")

@@ -124,11 +124,11 @@ def build_personalized_message(host: Dict[str, Any], trip: Union[Dict[str, Any],
 
     if is_minimal:
         hook_sentence = "I appreciate your open hospitality on Couchsurfing."
-        guest_fact = f"I am visiting from Geneva (Switzerland) to explore {city}."
+        guest_fact = f"I am visiting {city} to explore its architecture and street photography."
         lines = [
             f"Hi {first_name},",
             "",
-            f"{hook_sentence} {guest_fact} I am an experienced Couchsurfer, quiet, tidy, and respectful of house rules.",
+            f"{hook_sentence} {guest_fact} Originally from Siberia, I work as an alpine ski instructor and have been on CS for years. I keep a quiet and tidy routine.",
             "",
             f"I will be visiting {city} {dates_str}. If your schedule allows hosting, I would be glad to connect and exchange stories!",
             "",
@@ -138,19 +138,19 @@ def build_personalized_message(host: Dict[str, Any], trip: Union[Dict[str, Any],
     else:
         if any(k in reasons_str for k in ["горы", "лыжи", "ski", "mountain", "hiking", "trekking", "alps"]):
             hook_sentence = "Your shared love for the mountains and outdoor adventures really resonated with me."
-            guest_fact = "I'm a ski instructor based in Geneva and the French Alps, so spending time in alpine nature is close to my heart."
-        elif any(k in reasons_str for k in ["кино", "фото", "арт", "photo", "cinema", "film", "art", "camera"]):
-            hook_sentence = "Your creative interests in visual culture, film, and photography really resonated with me."
-            guest_fact = "I'm traveling from Geneva (Switzerland) where I studied film directing and practice street photography; visual culture is central to my journey."
-        elif any(k in reasons_str for k in ["музыка", "фортепиано", "music", "piano", "jazz", "concert"]):
+            guest_fact = "I work as an alpine ski coach in Courchevel (French Alps) and grew up in Siberia, so mountain trails, snow, and outdoor life are second nature to me."
+        elif any(k in reasons_str for k in ["кино", "фото", "арт", "photo", "cinema", "film", "art", "camera", "visual"]):
+            hook_sentence = "Your creative interests in visual culture, film, and photography really caught my attention."
+            guest_fact = "I studied film directing at VGIK and actively practice street photography; visual storytelling and capturing genuine moments are central to how I travel."
+        elif any(k in reasons_str for k in ["музыка", "фортепиано", "music", "piano", "jazz", "concert", "sound"]):
             hook_sentence = "I was delighted to see your appreciation for acoustic music and piano."
-            guest_fact = "I play the piano and deeply appreciate musical traditions, quiet conversations, and cultural exchange."
+            guest_fact = "I play the piano and deeply appreciate musical traditions, quiet evening conversations, sound design, and genuine cultural exchange."
         elif any(k in reasons_str for k in ["французский", "french", "france"]):
             hook_sentence = "It was wonderful to notice your connection with the French language and European culture."
-            guest_fact = "I'm based in Geneva (Switzerland) and Courchevel, so sharing cultural perspectives would be a genuine pleasure."
+            guest_fact = "I work as a ski coach in the French Alps (Courchevel), so sharing perspectives in French or English over local traditions would be a pleasure."
         else:
             hook_sentence = "Your welcoming approach to hosting and cultural exchange immediately stood out to me."
-            guest_fact = f"I'm traveling from Geneva (Switzerland) to experience {city}'s local atmosphere, photography, and cultural traditions."
+            guest_fact = f"Originally from Siberia, I work as an alpine ski instructor and have been on Couchsurfing for many years. Visiting {city} for photography, architecture, and local culture."
 
         lines = [
             f"Hi {first_name},",
@@ -553,20 +553,13 @@ class RequestQueueManager:
             logger.info(f"Миграция {len(queue)} анкет из JSON в базу данных core_hosts...")
             from core.database import get_active_trip
             active_trip = get_active_trip()
-            target_trip_id = active_trip.id if active_trip else "trip_tokyo"
+            if not active_trip:
+                logger.warning("sync_from_json_if_db_empty: NO_ACTIVE_TRIP, пропуск синхронизации без создания фиктивных поездок.")
+                return
+            target_trip_id = active_trip.id
 
             with db_session() as conn:
                 cur = conn.cursor()
-                cur.execute("SELECT id FROM core_trips WHERE id = ?;", (target_trip_id,))
-                if not cur.fetchone():
-                    now_iso = datetime.now().isoformat()
-                    cur.execute(
-                        """
-                        INSERT INTO core_trips (id, title, city, arrival_date, departure_date, url, is_active, created_at, updated_at)
-                        VALUES (?, ?, 'Tokyo', '2026-11-18', '2026-11-20', 'https://couchsurfing.com/trips/default', 1, ?, ?);
-                        """,
-                        (target_trip_id, "Default Trip", now_iso, now_iso),
-                    )
 
                 now_iso = datetime.now().isoformat()
                 for item in queue:
@@ -1381,8 +1374,8 @@ class RequestQueueManager:
         active_trip = get_active_trip()
         target_trip_id = trip_id or (active_trip.id if active_trip else None)
         if not target_trip_id:
-            logger.warning("enqueue_hosts: нет активной поездки, невозможно добавить хостов в очередь.")
-            return (0, []) if return_details else 0
+            logger.error("enqueue_hosts: NO_ACTIVE_TRIP, невозможно добавить хостов в очередь без активной поездки.")
+            raise ValueError("NO_ACTIVE_TRIP")
 
         existing = self.load_queue(exclude_sent=False, trip_id=target_trip_id)
         existing_users = {

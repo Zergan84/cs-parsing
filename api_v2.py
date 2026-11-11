@@ -16,16 +16,15 @@ from core.inbox import InboxEngine
 
 router = APIRouter(prefix="/api/v2", tags=["V2 DDD Architecture"])
 
-KYOTO_TRIP_ID = "kyoto-trip-3lhdfema5epclndo82mclxklzfytp-3LhDfEmA5Epclndo82MclXkLzFy_tp"
-
-
 def get_active_trip_id() -> str:
-    """Возвращает идентификатор активной поездки."""
+    """Возвращает идентификатор активной поездки. При отсутствии выбрасывает NO_ACTIVE_TRIP."""
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("SELECT id FROM core_trips WHERE is_active = 1 LIMIT 1;")
         row = cur.fetchone()
-        return row[0] if row else KYOTO_TRIP_ID
+        if not row:
+            raise HTTPException(status_code=400, detail="NO_ACTIVE_TRIP")
+        return row[0]
 
 
 # =========================================================================
@@ -39,7 +38,7 @@ async def get_active_trip():
         cur.execute("SELECT * FROM core_trips WHERE is_active = 1 LIMIT 1;")
         row = cur.fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="No active trip found")
+            raise HTTPException(status_code=404, detail="NO_ACTIVE_TRIP")
         return dict(row)
 
 

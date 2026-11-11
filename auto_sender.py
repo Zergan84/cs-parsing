@@ -184,7 +184,10 @@ class AutoSender:
         self.headless = headless
         self.target_username = target_username
         self.test_mode = test_mode
-        self.trip_id = trip_id
+        if not self.trip_id:
+            from core.database import get_active_trip
+            active_trip = get_active_trip()
+            self.trip_id = active_trip.id if active_trip else None
         self.is_running = True
         self.is_paused = False
         self._start_timestamp = time.time()
@@ -195,7 +198,7 @@ class AutoSender:
         # Единый источник истины для очереди — RequestQueueManager (SQLite + JSON синхронизация)
         self.queue_manager = RequestQueueManager()
         from core.autopilot import AutopilotEngine
-        self.autopilot_engine = AutopilotEngine(trip_id=self.trip_id or "default")
+        self.autopilot_engine = AutopilotEngine(trip_id=self.trip_id) if self.trip_id else None
 
     def get_sent_today_count(self) -> int:
         """Подсчитывает количество успешно отправленных запросов за сегодняшний день."""
@@ -257,22 +260,23 @@ class AutoSender:
         os.replace(tmp_file, SENT_LOG_FILE)
 
         # Каноническая запись попытки отправки в SQLite sending_history через AutopilotEngine
-        try:
-            from core.autopilot import AutopilotEngine
-            engine = AutopilotEngine(trip_id=self.trip_id or "default")
-            engine.record_sending_attempt(
-                host_id_or_username=str(entry.get("username") or entry.get("id") or ""),
-                status=str(entry.get("status") or "UNKNOWN"),
-                mode=str(entry.get("mode") or ("dry_run" if self.dry_run else "live")),
-                http_status=entry.get("http_status"),
-                proof_screenshot=entry.get("proof_screenshot"),
-                before_screenshot=entry.get("before_screenshot"),
-                button_selector=entry.get("button_selector"),
-                notes=entry.get("notes"),
-                error_details=entry.get("error"),
-                timestamp=entry.get("timestamp"),
-            )
-        except Exception as e:
+        if self.trip_id:
+            try:
+                from core.autopilot import AutopilotEngine
+                engine = AutopilotEngine(trip_id=self.trip_id)
+                engine.record_sending_attempt(
+                    host_id_or_username=str(entry.get("username") or entry.get("id") or ""),
+                    status=str(entry.get("status") or "UNKNOWN"),
+                    mode=str(entry.get("mode") or ("dry_run" if self.dry_run else "live")),
+                    http_status=entry.get("http_status"),
+                    proof_screenshot=entry.get("proof_screenshot"),
+                    before_screenshot=entry.get("before_screenshot"),
+                    button_selector=entry.get("button_selector"),
+                    notes=entry.get("notes"),
+                    error_details=entry.get("error"),
+                    timestamp=entry.get("timestamp"),
+                )
+            except Exception as e:
             log_step("DEBUG", f"SQLite sending_history sync note: {e}")
 
     def update_queue_status(
@@ -365,35 +369,15 @@ class AutoSender:
             from database import db_session
             with db_session() as conn:
                 cur = conn.cursor()
-                if notes:
-                    cur.execute(
-                        """
-                        UPDATE sending_queue 
-                        SET status = ?, notes = ?,
-                            sent_at = CASE WHEN ? IS NOT NULL THEN ? WHEN ? = 1 THEN NULL ELSE sent_at END,
-                            updated_at = ?
-                        WHERE host_id IN (SELECT id FROM hosts WHERE username = ? OR id = ?);
-                        """,
-                        (new_status, notes, effective_sent_at, effective_sent_at, int(clear_sent_at), now_iso, username, username),
-                    )
-                else:
-                    cur.execute(
-                        """
-                        UPDATE sending_queue 
-                        SET status = ?,
-                            sent_at = CASE WHEN ? IS NOT NULL THEN ? WHEN ? = 1 THEN NULL ELSE sent_at END,
-                            updated_at = ?
-                        WHERE host_id IN (SELECT id FROM hosts WHERE username = ? OR id = ?);
-                        """,
-                        (new_status, effective_sent_at, effective_sent_at, int(clear_sent_at), now_iso, username, username),
-                    )
-
-                # Синхронизация в единый источник истины core_hosts (ТЗ)
+                # Единый источник истины: обновление исключительно core_hosts
                 st_map = {
                     "sent": "sent",
                     "was sent": "sent",
                     "skipped": "skipped",
                     "failed": "skipped",
+                    "uncertain": "uncertain",
+                    "verification_required": "uncertain",
+                    "declined": "skipped",
                     "approved": "approved",
                     "queued": "selected",
                     "qc_review_required": "drafted",
@@ -406,7 +390,7 @@ class AutoSender:
                         UPDATE core_hosts
                         SET state = ?,
                             sent_at = CASE WHEN ? = 'sent' THEN coalesce(sent_at, ?) ELSE sent_at END,
-                            qc_notes = CASE WHEN ? = 'skipped' THEN coalesce(?, qc_notes) ELSE qc_notes END,
+                            qc_notes = CASE WHEN ? IN ('skipped', 'uncertain') THEN coalesce(?, qc_notes) ELSE qc_notes END,
                             updated_at = ?
                         WHERE (LOWER(username) = LOWER(?) OR LOWER(host_id) = LOWER(?));
                         """,
@@ -424,18 +408,10 @@ class AutoSender:
                 cur = conn.cursor()
                 cur.execute(
                     """
-                    UPDATE sending_queue
-                    SET priority = COALESCE(priority, 0) - 100,
-                        notes = ?,
-                        updated_at = ?
-                    WHERE host_id IN (SELECT id FROM hosts WHERE LOWER(username) = LOWER(?) OR LOWER(id) = LOWER(?));
-                    """,
-                    (f"Moved to bottom of queue: {reason}", now_iso, username, username),
-                )
-                cur.execute(
-                    """
                     UPDATE core_hosts
-                    SET qc_notes = ?,
+                    SET priority = COALESCE(priority, 10) - 100,
+                        attempts = COALESCE(attempts, 0) + 1,
+                        qc_notes = ?,
                         updated_at = ?
                     WHERE (LOWER(username) = LOWER(?) OR LOWER(host_id) = LOWER(?));
                     """,
@@ -1084,10 +1060,6 @@ class AutoSender:
                             "UPDATE core_hosts SET message_draft = ?, qc_passed = 1, qc_notes = 'Auto-regenerated passed QC' WHERE LOWER(username) = LOWER(?)",
                             (regen_msg, username),
                         )
-                        cur.execute(
-                            "UPDATE generated_messages SET message_text = ? WHERE host_id IN (SELECT id FROM hosts WHERE LOWER(username) = LOWER(?))",
-                            (regen_msg, username),
-                        )
                     qc_ok = True
                 else:
                     log_step("WARN", f"Перегенерация для @{username} не прошла QC: {', '.join(regen_qc_issues)}.")
@@ -1519,13 +1491,13 @@ class AutoSender:
                 time.sleep(0.5)
 
             # 10. Фиксация результата в БД и логах
-            if submission_confirmed:
+            if submission_confirmed and http_status and (200 <= http_status <= 299):
                 time.sleep(1.5)
                 try:
                     page.screenshot(path=str(after_screenshot), timeout=5000)
                 except Exception:
                     pass
-                log_step("SUCCESS", f"Отправка верифицирована! Ответ сервера: {http_status or 200} OK. Скриншот: {after_screenshot}")
+                log_step("SUCCESS", f"Отправка верифицирована! Ответ сервера: {http_status} OK. Скриншот: {after_screenshot}")
 
                 self.append_sent_log({
                     "id": username,
@@ -1536,18 +1508,19 @@ class AutoSender:
                     "departure_date": departure_date,
                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "status": "SENT_SUCCESS",
-                    "http_status": http_status or 200,
+                    "http_status": http_status,
                     "mode": "live",
                     "proof_screenshot": str(after_screenshot),
                     "before_screenshot": str(before_screenshot),
-                    "notes": f"Stay request sent and verified. Server status: {http_status or 200}.",
+                    "notes": f"Stay request sent and verified. Server status: {http_status}.",
                     "message": message,
                 })
-                sent_notes = f"Stay request sent and verified. Server status: {http_status or 200}."
-                try:
-                    self.autopilot_engine.mark_as_sent(username, http_status=http_status or 200, notes=sent_notes)
-                except Exception as e:
-                    log_step("WARN", f"AutopilotEngine mark_as_sent note: {e}")
+                sent_notes = f"Stay request sent and verified. Server status: {http_status}."
+                if self.autopilot_engine:
+                    try:
+                        self.autopilot_engine.mark_as_sent(username, http_status=http_status, notes=sent_notes)
+                    except Exception as e:
+                        log_step("WARN", f"AutopilotEngine mark_as_sent note: {e}")
                 self.update_queue_status(username, "Sent", notes=sent_notes)
                 return True
             else:
@@ -1557,25 +1530,37 @@ class AutoSender:
                 except Exception:
                     pass
                 err_text = f"HTTP {http_status}" if http_status else "Отправка не подтверждена за отведенное время"
-                log_step("WARN", f"Подтверждение отправки отсутствует: {err_text}. Статус: FAILED. Скриншот: {error_screenshot}")
+                log_step("WARN", f"Подтверждение отправки отсутствует: {err_text}. Статус переведен в UNCERTAIN. Скриншот: {error_screenshot}")
 
                 self.append_sent_log({
                     "id": username,
                     "username": username,
                     "name": host_name,
                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "status": "FAILED",
+                    "status": "UNCERTAIN",
                     "http_status": http_status,
                     "mode": "live",
                     "proof_screenshot": str(error_screenshot),
                     "before_screenshot": str(before_screenshot),
-                    "notes": f"Submission clicked but unverified ({err_text}). Marked as FAILED.",
+                    "notes": f"Submission clicked but unverified ({err_text}). Marked as UNCERTAIN.",
                 })
-                self.update_queue_status(username, "FAILED", notes=f"Submission unverified: {err_text}", increment_attempts=True)
+                if self.autopilot_engine:
+                    try:
+                        self.autopilot_engine.mark_as_uncertain(
+                            username,
+                            error_details=err_text,
+                            http_status=http_status,
+                            proof_screenshot=str(error_screenshot),
+                            before_screenshot=str(before_screenshot),
+                            notes=f"Submission unverified: {err_text}",
+                        )
+                    except Exception as ex:
+                        log_step("WARN", f"AutopilotEngine mark_as_uncertain error: {ex}")
+                self.update_queue_status(username, "Uncertain", notes=f"Submission unverified: {err_text}", increment_attempts=True)
                 return False
 
         except Exception as e:
-            log_step("ERROR", f"Исключение при обработке @{username}: {e}. Статус изменён на FAILED, переход к следующему хосту.")
+            log_step("ERROR", f"Исключение при обработке @{username}: {e}. Статус изменён на UNCERTAIN, переход к следующему хосту.")
             try:
                 page.screenshot(path=str(error_screenshot), timeout=5000)
                 error_html.write_text(page.content(), encoding="utf-8")
@@ -1587,12 +1572,22 @@ class AutoSender:
                 "username": username,
                 "name": host_name,
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "status": "FAILED",
+                "status": "UNCERTAIN",
                 "error": str(e),
                 "proof_screenshot": str(error_screenshot),
                 "error_html": str(error_html),
             })
-            self.update_queue_status(username, "FAILED", notes=f"Exception: {e}", increment_attempts=True)
+            if self.autopilot_engine:
+                try:
+                    self.autopilot_engine.mark_as_uncertain(
+                        username,
+                        error_details=str(e),
+                        proof_screenshot=str(error_screenshot),
+                        notes=f"Exception: {e}",
+                    )
+                except Exception as ex:
+                    log_step("WARN", f"AutopilotEngine mark_as_uncertain error: {ex}")
+            self.update_queue_status(username, "Uncertain", notes=f"Exception: {e}", increment_attempts=True)
             return False
         finally:
             try:
@@ -1681,6 +1676,22 @@ class AutoSender:
             current_host=None,
             last_status="Инициализация очереди и проверка лимитов...",
         )
+
+        if not self.trip_id:
+            from core.database import get_active_trip
+            active_trip = get_active_trip()
+            if not active_trip:
+                log_step("ERROR", "NO_ACTIVE_TRIP: Автопилот не может работать без активной поездки")
+                self.update_autopilot_status(
+                    is_running=False,
+                    is_paused=False,
+                    current_host=None,
+                    last_status="ERROR: NO_ACTIVE_TRIP",
+                )
+                raise ValueError("NO_ACTIVE_TRIP")
+            self.trip_id = active_trip.id
+            from core.autopilot import AutopilotEngine
+            self.autopilot_engine = AutopilotEngine(trip_id=self.trip_id)
 
         # 1. Проверка суточного лимита
         sent_today = self.get_sent_today_count()

@@ -77,6 +77,7 @@ class TestArchitecturalInvariants(unittest.TestCase):
             REPO_ROOT / "scripts",
             REPO_ROOT / "archive",
             REPO_ROOT / ".venv",
+            REPO_ROOT / "tests",
         }
 
         violations = []

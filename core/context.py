@@ -25,31 +25,35 @@ logger = logging.getLogger("CoreContext")
 
 class GuestProfile(BaseModel):
     name: str = "Andrey"
-    origin_city: str = "Geneva"
-    origin_country: str = "Switzerland"
-    departure_city: str = "Geneva"
+    origin_city: str = "Siberia"
+    origin_country: str = "Russia"
     secondary_base: str = "Courchevel, French Alps"
     languages: List[str] = ["English", "Russian", "French"]
 
     interests: Dict[str, List[str]] = Field(default_factory=lambda: {
         "outdoors": ["skiing", "ski", "mountains", "alps", "hiking", "trekking", "everest", "nepal", "motorcycle", "bmw gs"],
-        "arts_media": ["cinema", "film", "filmmaking", "directing", "cannes", "photography", "street photography", "visual arts"],
+        "arts_media": ["cinema", "film", "filmmaking", "directing", "cannes", "vgik", "photography", "street photography", "visual arts"],
         "music": ["piano", "classical music", "jazz", "sound design"],
-        "culture_travel": ["japan", "travel", "culture", "couchsurfing", "switzerland", "alps", "france"],
+        "culture_travel": ["japan", "travel", "culture", "couchsurfing", "alps", "france", "siberia"],
         "food": ["cooking", "coffee", "tea", "cuisine", "wine"],
         "tech": ["technology", "ai", "startups", "software"],
     })
 
     verified_facts: List[Dict[str, Any]] = Field(default_factory=lambda: [
         {
+            "category": "siberian_roots",
+            "fact": "Born and raised in Siberia; lifelong connection to winter nature, snow, and outdoor life.",
+            "keywords": ["siberia", "winter", "nature", "snow", "outdoors", "roots"],
+        },
+        {
             "category": "cinema_arts",
-            "fact": "Studied film directing and practice street photography; deeply interested in visual culture.",
-            "keywords": ["film", "cinema", "directing", "movies", "photography", "art", "visual", "design"],
+            "fact": "Educated in film directing at VGIK; visual storyteller and street photographer.",
+            "keywords": ["film", "cinema", "directing", "movies", "vgik", "photography", "art", "visual", "design"],
         },
         {
             "category": "mountains_ski",
-            "fact": "Professional ski instructor based in Geneva and Courchevel (French Alps); passionate about mountains.",
-            "keywords": ["ski", "skiing", "mountains", "alps", "snowboard", "winter sports", "outdoor", "nature"],
+            "fact": "Professional ski instructor in the French Alps (Courchevel); passionate about mountains.",
+            "keywords": ["ski", "skiing", "mountains", "alps", "snowboard", "courchevel", "winter sports", "outdoor"],
         },
         {
             "category": "music",
@@ -69,8 +73,8 @@ class GuestProfile(BaseModel):
     ])
 
     forbidden_terms: List[str] = [
-        "moscow", "russia", "vgik", "russian federation",
-        "москва", "россия", "вгик",
+        "born in geneva", "geneva native", "swiss citizen", "native of switzerland",
+        "born in switzerland", "from geneva originally",
     ]
 
 
@@ -81,6 +85,7 @@ ROBOTIC_CLICHES: List[str] = [
     "55+ countries",
     "10+ years on cs",
     "club med tomamu",
+    "exchange stories over a cup of tea",
 ]
 
 
@@ -116,10 +121,10 @@ def validate_text_purity(text: str) -> Tuple[bool, List[str]]:
 # =====================================================================
 
 DEFAULT_GUEST_CONTEXT = (
-    "Andrey, professional ski instructor based in Geneva (Switzerland) and Courchevel (French Alps), flying to Japan from Geneva. "
-    "10+ years CS veteran (overland Geneva-Paris, Alps, Morocco). High-altitude trekker (Thorong La Pass 5416m with son Mark in 2026, "
-    "solo Everest Base Camp). Film director (Cannes 2024), plays piano, rides BMW GS motorcycle. "
-    "Independent, quiet, out exploring all day."
+    "Andrey, film director (VGIK) and alpine ski instructor in the French Alps (Courchevel), originally from Siberia. "
+    "10+ years Couchsurfing member. High-altitude trekker (Thorong La Pass 5416m, solo Everest Base Camp). "
+    "Plays piano, rides BMW GS motorcycle, practices street photography. "
+    "Independent, quiet, considerate guest."
 )
 
 PERSONAL_CATEGORIES = [
@@ -137,7 +142,18 @@ DEFAULT_FACTS: List[Dict[str, Any]] = [
         "fact_id": "prof_ski_coach_alps",
         "category": "Professional Background",
         "title": "Горнолыжный инструктор (Куршевель, Франция)",
-        "content": "Профессиональный инструктор по горным лыжам и сноуборду, базируется в Женеве (Швейцария) и Французских Альпах (Куршевель, Les 3 Vallées). Летит в Японию из Женевы.",
+        "content": "Профессиональный инструктор по горным лыжам и сноуборду во Французских Альпах (Куршевель, Les 3 Vallées).",
+        "priority": 2,
+        "status": "confirmed",
+        "source": "curated",
+        "confidence": 1.0,
+        "is_active": 1,
+    },
+    {
+        "fact_id": "pb_siberian_roots",
+        "category": "Personal Background",
+        "title": "Родом из Сибири (природа, лыжи, снег)",
+        "content": "Родился и вырос в Сибири. С детства глубоко связан со снегом, сибирской природой, зимними видами спорта и спокойным отношением к суровому климату.",
         "priority": 2,
         "status": "confirmed",
         "source": "curated",
@@ -257,8 +273,8 @@ DEFAULT_FACTS: List[Dict[str, Any]] = [
     {
         "fact_id": "edu_vgik_cinema",
         "category": "Education",
-        "title": "Высшее образование: Режиссура кино",
-        "content": "Диплом кинорежиссера (киношкола визуальных искусств). Классическая школа киноязыка, драматургии и визуальной композиции.",
+        "title": "Высшее образование: Режиссура кино (ВГИК)",
+        "content": "Диплом кинорежиссера (ВГИК, мастерская режиссуры). Классическая школа киноязыка, драматургии и визуальной композиции.",
         "priority": 1,
         "status": "confirmed",
         "source": "curated",

@@ -154,7 +154,7 @@ class TestMigrationAndLifecycle(unittest.TestCase):
         text = draft_res["text"]
         self.assertIn("Daiki", text)
         self.assertIn("Sapporo", text)
-        self.assertIn("Geneva", text)
+        self.assertIn("Siberia", text)
         wc = len(text.split())
         self.assertTrue(50 <= wc <= 95, f"Word count was {wc}")
 

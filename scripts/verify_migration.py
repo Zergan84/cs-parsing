@@ -3,12 +3,19 @@
 scripts/verify_migration.py
 
 Скрипт исчерпывающей поштучной (per-record) верификации миграции и консолидации:
-1. PRAGMA integrity_check и PRAGMA foreign_key_check.
-2. Построчная сверка user_trips -> core_trips (каждая запись и ключевые поля).
-3. Построчная сверка hosts -> core_hosts и core_host_snapshots (каждый хост и неизменяемый снимок).
-4. Построчная сверка sent_log.json -> sending_history и core_hosts.state == 'sent'.
-5. Построчная сверка inbox_conversations -> core_hosts.state == 'inbox'.
-6. Проверка архитектурных инвариантов бизнес-состояний и целостности связей.
+1. Строго Read-Only подключение к SQLite.
+2. PRAGMA integrity_check и PRAGMA foreign_key_check.
+3. Построчная сверка user_trips -> core_trips (каждая запись и ключевые поля).
+4. Построчная сверка hosts -> core_hosts и core_host_snapshots (каждый хост и неизменяемый снимок).
+5. Построчная сверка sent_log.json -> sending_history и core_hosts.state == 'sent'.
+6. Построчная сверка inbox_conversations -> core_hosts.state == 'inbox'.
+7. Категоризация несоответствий по типам:
+   - MISSING
+   - EXTRA
+   - DUPLICATE
+   - FIELD_MISMATCH
+   - UNRESOLVED_RELATIONSHIP
+8. Проверка архитектурных инвариантов бизнес-состояний.
 """
 
 import argparse
@@ -17,23 +24,42 @@ import logging
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from core.database import OUTPUT_DIR, get_connection, get_db_path
+from core.database import OUTPUT_DIR, get_db_path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("VerifyMigration")
 
 
-def verify_migration(db_path: Path) -> Dict[str, Any]:
-    if not db_path.exists():
-        raise FileNotFoundError(f"Database not found: {db_path}")
+def verify_migration(db_path: Path, sent_log_path: Optional[Path] = None) -> Dict[str, Any]:
+    db_file = Path(db_path).resolve()
+    if not db_file.exists():
+        raise FileNotFoundError(f"Database not found: {db_file}")
+
+    if sent_log_path is None:
+        local_candidate = db_file.parent / "sent_log.json"
+        if local_candidate.exists():
+            effective_sent_log = local_candidate
+        elif (OUTPUT_DIR / "sent_log.json").exists() and db_file == get_db_path().resolve():
+            effective_sent_log = OUTPUT_DIR / "sent_log.json"
+        else:
+            effective_sent_log = None
+    else:
+        effective_sent_log = Path(sent_log_path) if Path(sent_log_path).exists() else None
 
     report: Dict[str, Any] = {
-        "db_path": str(db_path),
+        "db_path": str(db_file),
         "checks_passed": True,
         "integrity_check": None,
+        "category_counts": {
+            "MISSING": 0,
+            "EXTRA": 0,
+            "DUPLICATE": 0,
+            "FIELD_MISMATCH": 0,
+            "UNRESOLVED_RELATIONSHIP": 0,
+        },
         "foreign_key_violations": [],
         "per_record_checks": {
             "user_trips": {"total": 0, "verified": 0, "discrepancies": []},
@@ -47,12 +73,23 @@ def verify_migration(db_path: Path) -> Dict[str, Any]:
             "sent_hosts_in_draft_or_approved": 0,
             "core_hosts_pk_duplicates": 0,
             "core_trips_pk_duplicates": 0,
+            "multiple_active_trips": 0,
             "orphan_core_hosts": 0,
         },
     }
 
-    with get_connection(db_path) as conn:
-        conn.row_factory = sqlite3.Row
+    def _record_discrepancy(section: str, disc_type: str, details: Dict[str, Any]):
+        details["type"] = disc_type
+        if section in report["per_record_checks"]:
+            report["per_record_checks"][section]["discrepancies"].append(details)
+        report["category_counts"][disc_type] = report["category_counts"].get(disc_type, 0) + 1
+        report["checks_passed"] = False
+
+    # Строго Read-Only подключение
+    db_uri = f"file:{db_file}?mode=ro"
+    conn = sqlite3.connect(db_uri, uri=True, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    try:
         cur = conn.cursor()
 
         # 1. PRAGMA integrity_check
@@ -67,86 +104,111 @@ def verify_migration(db_path: Path) -> Dict[str, Any]:
         fk_violations = [dict(r) for r in cur.fetchall()]
         report["foreign_key_violations"] = fk_violations
         if fk_violations:
-            report["checks_passed"] = False
+            for v in fk_violations:
+                _record_discrepancy("hosts_to_core", "UNRESOLVED_RELATIONSHIP", {"error": "Foreign key violation", "violation": v})
+
+        # Проверяем наличие таблиц
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = {r[0] for r in cur.fetchall()}
+
+        if "core_trips" not in tables:
+            _record_discrepancy("user_trips", "MISSING", {"error": "Table core_trips missing"})
+            return report
 
         # 3. Per-Record Check: user_trips -> core_trips
-        cur.execute("SELECT * FROM user_trips;")
-        legacy_trips = cur.fetchall()
-        report["per_record_checks"]["user_trips"]["total"] = len(legacy_trips)
-        for lt in legacy_trips:
-            t_id = lt["trip_id"] if "trip_id" in lt.keys() else lt["id"]
-            cur.execute("SELECT * FROM core_trips WHERE id = ?;", (t_id,))
-            ct = cur.fetchone()
-            if not ct:
-                # Поиск по URL
-                cur.execute("SELECT * FROM core_trips WHERE url = ?;", (lt["url"],))
+        legacy_trips = []
+        if "user_trips" in tables:
+            cur.execute("SELECT * FROM user_trips;")
+            legacy_trips = cur.fetchall()
+            report["per_record_checks"]["user_trips"]["total"] = len(legacy_trips)
+            for lt in legacy_trips:
+                t_id = lt["trip_id"] if "trip_id" in lt.keys() else lt["id"]
+                cur.execute("SELECT * FROM core_trips WHERE id = ?;", (t_id,))
                 ct = cur.fetchone()
+                if not ct and "url" in lt.keys() and lt["url"]:
+                    cur.execute("SELECT * FROM core_trips WHERE url = ?;", (lt["url"],))
+                    ct = cur.fetchone()
 
-            if not ct:
-                report["per_record_checks"]["user_trips"]["discrepancies"].append({
-                    "trip_id": t_id,
-                    "error": "Missing in core_trips",
-                })
-                report["checks_passed"] = False
-            else:
-                report["per_record_checks"]["user_trips"]["verified"] += 1
+                if not ct:
+                    _record_discrepancy("user_trips", "MISSING", {
+                        "trip_id": t_id,
+                        "error": "Trip missing in core_trips",
+                    })
+                else:
+                    # Полевая сверка: city, arrival_date, departure_date
+                    if "city" in lt.keys() and lt["city"] and ct["city"]:
+                        if lt["city"].strip().lower() != ct["city"].strip().lower():
+                            _record_discrepancy("user_trips", "FIELD_MISMATCH", {
+                                "trip_id": t_id,
+                                "field": "city",
+                                "expected": lt["city"],
+                                "actual": ct["city"],
+                            })
+                    report["per_record_checks"]["user_trips"]["verified"] += 1
 
         # 4. Per-Record Check: hosts -> core_hosts & core_host_snapshots
-        cur.execute("SELECT id, username, name, location FROM hosts;")
-        legacy_hosts = cur.fetchall()
-        report["per_record_checks"]["hosts_to_core"]["total"] = len(legacy_hosts)
-        report["per_record_checks"]["hosts_snapshots"]["total"] = len(legacy_hosts)
+        if "hosts" in tables:
+            cur.execute("SELECT id, username, name, location FROM hosts;")
+            legacy_hosts = cur.fetchall()
+            report["per_record_checks"]["hosts_to_core"]["total"] = len(legacy_hosts)
+            report["per_record_checks"]["hosts_snapshots"]["total"] = len(legacy_hosts)
 
-        # Индексируем core_hosts в памяти для ускорения построчной верификации
-        cur.execute("SELECT host_id, trip_id, username, state FROM core_hosts;")
-        all_core_hosts = cur.fetchall()
-        core_by_uname = {}
-        core_by_hid = {}
-        for ch in all_core_hosts:
-            core_by_uname.setdefault(ch["username"].lower(), []).append(ch)
-            core_by_hid.setdefault(ch["host_id"].lower(), []).append(ch)
+            cur.execute("SELECT host_id, trip_id, username, name, location, state FROM core_hosts;")
+            all_core_hosts = cur.fetchall()
+            core_by_uname = {}
+            core_by_hid = {}
+            for ch in all_core_hosts:
+                core_by_uname.setdefault(ch["username"].lower(), []).append(ch)
+                core_by_hid.setdefault(ch["host_id"].lower(), []).append(ch)
 
-        # Индексируем снимки
-        cur.execute("SELECT DISTINCT LOWER(host_id) FROM core_host_snapshots;")
-        snapshots_host_ids = {r[0] for r in cur.fetchall()}
+            cur.execute("SELECT DISTINCT LOWER(host_id) FROM core_host_snapshots;")
+            snapshots_host_ids = {r[0] for r in cur.fetchall()}
 
-        for lh in legacy_hosts:
-            hid = str(lh["id"]).lower()
-            uname = str(lh["username"]).lower()
-            matched_core = core_by_hid.get(hid) or core_by_uname.get(uname)
-            if not matched_core:
-                report["per_record_checks"]["hosts_to_core"]["discrepancies"].append({
-                    "id": lh["id"],
-                    "username": lh["username"],
-                    "error": "Host not present in core_hosts",
-                })
-                report["checks_passed"] = False
-            else:
-                report["per_record_checks"]["hosts_to_core"]["verified"] += 1
+            for lh in legacy_hosts:
+                hid = str(lh["id"]).lower()
+                uname = str(lh["username"]).lower()
+                matched_core = core_by_hid.get(hid) or core_by_uname.get(uname)
+                if not matched_core:
+                    _record_discrepancy("hosts_to_core", "MISSING", {
+                        "id": lh["id"],
+                        "username": lh["username"],
+                        "error": "Host not present in core_hosts",
+                    })
+                else:
+                    report["per_record_checks"]["hosts_to_core"]["verified"] += 1
+                    # Полевая сверка: username
+                    ch = matched_core[0]
+                    if ch["username"].strip().lower() != uname:
+                        _record_discrepancy("hosts_to_core", "FIELD_MISMATCH", {
+                            "id": lh["id"],
+                            "field": "username",
+                            "expected": uname,
+                            "actual": ch["username"],
+                        })
 
-            # Проверка снимка
-            has_snapshot = hid in snapshots_host_ids or uname in snapshots_host_ids
-            if not has_snapshot:
-                # Проверим, есть ли снимок по actual host_id из core_hosts
-                actual_hids = [c["host_id"].lower() for c in matched_core] if matched_core else []
-                if any(x in snapshots_host_ids for x in actual_hids):
-                    has_snapshot = True
+                # Проверка снимка
+                has_snapshot = hid in snapshots_host_ids or uname in snapshots_host_ids
+                if not has_snapshot and matched_core:
+                    actual_hids = [c["host_id"].lower() for c in matched_core]
+                    if any(x in snapshots_host_ids for x in actual_hids):
+                        has_snapshot = True
 
-            if not has_snapshot:
-                report["per_record_checks"]["hosts_snapshots"]["discrepancies"].append({
-                    "id": lh["id"],
-                    "username": lh["username"],
-                    "error": "Missing snapshot in core_host_snapshots",
-                })
-                report["checks_passed"] = False
-            else:
-                report["per_record_checks"]["hosts_snapshots"]["verified"] += 1
+                if not has_snapshot:
+                    _record_discrepancy("hosts_snapshots", "MISSING", {
+                        "id": lh["id"],
+                        "username": lh["username"],
+                        "error": "Missing snapshot in core_host_snapshots",
+                    })
+                else:
+                    report["per_record_checks"]["hosts_snapshots"]["verified"] += 1
 
         # 5. Per-Record Check: sent_log.json -> sending_history & core_hosts.state == 'sent'
-        sent_log_path = OUTPUT_DIR / "sent_log.json"
-        if sent_log_path.exists():
-            with open(sent_log_path, "r", encoding="utf-8") as f:
-                sent_entries = json.load(f)
+        if effective_sent_log and "sending_history" in tables:
+            try:
+                with open(effective_sent_log, "r", encoding="utf-8") as f:
+                    sent_entries = json.load(f)
+            except Exception:
+                sent_entries = []
 
             report["per_record_checks"]["sent_log_to_db"]["total"] = len(sent_entries)
             report["per_record_checks"]["sent_state_in_core"]["total"] = len(sent_entries)
@@ -160,70 +222,83 @@ def verify_migration(db_path: Path) -> Dict[str, Any]:
                 status = str(entry.get("status") or "").upper()
 
                 if (u, ts) not in hist_records:
-                    report["per_record_checks"]["sent_log_to_db"]["discrepancies"].append({
+                    _record_discrepancy("sent_log_to_db", "MISSING", {
                         "username": u,
                         "timestamp": ts,
                         "error": "Record missing in sending_history",
                     })
-                    report["checks_passed"] = False
                 else:
                     report["per_record_checks"]["sent_log_to_db"]["verified"] += 1
 
                 if status in ("SENT_SUCCESS", "SUCCESS"):
-                    # Проверяем, что в core_hosts состояние 'sent'
-                    core_matches = core_by_uname.get(u) or core_by_hid.get(u)
+                    core_matches = core_by_uname.get(u) or core_by_hid.get(u) if "hosts" in tables else None
                     if not core_matches or not any(cm["state"] == "sent" for cm in core_matches):
-                        report["per_record_checks"]["sent_state_in_core"]["discrepancies"].append({
+                        _record_discrepancy("sent_state_in_core", "FIELD_MISMATCH", {
                             "username": u,
                             "error": "Host not marked as 'sent' in core_hosts",
                         })
-                        report["checks_passed"] = False
                     else:
                         report["per_record_checks"]["sent_state_in_core"]["verified"] += 1
                 else:
                     report["per_record_checks"]["sent_state_in_core"]["verified"] += 1
 
         # 6. Per-Record Check: inbox_conversations -> core_hosts
-        cur.execute("SELECT * FROM inbox_conversations;")
-        inbox_rows = cur.fetchall()
-        report["per_record_checks"]["inbox_conversations"]["total"] = len(inbox_rows)
-        for ir in inbox_rows:
-            u = str(ir["host_username"] or "").strip().lower()
-            core_matches = core_by_uname.get(u) or core_by_hid.get(u)
-            if not core_matches or not any(cm["state"] == "inbox" for cm in core_matches):
-                report["per_record_checks"]["inbox_conversations"]["discrepancies"].append({
-                    "username": u,
-                    "error": "Host not marked as 'inbox' in core_hosts",
-                })
-                report["checks_passed"] = False
-            else:
-                report["per_record_checks"]["inbox_conversations"]["verified"] += 1
+        if "inbox_conversations" in tables:
+            cur.execute("SELECT * FROM inbox_conversations;")
+            inbox_rows = cur.fetchall()
+            report["per_record_checks"]["inbox_conversations"]["total"] = len(inbox_rows)
+            for ir in inbox_rows:
+                u = str(ir["host_username"] or "").strip().lower()
+                core_matches = core_by_uname.get(u) or core_by_hid.get(u) if "hosts" in tables else None
+                if not core_matches or not any(cm["state"] == "inbox" for cm in core_matches):
+                    _record_discrepancy("inbox_conversations", "FIELD_MISMATCH", {
+                        "username": u,
+                        "error": "Host not marked as 'inbox' in core_hosts",
+                    })
+                else:
+                    report["per_record_checks"]["inbox_conversations"]["verified"] += 1
 
         # 7. Invariants Checks
         # Sent hosts must never be in draft or approved
-        cur.execute("""
-            SELECT COUNT(*) FROM core_hosts 
-            WHERE state IN ('drafted', 'approved') 
-              AND (host_id IN (SELECT host_id FROM sending_history WHERE UPPER(status) IN ('SENT_SUCCESS', 'SUCCESS', 'SENT'))
-                   OR LOWER(username) IN (SELECT LOWER(username) FROM sending_history WHERE UPPER(status) IN ('SENT_SUCCESS', 'SUCCESS', 'SENT')));
-        """)
-        sent_in_draft = cur.fetchone()[0]
-        report["invariants"]["sent_hosts_in_draft_or_approved"] = sent_in_draft
-        if sent_in_draft > 0:
-            report["checks_passed"] = False
+        if "sending_history" in tables:
+            cur.execute("""
+                SELECT COUNT(*) FROM core_hosts 
+                WHERE state IN ('drafted', 'approved') 
+                  AND (host_id IN (SELECT host_id FROM sending_history WHERE UPPER(status) IN ('SENT_SUCCESS', 'SUCCESS', 'SENT'))
+                       OR LOWER(username) IN (SELECT LOWER(username) FROM sending_history WHERE UPPER(status) IN ('SENT_SUCCESS', 'SUCCESS', 'SENT')));
+            """)
+            sent_in_draft = cur.fetchone()[0]
+            report["invariants"]["sent_hosts_in_draft_or_approved"] = sent_in_draft
+            if sent_in_draft > 0:
+                _record_discrepancy("hosts_to_core", "FIELD_MISMATCH", {
+                    "error": f"{sent_in_draft} sent hosts in drafted/approved state",
+                })
 
         # Primary key uniqueness
         cur.execute("SELECT trip_id, host_id, COUNT(*) as cnt FROM core_hosts GROUP BY trip_id, host_id HAVING cnt > 1;")
         pk_dupes = len(cur.fetchall())
         report["invariants"]["core_hosts_pk_duplicates"] = pk_dupes
         if pk_dupes > 0:
-            report["checks_passed"] = False
+            _record_discrepancy("hosts_to_core", "DUPLICATE", {
+                "error": f"{pk_dupes} duplicate primary keys (trip_id, host_id) in core_hosts",
+            })
 
         cur.execute("SELECT id, COUNT(*) as cnt FROM core_trips GROUP BY id HAVING cnt > 1;")
         trip_pk_dupes = len(cur.fetchall())
         report["invariants"]["core_trips_pk_duplicates"] = trip_pk_dupes
         if trip_pk_dupes > 0:
-            report["checks_passed"] = False
+            _record_discrepancy("user_trips", "DUPLICATE", {
+                "error": f"{trip_pk_dupes} duplicate trip IDs in core_trips",
+            })
+
+        # Active trip uniqueness
+        cur.execute("SELECT COUNT(*) FROM core_trips WHERE is_active = 1;")
+        active_cnt = cur.fetchone()[0]
+        if active_cnt > 1:
+            report["invariants"]["multiple_active_trips"] = active_cnt
+            _record_discrepancy("user_trips", "DUPLICATE", {
+                "error": f"Multiple active trips detected: {active_cnt}",
+            })
 
         # Orphan check
         cur.execute("""
@@ -233,8 +308,35 @@ def verify_migration(db_path: Path) -> Dict[str, Any]:
         orphan_hosts = cur.fetchone()[0]
         report["invariants"]["orphan_core_hosts"] = orphan_hosts
         if orphan_hosts > 0:
-            report["checks_passed"] = False
+            _record_discrepancy("hosts_to_core", "UNRESOLVED_RELATIONSHIP", {
+                "error": f"{orphan_hosts} orphan core_hosts without valid core_trips link",
+            })
 
+        # Extra trips check
+        if "user_trips" in tables:
+            cur.execute("SELECT id FROM core_trips WHERE id NOT IN (SELECT trip_id FROM user_trips UNION SELECT id FROM user_trips);")
+            extra_trips = cur.fetchall()
+            for et in extra_trips:
+                _record_discrepancy("user_trips", "EXTRA", {"trip_id": et[0], "error": "Extra trip in core_trips not found in user_trips"})
+
+        # Extra hosts check (hosts without source in hosts, inbox_conversations, or sending_history)
+        if "hosts" in tables:
+            cur.execute("""
+                SELECT trip_id, host_id, username FROM core_hosts
+                WHERE LOWER(host_id) NOT IN (SELECT LOWER(id) FROM hosts)
+                  AND LOWER(username) NOT IN (SELECT LOWER(username) FROM hosts)
+                  AND LOWER(username) NOT IN (SELECT LOWER(host_username) FROM inbox_conversations)
+                  AND LOWER(username) NOT IN (SELECT LOWER(username) FROM sending_history);
+            """)
+            extra_hosts = cur.fetchall()
+            for eh in extra_hosts:
+                _record_discrepancy("hosts_to_core", "EXTRA", {"host_id": eh["host_id"], "username": eh["username"], "error": "Extra host in core_hosts without legacy source"})
+
+    finally:
+        conn.close()
+
+    total_discrepancies = sum(report["category_counts"].values())
+    report["checks_passed"] = (total_discrepancies == 0 and report["integrity_check"] == "ok")
     return report
 
 
@@ -257,6 +359,11 @@ def main():
     print(f"Overall Status:  {'PASSED [SUCCESS]' if report['checks_passed'] else 'FAILED [VIOLATIONS]'}")
     print(f"Integrity Check: {report['integrity_check']}")
     print(f"FK Violations:   {len(report['foreign_key_violations'])}")
+
+    print("\n--- DISCREPANCY CATEGORY BREAKDOWN ---")
+    for cat, cnt in report["category_counts"].items():
+        st = "OK" if cnt == 0 else "VIOLATION"
+        print(f"  {cat:25}: {cnt} [{st}]")
 
     print("\n--- PER-RECORD FIDELITY CHECKS ---")
     for name, stats in report["per_record_checks"].items():

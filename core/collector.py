@@ -189,48 +189,6 @@ class CollectorEngine:
                 ),
             )
 
-            # 3. Синхронизация с глобальным справочником hosts и связкой trip_hosts
-            cur.execute("SELECT city, arrival_date, departure_date FROM core_trips WHERE id = ? LIMIT 1;", (self.trip_id,))
-            t_row = cur.fetchone()
-            t_city = t_row["city"] if t_row else (card.location or "Tokyo")
-            t_arr = t_row["arrival_date"] if t_row else "2026-11-18"
-            t_dep = t_row["departure_date"] if t_row else "2026-11-20"
-
-            cur.execute("SELECT id FROM hosts WHERE LOWER(username) = LOWER(?) OR LOWER(id) = LOWER(?) LIMIT 1;", (card.username, card.host_id))
-            ex_h = cur.fetchone()
-            canon_h_id = ex_h["id"] if ex_h else card.host_id
-            if not ex_h:
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO hosts (
-                        id, username, name, clean_name, profile_url, stay_request_url,
-                        location, avatar_url, about_me, about_me_clean, first_scraped_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                    """,
-                    (
-                        canon_h_id,
-                        card.username,
-                        card.name,
-                        card.name.split()[0] if card.name else card.username,
-                        card.profile_url or f"https://www.couchsurfing.com/c/users/{card.username}",
-                        f"https://www.couchsurfing.com/c/users/{card.username}/stay-request",
-                        card.location or t_city,
-                        card.avatar_url,
-                        card.about or "",
-                        card.about or "",
-                        now_iso,
-                        now_iso,
-                    ),
-                )
-            conn.execute(
-                """
-                INSERT INTO trip_hosts (trip_id, host_id, city, arrival_date, departure_date, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(trip_id, host_id) DO NOTHING;
-                """,
-                (self.trip_id, canon_h_id, card.location or t_city, t_arr, t_dep, now_iso),
-            )
-
         log_audit(
             trip_id=self.trip_id,
             module="COLLECTOR",
@@ -474,89 +432,16 @@ class ProfileAnalyzer:
             cur = active_conn.cursor()
             now_iso = datetime.now().isoformat()
             cur.execute(
-                "SELECT id FROM hosts WHERE LOWER(id) = LOWER(?) OR LOWER(username) = LOWER(?) LIMIT 1;",
-                (host_id, username),
-            )
-            existing = cur.fetchone()
-            target_id = existing["id"] if existing else host_id
-            if existing:
-                cur.execute(
-                    """
-                    UPDATE hosts SET
-                        name = COALESCE(?, name),
-                        clean_name = COALESCE(?, clean_name),
-                        about_me_clean = CASE WHEN length(?) > length(COALESCE(about_me_clean, '')) THEN ? ELSE about_me_clean END,
-                        updated_at = ?
-                    WHERE id = ?;
-                    """,
-                    (name, name, about_me, about_me, now_iso, target_id),
-                )
-            else:
-                cur.execute(
-                    """
-                    INSERT OR IGNORE INTO hosts (
-                        id, username, name, clean_name, profile_url, stay_request_url,
-                        location, about_me, about_me_clean, references_count,
-                        response_rate_pct, first_scraped_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                    """,
-                    (
-                        target_id,
-                        username,
-                        name,
-                        name,
-                        host.get("profile_url") or f"https://www.couchsurfing.com/c/users/{username}",
-                        host.get("stay_request_url") or f"https://www.couchsurfing.com/c/users/{username}/stay-request",
-                        str(host.get("location", "Tokyo")),
-                        host.get("about_me", ""),
-                        about_me,
-                        refs,
-                        float(host.get("response_rate_pct", 90.0)),
-                        now_iso,
-                        now_iso,
-                    ),
-                )
-
-            cur.execute(
                 """
-                INSERT INTO profile_analyses (
-                    host_id, estimated_gender, host_type, can_host_overnight,
-                    hosting_verdict_reason, hosting_confidence, sleeping_arrangement,
-                    house_rules, secret_code_detected, secret_code_hint,
-                    conversation_hooks_json, compatibility_points_json,
-                    conversation_strategy, analyzed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(host_id) DO UPDATE SET
-                    estimated_gender = excluded.estimated_gender,
-                    host_type = excluded.host_type,
-                    can_host_overnight = excluded.can_host_overnight,
-                    hosting_verdict_reason = excluded.hosting_verdict_reason,
-                    hosting_confidence = excluded.hosting_confidence,
-                    sleeping_arrangement = excluded.sleeping_arrangement,
-                    house_rules = excluded.house_rules,
-                    secret_code_detected = excluded.secret_code_detected,
-                    secret_code_hint = excluded.secret_code_hint,
-                    conversation_hooks_json = excluded.conversation_hooks_json,
-                    compatibility_points_json = excluded.compatibility_points_json,
-                    conversation_strategy = excluded.conversation_strategy,
-                    analyzed_at = excluded.analyzed_at;
+                UPDATE core_hosts
+                SET name = COALESCE(?, name),
+                    about = CASE WHEN length(?) > length(COALESCE(about, '')) THEN ? ELSE about END,
+                    gender = COALESCE(?, gender),
+                    house_rules = COALESCE(?, house_rules),
+                    updated_at = ?
+                WHERE (LOWER(username) = LOWER(?) OR LOWER(host_id) = LOWER(?));
                 """,
-                (
-                    target_id,
-                    est_gender,
-                    host_type,
-                    1 if can_host else 0,
-                    hosting_reason,
-                    hosting_conf,
-                    sleeping,
-                    house_rules,
-                    1 if has_secret else 0,
-                    secret_code,
-                    json.dumps(hooks, ensure_ascii=False),
-                    json.dumps(analysis_result["compatibility_points"], ensure_ascii=False),
-                    strategy,
-                    analysis_result["analyzed_at"],
-                ),
+                (name, about_me, about_me, est_gender, house_rules, now_iso, username, host_id),
             )
 
         if conn is not None:

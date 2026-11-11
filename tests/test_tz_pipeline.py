@@ -101,23 +101,23 @@ class TestTZGlobalPipeline(unittest.TestCase):
 
     # 2. ТЕСТ: CONTEXT (Истина о госте и отсутствие галлюцинаций)
     def test_2_context_truth_and_forbidden_terms(self):
-        """Проверяет константы гостя (Женева, Альпы) и жесткий стоп-лист."""
+        """Проверяет константы гостя (Сибирь, ВГИК, Альпы) и жесткий стоп-лист выдуманных историй."""
         self.assertEqual(GUEST.name, "Andrey")
-        self.assertEqual(GUEST.origin_city, "Geneva")
-        self.assertEqual(GUEST.origin_country, "Switzerland")
+        self.assertEqual(GUEST.origin_city, "Siberia")
+        self.assertEqual(GUEST.origin_country, "Russia")
         self.assertIn("French", GUEST.languages)
 
-        # Текст с галлюцинацией (Москва/ВГИК/Россия) должен блокироваться
-        bad_text = "Hi! I studied at VGIK in Moscow, Russia and now traveling."
-        is_pure, violations = validate_text_purity(bad_text)
-        self.assertFalse(is_pure)
-        self.assertGreaterEqual(len(violations), 2)
+        # Достоверные факты о ВГИКе и Сибири должны проходить валидацию
+        truthful_text = "I studied film directing at VGIK and grew up in Siberia, working as an alpine ski coach."
+        is_pure_truth, violations_truth = validate_text_purity(truthful_text)
+        self.assertTrue(is_pure_truth)
+        self.assertEqual(len(violations_truth), 0)
 
-        # Чистый текст гостя должен проходить
-        clean_text = "I'm a professional ski instructor based in Geneva and Courchevel (French Alps)."
-        is_pure_clean, violations_clean = validate_text_purity(clean_text)
-        self.assertTrue(is_pure_clean)
-        self.assertEqual(len(violations_clean), 0)
+        # Выдуманное происхождение (швейцарец/из Женевы) и роботизированные клише должны блокироваться
+        fake_text = "I am a swiss citizen born in geneva and won't crowd your space."
+        is_pure_fake, violations_fake = validate_text_purity(fake_text)
+        self.assertFalse(is_pure_fake)
+        self.assertGreaterEqual(len(violations_fake), 2)
 
     # 3. ТЕСТ: COLLECTOR (Прием, дедупликация, скоринг 1-5★)
     def test_3_collector_ingest_dedup_and_scoring(self):
@@ -203,7 +203,7 @@ class TestTZGlobalPipeline(unittest.TestCase):
         word_count = len(text.split())
         self.assertTrue(50 <= word_count <= 95, f"Word count was {word_count}")
         self.assertIn("Hi Kenji,", text)
-        self.assertIn("Geneva", text)
+        self.assertIn("Siberia", text)
         self.assertIn("Kyoto", text)
 
         # Утверждение (Approve)

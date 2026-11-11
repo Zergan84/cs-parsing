@@ -108,16 +108,6 @@ class SelectorEngine:
                 (new_state.value, now_iso, self.trip_id, host_id, host_id),
             )
             affected = cur.rowcount > 0
-            if affected:
-                cur.execute(
-                    """
-                    UPDATE sending_queue
-                    SET status = ?, updated_at = ?
-                    WHERE (host_id = ? OR host_id IN (SELECT id FROM hosts WHERE LOWER(username) = LOWER(?)))
-                      AND LOWER(status) != 'sent';
-                    """,
-                    (q_status, now_iso, host_id, host_id),
-                )
 
         if affected:
             log_audit(
