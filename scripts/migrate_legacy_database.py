@@ -32,6 +32,7 @@ from core.database import (
     backup_db,
     get_connection,
     get_db_path,
+    get_production_db_path,
     init_db,
     log_audit,
 )
@@ -46,7 +47,7 @@ def create_pre_migration_backup(source_db: Path) -> Path:
     backup_dir = OUTPUT_DIR / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dest_path = backup_dir / f"migration_backup_{ts}.db"
+    dest_path = get_db_path(backup_dir / f"migration_backup_{ts}.db")
     
     with get_connection(source_db) as src_conn:
         with sqlite3.connect(dest_path) as dst_conn:
@@ -464,7 +465,7 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Perform inspection without writing changes")
     args = parser.parse_args()
 
-    db_path = Path(args.db_path) if args.db_path else get_db_path()
+    db_path = get_db_path(args.db_path) if args.db_path else get_production_db_path()
     res = run_migration(db_path, dry_run=args.dry_run)
     print("\n--- ИТОГИ МИГРАЦИИ ---")
     for k, v in res.items():

@@ -8,6 +8,7 @@ from core.database import (
     DEFAULT_DB_PATH,
     OUTPUT_DIR,
     db_session,
+    database_path_context,
     get_active_trip,
     get_connection,
     get_db_connection,
@@ -17,6 +18,8 @@ from core.database import (
     get_inbox_conversation,
     get_inbox_conversations,
     get_output_dir,
+    get_production_db_path,
+    get_read_only_connection,
     get_sent_usernames,
     get_setting,
     init_core_tables,
@@ -32,6 +35,7 @@ from core.database import (
     set_active_trip,
     set_setting,
     update_inbox_conversation,
+    verify_schema_read_only,
 )
 
 __all__ = [
@@ -40,10 +44,14 @@ __all__ = [
     "DEFAULT_DB_PATH",
     "DB_PATH",
     "get_output_dir",
+    "get_production_db_path",
     "get_db_path",
     "get_db_connection",
     "get_connection",
+    "get_read_only_connection",
     "db_session",
+    "database_path_context",
+    "verify_schema_read_only",
     "init_core_tables",
     "init_db",
     "log_audit",
@@ -67,5 +75,5 @@ __all__ = [
 ]
 
 if __name__ == "__main__":
-    init_db()
+    init_db(get_production_db_path())
     print("✅ База данных couchsurfing_platform.db успешно инициализирована через core.database.")

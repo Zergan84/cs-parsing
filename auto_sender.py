@@ -19,6 +19,7 @@ import json
 import os
 import random
 import re
+import subprocess
 import signal
 import sys
 import time
@@ -36,6 +37,15 @@ from playwright.sync_api import sync_playwright
 
 from request_manager import RequestQueueManager
 
+from core.dispatch_confirmation import (
+    ConfirmationCapability,
+    ConfirmationResult,
+    DispatchOutcome,
+    EvidenceType,
+    validate_dispatch_confirmation,
+)
+from core.dispatch_identity import reserve_host_for_dispatch, register_host_identity
+
 if sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -48,7 +58,6 @@ OUTPUT_DIR = Path(os.environ.get("CS_OUTPUT_DIR", str(BASE_DIR / "output"))).res
 DEBUG_DIR = OUTPUT_DIR / "debug"
 USER_DATA_DIR = BASE_DIR / "user_data"
 AUTH_STATE_FILE = USER_DATA_DIR / "auth_state.json"
-QUEUE_FILE = OUTPUT_DIR / "requests_queue.json"
 SENT_LOG_FILE = OUTPUT_DIR / "sent_log.json"
 STATUS_FILE = OUTPUT_DIR / "autopilot_status.json"
 
@@ -57,13 +66,15 @@ DEFAULT_DELAY_MIN = 15  # минут
 DEFAULT_DELAY_MAX = 35  # минут
 
 
-def sanitize_before_send(text: str, host_clean_name: Optional[str] = None) -> str:
+def sanitize_before_send(text: str, host_clean_name: Optional[str] = None, preserve_neutral_greeting: bool = False) -> str:
     """Локальная фильтрация текста перед вводом 'в последнюю секунду' (без подстановки 'there')."""
     lines = text.split('\n')
     if not lines:
         return text
 
     first_line = lines[0].strip()
+    if preserve_neutral_greeting and first_line == "Hello,":
+        return text
     # Если приветствие уже чистое ("Hi Name," или "Hello Name,"), не искажаем пунктуацию
     if re.match(r'^(Hi|Hello|Hey)\s+[A-Za-zА-Яа-яЁё]+,\s*$', first_line):
         return text
@@ -170,6 +181,7 @@ class AutoSender:
         target_username: Optional[str] = None,
         test_mode: bool = False,
         trip_id: Optional[str] = None,
+        db_file: Optional[Path | str] = None,
     ):
         self.daily_limit = max(1, daily_limit)
         self.delay_min = delay_min
@@ -184,43 +196,48 @@ class AutoSender:
         self.headless = headless
         self.target_username = target_username
         self.test_mode = test_mode
+        self.db_file = Path(db_file).expanduser().resolve() if db_file is not None else None
         self.trip_id = trip_id
         if not self.trip_id:
             from core.database import get_active_trip
-            active_trip = get_active_trip()
+            active_trip = get_active_trip(self.db_file)
             self.trip_id = active_trip.id if active_trip else None
         self.is_running = True
         self.is_paused = False
         self._start_timestamp = time.time()
+        self.sender_pid = os.getpid()
+        self.sender_started_at = None
+        self.sender_command = " ".join([sys.executable, *sys.argv])
+        try:
+            identity = subprocess.run(
+                ["ps", "-p", str(self.sender_pid), "-o", "lstart="],
+                capture_output=True, text=True, timeout=2, check=False,
+            )
+            if identity.returncode == 0:
+                self.sender_started_at = identity.stdout.strip() or None
+        except (OSError, subprocess.SubprocessError):
+            pass
 
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
-        # Единый источник истины для очереди — RequestQueueManager (SQLite + JSON синхронизация)
-        self.queue_manager = RequestQueueManager()
+        # Единый источник истины для очереди — RequestQueueManager поверх SQLite.
+        self.queue_manager = RequestQueueManager(self.db_file)
         from core.autopilot import AutopilotEngine
-        self.autopilot_engine = AutopilotEngine(trip_id=self.trip_id) if self.trip_id else None
+        self.autopilot_engine = AutopilotEngine(trip_id=self.trip_id, db_file=self.db_file) if self.trip_id else None
 
     def get_sent_today_count(self) -> int:
-        """Подсчитывает количество успешно отправленных запросов за сегодняшний день."""
-        if not SENT_LOG_FILE.exists():
-            return 0
-        try:
-            with open(SENT_LOG_FILE, "r", encoding="utf-8") as f:
-                logs = json.load(f)
-            today_str = date.today().isoformat()
-            today_sent = [
-                entry for entry in logs
-                if entry.get("timestamp", "").startswith(today_str)
-                and entry.get("status") in ("SENT_SUCCESS", "success", "dry_run_success", "DRY_RUN_SUCCESS")
-                and entry.get("mode") in ("live", "dry_run")
-                and "Deduplicated" not in (entry.get("notes") or "")
-                and "Detected as already sent" not in (entry.get("notes") or "")
-                and not entry.get("timestamp", "").endswith("19:55:57")
-            ]
-            return len(today_sent)
-        except Exception:
-            return 0
+        """Return the reconciled SQLite count; never fall back to legacy JSON."""
+        if not self.trip_id:
+            raise RuntimeError("Daily send count requires the selected Trip; sender remains stopped.")
+        # Couchsurfing's limit applies to the account, across all Trips.
+        summary = self.queue_manager.get_daily_send_summary(self.trip_id, account_wide=True)
+        if not summary.get("available") or summary.get("confirmed_live") is None:
+            raise RuntimeError(
+                "Daily send count is not reconciled across SQLite sources; sender remains stopped: "
+                + str(summary.get("reason") or "count unavailable")
+            )
+        return int(summary["confirmed_live"])
 
     def append_sent_log(self, entry: Dict[str, Any], sync_db: bool = True) -> None:
         """Записывает подробный результат отправки в sent_log.json с файловым_lock и атомарной записью."""
@@ -264,7 +281,7 @@ class AutoSender:
         if sync_db and self.trip_id:
             try:
                 from core.autopilot import AutopilotEngine
-                engine = AutopilotEngine(trip_id=self.trip_id)
+                engine = AutopilotEngine(trip_id=self.trip_id, db_file=self.db_file)
                 engine.record_sending_attempt(
                     host_id_or_username=str(entry.get("username") or entry.get("id") or ""),
                     status=str(entry.get("status") or "UNKNOWN"),
@@ -276,6 +293,9 @@ class AutoSender:
                     notes=entry.get("notes"),
                     error_details=entry.get("error"),
                     timestamp=entry.get("timestamp"),
+                    attempt_id=getattr(self, "_current_attempt_id", None),
+                    trip_id=self.trip_id,
+                    evidence_type=entry.get("evidence_type"),
                 )
             except Exception as e:
                 log_step("DEBUG", f"SQLite sending_history sync note: {e}")
@@ -290,145 +310,42 @@ class AutoSender:
         increment_attempts: bool = False,
         sync_db: bool = True,
     ) -> None:
-        """Обновляет статус карточки хоста в requests_queue.json и SQLite.
+        """Delegate queue state changes to the trip-scoped canonical queue service.
 
-        `attempts` / `increment_attempts` учитываются только в JSON-очереди
-        (в таблице sending_queue нет такой колонки) и используются для
-        сортировки кандидатов, чтобы проблемный хост уходил в конец очереди.
+        Confirmed ``sent`` transitions are owned by AutopilotEngine.mark_as_sent;
+        this adapter never writes queue JSON or mutates host state directly.
         """
-        now_iso = datetime.now().isoformat()
-        status_norm = (new_status or "").strip().lower()
-        notes_lower = (notes or "").lower()
-
-        # sent_at ставится ТОЛЬКО для реального подтверждённого клика Send.
-        # "Already sent" (особенно подтверждённый лишь отсутствием кнопки) — не WAS SENT:
-        # дату не подставляем, а у Approved/Queued/Failed/Skipped старую дату очищаем.
-        is_sent_status = status_norm in ("sent", "was sent")
-        is_already = "already sent" in notes_lower or "deduplicated" in notes_lower
-        clear_sent_at = False
-
-        if sent_at is not None:
-            effective_sent_at = sent_at
-        elif is_sent_status and not is_already:
-            effective_sent_at = now_iso
-        elif not is_sent_status:
-            effective_sent_at = None
-            clear_sent_at = True
-        else:
-            effective_sent_at = None
-
-        if QUEUE_FILE.exists():
-            try:
-                with open(QUEUE_FILE, "r", encoding="utf-8") as f:
-                    try:
-                        fcntl.flock(f.fileno(), fcntl.LOCK_SH)
-                    except (OSError, ImportError):
-                        pass
-                    try:
-                        queue = json.load(f)
-                    except Exception:
-                        queue = []
-                    finally:
-                        try:
-                            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-                        except (OSError, ImportError):
-                            pass
-
-                for item in queue:
-                    if item.get("username") == username:
-                        cur_item_st = str(item.get("status") or "").lower()
-                        if cur_item_st in ("sent", "was sent") and status_norm != "sent":
-                            # Необратимость sent: статус sent нельзя перезаписывать
-                            break
-                        item["status"] = new_status
-                        if notes:
-                            item["notes"] = notes
-                        if effective_sent_at:
-                            item["sent_at"] = effective_sent_at
-                        elif clear_sent_at:
-                            item.pop("sent_at", None)
-                        item["updated_at"] = now_iso
-                        if increment_attempts:
-                            item["attempts"] = int(item.get("attempts") or 0) + 1
-                        elif attempts is not None:
-                            item["attempts"] = int(attempts)
-                        break
-
-                tmp_queue = QUEUE_FILE.with_suffix(".json.tmp")
-                with open(tmp_queue, "w", encoding="utf-8") as f:
-                    try:
-                        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                    except (OSError, ImportError):
-                        pass
-                    try:
-                        json.dump(queue, f, ensure_ascii=False, indent=2)
-                    finally:
-                        try:
-                            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-                        except (OSError, ImportError):
-                            pass
-                os.replace(tmp_queue, QUEUE_FILE)
-            except Exception as e:
-                log_step("WARN", f"Ошибка обновления очереди JSON: {e}")
-
-        if sync_db:
-            try:
-                from database import db_session
-                with db_session() as conn:
-                    cur = conn.cursor()
-                    # Единый источник истины: обновление исключительно core_hosts
-                    st_map = {
-                        "sent": "sent",
-                        "was sent": "sent",
-                        "skipped": "skipped",
-                        "failed": "skipped",
-                        "uncertain": "uncertain",
-                        "verification_required": "uncertain",
-                        "declined": "skipped",
-                        "approved": "approved",
-                        "queued": "selected",
-                        "qc_review_required": "drafted",
-                        "draft": "drafted",
-                    }
-                    c_st = st_map.get(status_norm)
-                    if c_st:
-                        # Инвариант: нельзя перевести уже отправленного хоста из sent в uncertain, skipped и т.д.
-                        cur.execute(
-                            """
-                            UPDATE core_hosts
-                            SET state = CASE WHEN state = 'sent' THEN 'sent' ELSE ? END,
-                                sent_at = CASE WHEN ? = 'sent' THEN coalesce(sent_at, ?) ELSE sent_at END,
-                                qc_notes = CASE WHEN state = 'sent' THEN qc_notes WHEN ? IN ('skipped', 'uncertain') THEN coalesce(?, qc_notes) ELSE qc_notes END,
-                                updated_at = ?
-                            WHERE (LOWER(username) = LOWER(?) OR LOWER(host_id) = LOWER(?))
-                              AND (state != 'sent' OR ? = 'sent');
-                            """,
-                            (c_st, c_st, effective_sent_at or now_iso, c_st, notes, now_iso, username, username, c_st),
-                        )
-            except Exception as e:
-                log_step("WARN", f"Ошибка синхронизации статуса: {e}")
+        status_norm = str(new_status or "").strip().lower()
+        if status_norm in ("sent", "was sent"):
+            log_step("WARN", f"Rejected direct queue transition to sent for @{username}; confirmation flow owns it.")
+            return
+        if not sync_db:
+            return
+        if not self.trip_id:
+            log_step("WARN", f"Cannot update @{username}: no active trip is available for a scoped state change.")
+            return
+        try:
+            self.queue_manager.update_status(
+                username,
+                new_status,
+                notes=notes,
+                trip_id=self.trip_id,
+                increment_attempts=increment_attempts,
+                attempts=attempts,
+            )
+        except Exception as exc:
+            log_step("WARN", f"Canonical queue state update failed for @{username}: {exc}")
+            raise
 
     def move_host_to_end_of_queue(self, username: str, reason: str = "") -> None:
         """Перемещает проблемного хоста в самый конец очереди (вниз левого стакана) без остановки автопилота."""
-        now_iso = datetime.now().isoformat()
-        try:
-            from database import db_session
-            with db_session() as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    UPDATE core_hosts
-                    SET priority = COALESCE(priority, 10) - 100,
-                        attempts = COALESCE(attempts, 0) + 1,
-                        qc_notes = ?,
-                        updated_at = ?
-                    WHERE (LOWER(username) = LOWER(?) OR LOWER(host_id) = LOWER(?));
-                    """,
-                    (f"Moved to bottom: {reason}", now_iso, username, username),
-                )
-            log_step("QUEUE", f"Хост @{username} перемещен в конец очереди (priority -100). Причина: {reason}")
-        except Exception as e:
-            log_step("WARN", f"Ошибка перемещения @{username} в конец очереди: {e}")
+        if not self.trip_id:
+            log_step("WARN", f"Cannot reprioritize @{username}: no trip context.")
+            return
+        if self.queue_manager.move_host_to_end(username, self.trip_id, reason):
+            log_step("QUEUE", f"Хост @{username} перемещен в конец очереди поездки {self.trip_id}. Причина: {reason}")
+        else:
+            log_step("WARN", f"Хост @{username} не найден или недоступен для изменения в поездке {self.trip_id}.")
 
     def sync_queue_against_sent_and_inbox(self, page=None) -> int:
         """
@@ -437,15 +354,14 @@ class AutoSender:
         2. Экспресс-проверка чатов через сессию Playwright (если передан page).
         """
         log_step("SYNC", "Автоматическая проверка и очистка очереди от ранее отправленных хостов...")
-        from request_manager import RequestQueueManager
-        rm = RequestQueueManager()
+        rm = RequestQueueManager(self.db_file)
         deduped = rm.deduplicate_queue_against_sent()
 
         # Экспресс-проверка активных диалогов через живую страницу Playwright
         if page and AUTH_STATE_FILE.exists():
+            chat_members = set()
             try:
                 log_step("SYNC", "Экспресс-проверка активных диалогов Couchsurfing (/c/chat/request/sent)...")
-                chat_members = set()
 
                 def on_res(res):
                     u = res.url.lower()
@@ -473,22 +389,24 @@ class AutoSender:
                     if m:
                         chat_members.add(m.group(1).lower())
 
-                if chat_members:
-                    newly_removed = 0
-                    sync_queue = self.queue_manager.load_queue(exclude_sent=False)
-                    for item in sync_queue:
-                        u = (item.get("username") or "").lower()
-                        if u in chat_members and item.get("status") in ("Approved", "Queued"):
-                            self.queue_manager.update_item(
-                                item.get("username"),
-                                status="Sent",
-                                message=item.get("generated_message"),
-                            )
-                            log_step("SYNC", f"[SYNC] Исключен из очереди уже отправленный хост: @{item.get('username')}")
-                            newly_removed += 1
-                            deduped += 1
             except Exception as e:
                 log_step("DEBUG", f"Ошибка экспресс-проверки чатов: {e}")
+
+            # Сохраняем результат вне catch для необязательной Playwright-проверки:
+            # ошибки SQLite должны прервать синхронизацию, а не выглядеть как успех.
+            if chat_members:
+                sync_queue = self.queue_manager.load_queue(exclude_sent=False)
+                for item in sync_queue:
+                    u = (item.get("username") or "").lower()
+                    if u in chat_members and item.get("status") in ("Approved", "Queued"):
+                        skipped = self.queue_manager.skip_item(
+                            item.get("username"),
+                            reason="Already present in sent requests list",
+                            trip_id=self.trip_id,
+                        )
+                        if skipped:
+                            log_step("SYNC", f"[SYNC] Исключен из очереди уже отправленный хост: @{item.get('username')}")
+                            deduped += 1
 
         if deduped > 0:
             log_step("SYNC", f"Очистка очереди завершена: исключено {deduped} ранее отправленных хостов.")
@@ -549,6 +467,12 @@ class AutoSender:
             "seconds_remaining": rem,
             "last_status": last_status,
             "dry_run": self.dry_run,
+            "runtime_mode": "dry_run" if self.dry_run else "live",
+            "sender_pid": self.sender_pid,
+            "sender_started_at": self.sender_started_at,
+            "sender_command": self.sender_command,
+            "heartbeat_at": datetime.now().isoformat(),
+            "trip_id": self.trip_id,
             "headed": not self.headless,
             "min_interval_minutes": self.min_interval_minutes,
             "max_interval_minutes": self.max_interval_minutes,
@@ -634,52 +558,40 @@ class AutoSender:
 
     def get_host_dates_and_city(self, host_item: Dict[str, Any]) -> Tuple[str, str, str]:
         """
-        Считывает даты и город кандидата из объекта host_item и базы данных SQLite.
-        Приоритет отдается городу и датам Trip Card, так как на CS сопоставляется карточка поездки.
+        Возвращает только trip-scoped контекст, переданный очередью из core_hosts/core_trips.
+
+        Отправитель не разрешает конфликты между legacy-таблицами и не подставляет
+        фиктивные поездки: неполный контекст блокирует отправку.
         """
-        username = host_item.get("username", "")
-        arrival_date = host_item.get("arrival_date") or host_item.get("check_in")
-        departure_date = host_item.get("departure_date") or host_item.get("check_out")
-        target_city = (
-            host_item.get("trip_city")
-            or host_item.get("city")
-            or host_item.get("target_city")
-        )
+        trip_id = str(host_item.get("trip_id") or host_item.get("linked_trip_id") or "").strip()
+        arrival_date = str(host_item.get("trip_arrival") or "").strip()
+        departure_date = str(host_item.get("trip_departure") or "").strip()
+        target_city = str(host_item.get("trip_city") or "").strip()
+        missing = [
+            label for label, value in (
+                ("trip_id", trip_id),
+                ("core_trips.city", target_city),
+                ("core_trips.arrival_date", arrival_date),
+                ("core_trips.departure_date", departure_date),
+            ) if not value
+        ]
+        if missing:
+            username = host_item.get("username") or host_item.get("id") or "unknown host"
+            raise ValueError(
+                f"Incomplete canonical trip context for @{username}: missing {', '.join(missing)}"
+            )
 
-        # Синхронизация с канонической базой данных через core.database
-        if username:
-            try:
-                from core.database import get_connection
-                with get_connection() as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("""
-                        SELECT 
-                            COALESCE(ct.city, ut.city, th.city, h.location) as trip_city,
-                            COALESCE(gm.check_in, th.arrival_date, ct.arrival_date, ut.arrival_date) as cin,
-                            COALESCE(gm.check_out, th.departure_date, ct.departure_date, ut.departure_date) as cout
-                        FROM hosts h
-                        LEFT JOIN trip_hosts th ON (th.host_id = h.id OR LOWER(th.host_id) = LOWER(h.username))
-                        LEFT JOIN core_trips ct ON th.trip_id = ct.id
-                        LEFT JOIN user_trips ut ON th.trip_id = ut.trip_id
-                        LEFT JOIN generated_messages gm ON gm.host_id = h.id AND gm.is_active = 1
-                        WHERE LOWER(h.username) = LOWER(?) OR LOWER(h.id) = LOWER(?)
-                        ORDER BY th.created_at DESC, gm.id DESC LIMIT 1
-                    """, (username, username))
-                    row = cursor.fetchone()
-                    if row:
-                        db_city, db_cin, db_cout = row
-                        if db_city and not target_city:
-                            target_city = db_city
-                        if db_cin and not arrival_date:
-                            arrival_date = db_cin
-                        if db_cout and not departure_date:
-                            departure_date = db_cout
-            except Exception:
-                pass
-
-        arrival_date = arrival_date or "2026-11-16"
-        departure_date = departure_date or "2026-11-19"
-        target_city = target_city or "Tokyo"
+        expected_trip_id = str(getattr(self, "trip_id", None) or "").strip()
+        if not expected_trip_id:
+            raise ValueError("Cannot dispatch without an explicitly resolved trip_id")
+        expected_trip_id = RequestQueueManager._resolve_canonical_trip_id(expected_trip_id)
+        candidate_trip_id = RequestQueueManager._resolve_canonical_trip_id(trip_id)
+        if candidate_trip_id.lower() != expected_trip_id.lower():
+            username = host_item.get("username") or host_item.get("id") or "unknown host"
+            raise ValueError(
+                f"Trip context mismatch for @{username}: candidate belongs to {trip_id}, "
+                f"dispatcher is scoped to {expected_trip_id}"
+            )
 
         # Извлечение чистого названия города (например, "Kyoto, Japan" -> "Kyoto")
         raw_lower = target_city.lower()
@@ -696,18 +608,48 @@ class AutoSender:
             "nihonbashi", "ginza", "roppongi", "akihabara", "ueno", "asakusa"
         ]
         if not clean_city:
-            if (self.trip_id and "tokyo" in self.trip_id.lower()) or any(d in raw_lower for d in tokyo_districts):
+            if any(d in raw_lower for d in tokyo_districts):
                 clean_city = "Tokyo"
-            elif self.trip_id and "kyoto" in self.trip_id.lower():
-                clean_city = "Kyoto"
-            elif self.trip_id and "osaka" in self.trip_id.lower():
-                clean_city = "Osaka"
-            elif self.trip_id and "sapporo" in self.trip_id.lower():
-                clean_city = "Sapporo"
             else:
-                clean_city = target_city.split(",")[0].strip() or "Tokyo"
+                clean_city = target_city.split(",")[0].strip()
 
         return arrival_date, departure_date, clean_city
+
+    def validate_dispatch_context(self, candidates: List[Dict[str, Any]]) -> List[str]:
+        """Return candidates whose canonical trip context is incomplete."""
+        invalid = []
+        for candidate in candidates:
+            try:
+                self.get_host_dates_and_city(candidate)
+            except ValueError as exc:
+                invalid.append(str(exc))
+        return invalid
+
+    def validate_message_approval(self, host_item: Dict[str, Any], message: str, *, audit: bool = False):
+        """Fail-closed authorization check used at each dispatch boundary."""
+        from core.approval_service import ApprovalService
+        trip_id = str(host_item.get("trip_id") or host_item.get("linked_trip_id") or "").strip()
+        host_id = str(host_item.get("host_id") or host_item.get("id") or "").strip()
+        username = str(host_item.get("username") or "").strip()
+        version = host_item.get("message_version")
+        if not (trip_id and host_id and username):
+            if audit:
+                from core.approval_service import ApprovalService
+                ApprovalService(self.db_file).record_dispatch_denial(
+                    trip_id=trip_id, host_id=host_id, code="MISSING_TRIP_OR_HOST_IDENTITY",
+                    detail="Dispatch item lacks trip_id, host_id, or username",
+                )
+            return None
+        if self.trip_id and str(self.trip_id).strip() != trip_id:
+            from core.approval_service import ApprovalService
+            return ApprovalService(self.db_file).validate_approval(
+                trip_id=str(self.trip_id), host_id=host_id, username=username,
+                message_text=message, message_version=version, record_failure=audit,
+            )
+        return ApprovalService(self.db_file).validate_approval(
+            trip_id=trip_id, host_id=host_id, username=username,
+            message_text=message, message_version=version, record_failure=audit,
+        )
 
     def fill_form_dates(self, page, arrival_date: str, departure_date: str) -> None:
         """
@@ -989,7 +931,7 @@ class AutoSender:
     ) -> None:
         """
         Пишет результат тестового прогона (dry-run) только в sent_log.json.
-        Статус записи в requests_queue.json НЕ меняется — остаётся 'Approved'.
+        Состояние очереди не меняется: тестовый прогон не записывает отправку в доменную БД.
         """
         self.append_sent_log({
             "id": username,
@@ -1019,6 +961,7 @@ class AutoSender:
         message: str,
         submission_confirmed: bool,
         http_status: Optional[int],
+        confirmation: Optional[ConfirmationResult] = None,
         after_screenshot: Optional[Path] = None,
         before_screenshot: Optional[Path] = None,
         error_screenshot: Optional[Path] = None,
@@ -1026,15 +969,35 @@ class AutoSender:
         page: Any = None,
     ) -> bool:
         """
-        Обрабатывает исход отправки запроса:
-        1. Проверяет подтверждение отправки и HTTP-код ответа сервера (200-299).
-        2. Валидирует фиксацию через AutopilotEngine.mark_as_sent():
-           - Если AutopilotEngine отсутствует -> отправка НЕ считается успешной, фиксируется как UNCERTAIN.
-           - Если mark_as_sent() вернул False или произошла ошибка -> update_queue_status(..., 'Sent') НЕ вызывается!
-           - Статус переводится в UNCERTAIN для предотвращения повторной отправки.
-        3. Если фиксация успешна -> обновляет только JSON-очередь (sync_db=False), не создавая отдельной записи в БД.
+        Обрабатывает исход отправки запроса с строгой валидацией подтверждения.
+
+        Правила:
+        * CONFIRMED_SENT возможен только при подтверждении через
+          ConfirmationCapability токен, выпущенный ConfirmationValidator.
+        * HTTP 200-299 без atribутируемого подтверждения → UNKNOWN_OUTCOME.
+        * Навигация в чат без atribутируемого подтверждения → UNKNOWN_OUTCOME.
+        * Общий текст успеха без atribутируемого подтверждения → UNKNOWN_OUTCOME.
+        * UNKNOWN_OUTCOME блокирует автоматический повтор.
         """
-        if submission_confirmed and http_status and (200 <= http_status <= 299):
+        now_iso = datetime.now().isoformat()
+        ts_display = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Если нет объекта подтверждения (например, исключение до валидации),
+        # используем submission_confirmed как fallback, но не как достаточное доказательство.
+        if confirmation is None:
+            confirmation = ConfirmationResult(
+                outcome=DispatchOutcome.UNKNOWN_OUTCOME if submission_confirmed else DispatchOutcome.NOT_STARTED,
+                evidence_type=EvidenceType.NONE,
+                reason="No confirmation object provided; fail-closed",
+                attributable_to_stay_request=False,
+                http_status=http_status,
+            )
+
+        # --- Случай: подтверждено создание Stay Request (CONFIRMED_SENT) ---
+        # F1: Требуется валидный ConfirmationCapability токен
+        if confirmation.is_confirmed() and confirmation.capability is not None:
+            capability = confirmation.capability
+
             if not self.test_mode:
                 time.sleep(1.5)
             if page and after_screenshot:
@@ -1042,16 +1005,35 @@ class AutoSender:
                     page.screenshot(path=str(after_screenshot), timeout=5000)
                 except Exception:
                     pass
-            log_step("SUCCESS", f"Отправка верифицирована! Ответ сервера: {http_status} OK. Скриншот: {after_screenshot}")
 
-            sent_notes = f"Stay request sent and verified. Server status: {http_status}."
+            log_step(
+                "SUCCESS",
+                f"Stay request CONFIRMED SENT for @{username}. "
+                f"Evidence: {confirmation.evidence_type.value}, "
+                f"HTTP {confirmation.http_status}, URL: {confirmation.response_url}",
+            )
+
+            sent_notes = (
+                f"Stay request sent and strictly verified. "
+                f"Evidence: {confirmation.evidence_type.value}. "
+                f"Reason: {confirmation.reason}. "
+                f"Server status: {confirmation.http_status}."
+            )
+
             mark_success = False
-
-            # 5. Проверяем, что отсутствие AutopilotEngine не позволяет считать отправку успешно зафиксированной
             if self.autopilot_engine is not None:
                 try:
-                    # 1. Проверяем результат AutopilotEngine.mark_as_sent()
-                    mark_success = bool(self.autopilot_engine.mark_as_sent(username, http_status=http_status, notes=sent_notes))
+                    mark_success = bool(
+                        self.autopilot_engine.mark_as_sent(
+                            username,
+                            http_status=confirmation.http_status or 200,
+                            capability=capability,
+                            confirmation_url=confirmation.response_url,
+                            evidence_reference=None,
+                            notes=sent_notes,
+                            attempt_id=getattr(self, "_current_attempt_id", None),
+                        )
+                    )
                     if not mark_success:
                         log_step("WARN", f"AutopilotEngine.mark_as_sent() вернул False для @{username}.")
                 except Exception as e:
@@ -1062,7 +1044,6 @@ class AutoSender:
                 mark_success = False
 
             if mark_success:
-                # 4. Если фиксация успешна — обновляем JSON-очередь, не создавая отдельной записи в БД
                 self.append_sent_log({
                     "id": username,
                     "username": username,
@@ -1070,89 +1051,148 @@ class AutoSender:
                     "target_city": target_city,
                     "arrival_date": arrival_date,
                     "departure_date": departure_date,
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "timestamp": ts_display,
                     "status": "SENT_SUCCESS",
-                    "http_status": http_status,
+                    "http_status": confirmation.http_status,
                     "mode": "live",
                     "proof_screenshot": str(after_screenshot) if after_screenshot else "",
                     "before_screenshot": str(before_screenshot) if before_screenshot else "",
                     "notes": sent_notes,
                     "message": message,
+                    "evidence_type": confirmation.evidence_type.value,
+                    "outcome": confirmation.outcome.value,
                 }, sync_db=False)
                 self.update_queue_status(username, "Sent", notes=sent_notes, sync_db=False)
                 return True
             else:
-                # 2. Если результат False или возникла ошибка — не вызываем update_queue_status(..., "Sent")
-                # 3. Фиксируем результат как UNCERTAIN, чтобы сообщение не отправилось повторно
-                uncert_reason = f"Submission HTTP {http_status} OK, but mark_as_sent failed or AutopilotEngine missing"
-                log_step("WARN", f"Перевод @{username} в статус UNCERTAIN для предотвращения повторной отправки ({uncert_reason})")
-                self.append_sent_log({
-                    "id": username,
-                    "username": username,
-                    "name": host_name,
-                    "target_city": target_city,
-                    "arrival_date": arrival_date,
-                    "departure_date": departure_date,
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "status": "UNCERTAIN",
-                    "http_status": http_status,
-                    "mode": "live",
-                    "proof_screenshot": str(after_screenshot) if after_screenshot else "",
-                    "before_screenshot": str(before_screenshot) if before_screenshot else "",
-                    "notes": f"{sent_notes} [Marked UNCERTAIN: {uncert_reason}]",
-                    "message": message,
-                }, sync_db=False)
-                if self.autopilot_engine is not None:
-                    try:
-                        self.autopilot_engine.mark_as_uncertain(
-                            username,
-                            error_details=uncert_reason,
-                            http_status=http_status,
-                            proof_screenshot=str(after_screenshot) if after_screenshot else None,
-                            before_screenshot=str(before_screenshot) if before_screenshot else None,
-                            notes=f"Uncertain: {uncert_reason}",
-                        )
-                    except Exception as ex:
-                        log_step("WARN", f"AutopilotEngine mark_as_uncertain note: {ex}")
-                self.update_queue_status(username, "Uncertain", notes=f"Marked UNCERTAIN: {uncert_reason}", increment_attempts=True, sync_db=False)
+                # mark_as_sent не смог зафиксировать (например, хост уже sent)
+                uncert_reason = f"mark_as_sent failed for @{username}"
+                log_step("WARN", f"Перевод @{username} в статус UNCERTAIN ({uncert_reason})")
+                self._mark_uncertain(
+                    username, host_name, target_city, arrival_date, departure_date,
+                    message, uncert_reason, confirmation.http_status,
+                    after_screenshot, before_screenshot,
+                )
                 return False
-        else:
-            if page and error_screenshot:
-                try:
-                    page.screenshot(path=str(error_screenshot), timeout=5000)
-                    if error_html:
-                        error_html.write_text(page.content(), encoding="utf-8")
-                except Exception:
-                    pass
-            err_text = f"HTTP {http_status}" if http_status else "Отправка не подтверждена за отведенное время"
-            log_step("WARN", f"Подтверждение отправки отсутствует: {err_text}. Статус переведен в UNCERTAIN. Скриншот: {error_screenshot}")
 
-            self.append_sent_log({
-                "id": username,
-                "username": username,
-                "name": host_name,
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "status": "UNCERTAIN",
-                "http_status": http_status,
-                "mode": "live",
-                "proof_screenshot": str(error_screenshot) if error_screenshot else "",
-                "before_screenshot": str(before_screenshot) if before_screenshot else "",
-                "notes": f"Submission clicked but unverified ({err_text}). Marked as UNCERTAIN.",
-            }, sync_db=False)
-            if self.autopilot_engine:
-                try:
-                    self.autopilot_engine.mark_as_uncertain(
+        # --- Все остальные случаи: UNKNOWN_OUTCOME, CONFIRMED_REJECTED, NOT_STARTED, etc. ---
+        # UNKNOWN_OUTCOME блокирует автоматический повтор.
+        err_text = confirmation.reason or (
+            f"HTTP {http_status}" if http_status else "Отправка не подтверждена за отведенное время"
+        )
+
+        log_step(
+            "WARN",
+            f"Подтверждение отправки отсутствует или недопустимо: {err_text}. "
+            f"Статус переведен в UNCERTAIN. Outcome: {confirmation.outcome.value}. "
+            f"Скриншот: {error_screenshot}",
+        )
+
+        if page and error_screenshot:
+            try:
+                page.screenshot(path=str(error_screenshot), timeout=5000)
+                if error_html:
+                    error_html.write_text(page.content(), encoding="utf-8")
+            except Exception:
+                pass
+
+        self.append_sent_log({
+            "id": username,
+            "username": username,
+            "name": host_name,
+            "target_city": target_city,
+            "arrival_date": arrival_date,
+            "departure_date": departure_date,
+            "timestamp": ts_display,
+            "status": "UNCERTAIN",
+            "http_status": confirmation.http_status or http_status,
+            "mode": "live",
+            "proof_screenshot": str(error_screenshot) if error_screenshot else "",
+            "before_screenshot": str(before_screenshot) if before_screenshot else "",
+            "notes": f"Submission unverified ({err_text}). Outcome: {confirmation.outcome.value}. Marked as UNCERTAIN.",
+            "message": message,
+            "evidence_type": confirmation.evidence_type.value,
+            "outcome": confirmation.outcome.value,
+        }, sync_db=False)
+
+        if self.autopilot_engine:
+            try:
+                if confirmation.is_rejected():
+                    self.autopilot_engine.mark_as_rejected(
                         username,
-                        error_details=err_text,
-                        http_status=http_status,
-                        proof_screenshot=str(error_screenshot) if error_screenshot else None,
-                        before_screenshot=str(before_screenshot) if before_screenshot else None,
-                        notes=f"Submission unverified: {err_text}",
+                        http_status=confirmation.http_status or http_status,
+                        error_details=confirmation.reason,
+                        notes=sent_notes if 'sent_notes' in dir() else f"Rejected: {confirmation.reason}",
+                        attempt_id=getattr(self, "_current_attempt_id", None),
                     )
-                except Exception as ex:
-                    log_step("WARN", f"AutopilotEngine mark_as_uncertain error: {ex}")
-            self.update_queue_status(username, "Uncertain", notes=f"Submission unverified: {err_text}", increment_attempts=True, sync_db=False)
-            return False
+                else:
+                    # UNKNOWN_OUTCOME, NOT_STARTED, IN_PROGRESS, REQUIRES_RECONCILIATION
+                    self.autopilot_engine.mark_as_unknown(
+                        username,
+                        http_status=confirmation.http_status or http_status,
+                        error_details=confirmation.reason,
+                        notes=f"Uncertain: {confirmation.reason}",
+                        attempt_id=getattr(self, "_current_attempt_id", None),
+                    )
+            except Exception as ex:
+                log_step("WARN", f"AutopilotEngine mark outcome error: {ex}")
+
+        self.update_queue_status(
+            username, "Uncertain",
+            notes=f"Uncertain: {confirmation.reason}",
+            increment_attempts=True,
+            sync_db=False,
+        )
+        return False
+
+    def _mark_uncertain(
+        self,
+        username: str,
+        host_name: str,
+        target_city: str,
+        arrival_date: str,
+        departure_date: str,
+        message: str,
+        reason: str,
+        http_status: Optional[int],
+        after_screenshot: Optional[Path],
+        before_screenshot: Optional[Path],
+    ) -> None:
+        """Вспомогательный метод для перевода в UNCERTAIN."""
+        ts_display = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.append_sent_log({
+            "id": username,
+            "username": username,
+            "name": host_name,
+            "target_city": target_city,
+            "arrival_date": arrival_date,
+            "departure_date": departure_date,
+            "timestamp": ts_display,
+            "status": "UNCERTAIN",
+            "http_status": http_status,
+            "mode": "live",
+            "proof_screenshot": str(after_screenshot) if after_screenshot else "",
+            "before_screenshot": str(before_screenshot) if before_screenshot else "",
+            "notes": f"UNCERTAIN: {reason}",
+            "message": message,
+        }, sync_db=False)
+        if self.autopilot_engine:
+            try:
+                self.autopilot_engine.mark_as_unknown(
+                    username,
+                    http_status=http_status,
+                    error_details=reason,
+                    notes=f"Uncertain: {reason}",
+                    attempt_id=getattr(self, "_current_attempt_id", None),
+                )
+            except Exception as ex:
+                log_step("WARN", f"AutopilotEngine mark_as_unknown error: {ex}")
+        self.update_queue_status(
+            username, "Uncertain",
+            notes=f"Uncertain: {reason}",
+            increment_attempts=True,
+            sync_db=False,
+        )
 
     def process_host(self, page, host_item: Dict[str, Any]) -> bool:
         """
@@ -1160,17 +1200,30 @@ class AutoSender:
         Возвращает True в случае успеха.
         """
         username = host_item.get("username", "")
+        self._current_attempt_id = None
+        self._current_canonical_key = None
         host_name = host_item.get("clean_name") or host_item.get("name") or username
         message = host_item.get("generated_message", "")
         arrival_date, departure_date, target_city = self.get_host_dates_and_city(host_item)
         stay_url = f"https://www.couchsurfing.com/c/users/{username}/stay-request"
 
+        approval = self.validate_message_approval(host_item, message, audit=True)
+        if approval is None or not approval.valid:
+            reason = approval.code if approval else "MISSING_TRIP_OR_HOST_IDENTITY"
+            log_step("BLOCKED", f"Отправка @{username} запрещена: нет действующего approval ({reason}).")
+            return False
+
         # Предохранитель Pre-flight QC: жесткая проверка перед запуском браузера
-        from llm_agent import validate_message_qc
-        from message_generator import verify_host_name
+        from core.messaging import validate_message_qc
+        from core.identity import verify_host_name
 
         first_name, is_trusted = verify_host_name(host_item)
-        if not is_trusted or not first_name:
+        approved_neutral = (
+            str(host_item.get("status") or "").lower() == "approved"
+            and "BULK_APPROVED_NEUTRAL_GREETING" in str(host_item.get("notes") or "")
+            and str(message).lstrip().startswith("Hello,")
+        )
+        if (not is_trusted or not first_name) and not approved_neutral:
             log_step("WARN", f"Остановка отправки @{username}: сомнительное имя '{host_item.get('name')}'. Требуется проверка.")
             self.update_queue_status(username, "Name_Review_Required", notes="Untrusted display name; manual review required.")
             return False
@@ -1181,45 +1234,14 @@ class AutoSender:
             return False
 
         bio_words = len((host_item.get("about_me_clean") or host_item.get("about_me") or "").split())
-        is_minimal = bio_words < 25
+        bio_text = (host_item.get("about_me_clean") or host_item.get("about_me") or "").strip()
+        is_minimal = bio_words < 25 or bio_text.lower().startswith("friendly local resident")
         qc_ok, qc_issues = validate_message_qc(
             message,
             is_minimal_bio=is_minimal,
             host_data=host_item,
-            trip_city=host_item.get("city") or host_item.get("trip_city"),
+            trip_city=target_city or host_item.get("city") or host_item.get("trip_city"),
         )
-        if not qc_ok:
-            log_step("WARN", f"Сообщение для @{username} не прошло QC ({', '.join(qc_issues)}). Пробуем авто-перегенерацию...")
-            try:
-                from message_generator import generate_stay_request
-                regen_msg = generate_stay_request(
-                    host_item,
-                    check_in=arrival_date,
-                    check_out=departure_date,
-                )
-                regen_qc_ok, regen_qc_issues = validate_message_qc(
-                    regen_msg,
-                    is_minimal_bio=is_minimal,
-                    host_data=host_item,
-                    trip_city=target_city,
-                )
-                if regen_qc_ok:
-                    log_step("INFO", f"Успешная авто-перегенерация для @{username} ({len(regen_msg.split())} слов).")
-                    message = regen_msg
-                    host_item["generated_message"] = regen_msg
-                    from database import db_session
-                    with db_session() as conn:
-                        cur = conn.cursor()
-                        cur.execute(
-                            "UPDATE core_hosts SET message_draft = ?, qc_passed = 1, qc_notes = 'Auto-regenerated passed QC' WHERE LOWER(username) = LOWER(?)",
-                            (regen_msg, username),
-                        )
-                    qc_ok = True
-                else:
-                    log_step("WARN", f"Перегенерация для @{username} не прошла QC: {', '.join(regen_qc_issues)}.")
-            except Exception as ex:
-                log_step("WARN", f"Ошибка авто-перегенерации для @{username}: {ex}")
-
         if not qc_ok:
             log_step("WARN", f"Остановка отправки @{username}: сообщение не прошло QC ({', '.join(qc_issues)}).")
             self.update_queue_status(username, "QC_Review_Required", notes=f"Pre-dispatch QC: {', '.join(qc_issues)}")
@@ -1530,13 +1552,22 @@ class AutoSender:
                     error_screenshot, error_html,
                 )
 
-            # Runtime-санитизация текста перед вводом (текст уже в host_item из очереди)
-            message = host_item.get("generated_message", "") or ""
-            message = sanitize_before_send(message, host_name)
+            # The approved UTF-8 text is immutable at dispatch. Never rewrite
+            # greetings or whitespace here; a changed version needs reapproval.
+            approval = self.validate_message_approval(host_item, message, audit=True)
+            if approval is None or not approval.valid:
+                return self._fail_attempt(page, username, host_name, "Approval changed before text entry", error_screenshot, error_html)
             if not message.strip():
                 return self._fail_attempt(page, username, host_name, "Пустой текст сообщения в очереди", error_screenshot, error_html)
 
             self.human_type(textarea, message)
+            try:
+                entered_text = textarea.input_value(timeout=5000)
+            except Exception:
+                return self._fail_attempt(page, username, host_name, "Could not verify exact message text in the form", error_screenshot, error_html)
+            approval = self.validate_message_approval(host_item, message, audit=True)
+            if entered_text != message or approval is None or not approval.valid:
+                return self._fail_attempt(page, username, host_name, "Form text or approval differs from the user-approved message", error_screenshot, error_html)
             log_step("INPUT", f"Даты {arrival_date} – {departure_date}, текст введен (символов: {len(message)})")
             time.sleep(random.uniform(1.0, 2.0))
 
@@ -1597,21 +1628,123 @@ class AutoSender:
                 )
                 return False
 
-            # 9. БОЕВОЙ РЕЖИМ: Очистка буфера ответов, клик и строгая верификация
+            # Final pre-click revalidation closes the candidate-selection and
+            # form-entry TOCTOU window as far as SQLite and the external browser
+            # boundary permit.
+            final_approval = self.validate_message_approval(host_item, message, audit=True)
+            try:
+                final_form_text = textarea.input_value(timeout=5000)
+            except Exception:
+                final_form_text = None
+            if final_form_text != message or final_approval is None or not final_approval.valid:
+                log_step("BLOCKED", f"Клик отменен для @{username}: approval или точный текст изменился до отправки.")
+                if getattr(self, "_current_attempt_id", None):
+                    from core.dispatch_identity import release_host_dispatch_lock
+                    release_host_dispatch_lock(self._current_attempt_id, "released", db_file=self.db_file)
+                return False
+
+            # 9. БОЕВОЙ РЕЖИМ: Глобальное резервирование хоста перед кликом
+            # Резервируем хоста через Phase 2 диспетчер (используем canonical identity).
+            try:
+                # Регистрируем идентичность хоста (если ещё не зарегистрирован)
+                register_host_identity("username", username, f"un:{username}", db_file=self.db_file)
+                reservation = reserve_host_for_dispatch("username", username, self.trip_id, db_file=self.db_file)
+                if reservation["status"] != "ok":
+                    log_step(
+                        "BLOCKED",
+                        f"Глобальное резервирование недоступно для @{username}: {reservation.get('reason')}"
+                    )
+                    self.update_queue_status(
+                        username, "Uncertain",
+                        notes=f"Blocked: {reservation.get('reason')}",
+                        increment_attempts=True,
+                        sync_db=False,
+                    )
+                    return False
+                self._current_attempt_id = reservation["attempt_id"]
+                self._current_canonical_key = reservation["canonical_key"]
+                log_step(
+                    "RESERVE",
+                    f"Хост @{username} зарезервирован (attempt_id={self._current_attempt_id}, canonical_key={self._current_canonical_key})"
+                )
+            except Exception as e:
+                log_step("ERROR", f"Ошибка глобального резервирования для @{username}: {e}")
+                self._current_attempt_id = None
+
+            # Reservation is committed in SQLite before the external click.
+            # Revalidate after that commit and compare the exact live form value.
+            if not getattr(self, "_current_attempt_id", None):
+                return False
+            reserved_approval = self.validate_message_approval(host_item, message, audit=True)
+            try:
+                reserved_form_text = textarea.input_value(timeout=5000)
+            except Exception:
+                reserved_form_text = None
+            if reserved_form_text != message or reserved_approval is None or not reserved_approval.valid:
+                from core.dispatch_identity import release_host_dispatch_lock
+                release_host_dispatch_lock(self._current_attempt_id, "released", db_file=self.db_file)
+                log_step("BLOCKED", f"Резервирование @{username} снято: approval или текст изменился.")
+                return False
+            from core.approval_service import ApprovalService
+            try:
+                authorized = ApprovalService(self.db_file).record_dispatch_authorization(
+                    validation=reserved_approval, attempt_id=self._current_attempt_id,
+                    trip_id=str(host_item.get("trip_id") or host_item.get("linked_trip_id") or ""),
+                    host_id=str(host_item.get("id") or host_item.get("host_id") or ""),
+                )
+            except Exception as exc:
+                authorized = False
+                log_step("ERROR", f"Невозможно записать audit разрешения для @{username}: {exc}")
+            if not authorized:
+                from core.dispatch_identity import release_host_dispatch_lock
+                release_host_dispatch_lock(self._current_attempt_id, "released", db_file=self.db_file)
+                return False
+
+            # 9.1. Очистка буфера ответов, клик и строгая верификация
             api_responses.clear()
             send_btn.click(timeout=15000)
             log_step("CLICK", f"Кнопка отправки нажата ('{btn_text}')")
 
-            # Ожидание подтверждения: только реальный сетевой ответ или подтвержденный переход в чат
+            # Ожидание подтверждения: строгая валидация через ConfirmationValidator.
+            # HTTP 2xx, навигация в чат и общий текст НЕ являются достаточными доказательствами.
             start_wait = time.time()
-            submission_confirmed = False
-            http_status = None
+            dom_selectors: List[str] = []
+            page_text_captured: Optional[str] = None
 
             while time.time() - start_wait < 14:
-                # 1. Проверяем сетевые ответы POST запросов
-                ok_res = [r for r in api_responses if r.get("ok")]
-                err_res = [r for r in api_responses if not r.get("ok") and r.get("status", 0) >= 400]
+                # 1. Проверяем явное состояние интерфейса после отправки.
+                try:
+                    # После успешной отправки Couchsurfing показывает профильную
+                    # кнопку View Stay Request вместо формы отправки. Проверяем
+                    # именно видимый интерактивный элемент, а не совпадение текста
+                    # в скрытом DOM/i18n-бандле.
+                    view_stay_request = page.locator(
+                        "button:visible:has-text('View Stay Request'), "
+                        "a:visible:has-text('View Stay Request'), "
+                        "[role='button']:visible:has-text('View Stay Request')"
+                    )
+                    if view_stay_request.count() > 0 and view_stay_request.first.is_visible():
+                        dom_selectors.append("visible_view_stay_request_button")
+                        break
 
+                    for sel in (
+                        "h1:has-text('Request Sent'), h2:has-text('Request Sent'), div:has-text('Your request was sent')",
+                        '[data-testid*="stay-request-sent"], [data-testid*="stay_request_sent"]',
+                        '[class*="stay-request-sent"], [class*="stay_request_sent"]',
+                        '[data-testid*="request-sent"], [class*="request-sent"]',
+                    ):
+                        try:
+                            els = page.locator(sel)
+                            if els.count() > 0 and els.first.is_visible():
+                                dom_selectors.append(sel)
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+
+                # 2. Проверяем сетевые ошибки только если явный UI-успех ещё
+                # не появился. События POST собраны обработчиком response.
+                err_res = [r for r in api_responses if not r.get("ok") and r.get("status", 0) >= 400]
                 if err_res:
                     err_info = err_res[-1]
                     http_status = err_info.get("status")
@@ -1620,29 +1753,30 @@ class AutoSender:
                     log_step("WARN", f"Получен ошибочный ответ сервера: HTTP {http_status} от {err_url}. Тело ответа: {err_body}")
                     break
 
-                if ok_res:
-                    http_status = ok_res[-1].get("status")
-                    submission_confirmed = True
-                    break
-
-                # 2. Проверяем переход в конкретный чат (/c/chat/ или /messages/)
-                curr_url = page.url.lower()
-                if any(x in curr_url for x in ("/c/chat/", "/c/messages/", "/messages/thread/")):
-                    submission_confirmed = True
-                    http_status = 200
-                    break
-
-                # 3. Проверяем появление заголовка успешной отправки
+                # 3. Захватываем текст страницы для диагностики.
                 try:
-                    success_heading = page.query_selector("h1:has-text('Request Sent'), h2:has-text('Request Sent'), div:has-text('Your request was sent')")
-                    if success_heading and success_heading.is_visible():
-                        submission_confirmed = True
-                        http_status = 200
-                        break
+                    page_text_captured = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
                 except Exception:
                     pass
 
                 time.sleep(0.5)
+
+            # После цикла выполняем строгую валидацию подтверждения.
+            curr_url = page.url.lower() if page else ""
+            confirmation = validate_dispatch_confirmation(
+                api_responses=api_responses,
+                page_url=curr_url,
+                page_text=page_text_captured,
+                dom_selectors=dom_selectors,
+                send_button_clicked=True,
+                attempt_id=getattr(self, "_current_attempt_id", None),
+                canonical_host_key=getattr(self, "_current_canonical_key", None),
+            )
+
+            log_step("CONFIRM", f"Dispatch outcome: {confirmation.outcome.value} (evidence: {confirmation.evidence_type.value}, attributable: {confirmation.attributable_to_stay_request})")
+
+            http_status = confirmation.http_status
+            submission_confirmed = confirmation.is_confirmed()
 
             # 10. Фиксация результата в БД и логах
             return self.handle_submission_result(
@@ -1654,6 +1788,7 @@ class AutoSender:
                 message=message,
                 submission_confirmed=submission_confirmed,
                 http_status=http_status,
+                confirmation=confirmation,
                 after_screenshot=after_screenshot,
                 before_screenshot=before_screenshot,
                 error_screenshot=error_screenshot,
@@ -1686,6 +1821,7 @@ class AutoSender:
                         error_details=str(e),
                         proof_screenshot=str(error_screenshot),
                         notes=f"Exception: {e}",
+                        attempt_id=getattr(self, "_current_attempt_id", None),
                     )
                 except Exception as ex:
                     log_step("WARN", f"AutopilotEngine mark_as_uncertain error: {ex}")
@@ -1781,7 +1917,7 @@ class AutoSender:
 
         if not self.trip_id:
             from core.database import get_active_trip
-            active_trip = get_active_trip()
+            active_trip = get_active_trip(self.db_file)
             if not active_trip:
                 log_step("ERROR", "NO_ACTIVE_TRIP: Автопилот не может работать без активной поездки")
                 self.update_autopilot_status(
@@ -1793,7 +1929,7 @@ class AutoSender:
                 raise ValueError("NO_ACTIVE_TRIP")
             self.trip_id = active_trip.id
             from core.autopilot import AutopilotEngine
-            self.autopilot_engine = AutopilotEngine(trip_id=self.trip_id)
+            self.autopilot_engine = AutopilotEngine(trip_id=self.trip_id, db_file=self.db_file)
 
         # 1. Проверка суточного лимита
         sent_today = self.get_sent_today_count()
@@ -1826,6 +1962,20 @@ class AutoSender:
                 current_host=None,
                 seconds_remaining=0,
                 last_status="Нет одобренных хостов к отправке",
+            )
+            return
+
+        invalid_context = self.validate_dispatch_context(initial_candidates)
+        if invalid_context:
+            detail = " | ".join(invalid_context[:5])
+            log_step("ERROR", f"Отправка остановлена до запуска браузера: нет контекста поездки из core_trips. {detail}")
+            self.is_running = False
+            self.update_autopilot_status(
+                is_running=False,
+                is_paused=False,
+                current_host=None,
+                seconds_remaining=0,
+                last_status="ERROR: неполный контекст поездки в SQLite; отправка не запускалась",
             )
             return
 
@@ -1896,6 +2046,20 @@ class AutoSender:
                         current_host=None,
                         seconds_remaining=0,
                         last_status=f"Завершено. Отправлено сегодня: {self.get_sent_today_count()}/{self.daily_limit}",
+                    )
+                    break
+
+                invalid_context = self.validate_dispatch_context(active_candidates)
+                if invalid_context:
+                    detail = " | ".join(invalid_context[:5])
+                    log_step("ERROR", f"Автопилот остановлен: у кандидатов отсутствует контекст поездки из core_trips. {detail}")
+                    self.is_running = False
+                    self.update_autopilot_status(
+                        is_running=False,
+                        is_paused=False,
+                        current_host=None,
+                        seconds_remaining=0,
+                        last_status="ERROR: неполный контекст поездки в SQLite; отправка остановлена",
                     )
                     break
 
@@ -2015,7 +2179,7 @@ class AutoSender:
                         pause_type = "🎲 Human Jitter"
                         status_msg = f"Ожидание перед следующим запросом ({int(sleep_seconds)} сек)"
                         if res_is_error:
-                            log_step("SLEEP", f"@{username} НЕ отправлен (ошибка формы/сети, возвращён в очередь Queued). Пауза {int(sleep_seconds)} сек ({mins} мин {secs} сек) ({pause_type})...")
+                            log_step("SLEEP", f"Результат попытки для @{username} не подтверждён. Пауза {int(sleep_seconds)} сек ({mins} мин {secs} сек) ({pause_type}) перед следующей обработкой...")
                         else:
                             log_step("SLEEP", f"Ожидание {int(sleep_seconds)} сек ({mins} мин {secs} сек) ({pause_type}) до следующего запроса...")
                     else:
@@ -2136,10 +2300,9 @@ def acquire_singleton_lock() -> None:
     """
     Singleton диспетчера: одновременно работает строго ОДИН процесс auto_sender.
 
-    На Unix используем flock (атомарно, без гонки TOCTOU): если старый процесс держит
-    блокировку — мягко завершаем его и забираем блокировку себе. PID-файл нужен только
-    для диагностики и адресной остановки. Если взять блокировку не удалось — процесс
-    НЕ стартует (защита от двух параллельных циклов, ломающих таймер).
+    На Unix используем flock (атомарно, без гонки TOCTOU). Если другой sender уже
+    держит блокировку, новый экземпляр завершается и не трогает существующий процесс.
+    PID-файл нужен только для диагностики и адресной остановки.
     """
     import atexit
     import signal
@@ -2159,17 +2322,13 @@ def acquire_singleton_lock() -> None:
     if fcntl is not None:
         guard = open(guard_file, "a+")
         acquired = False
-        for _ in range(24):  # до ~6 секунд: даём старому процессу завершиться
+        for _ in range(24):  # до ~6 секунд: ждём возможное освобождение блокировки
             try:
                 fcntl.flock(guard.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 acquired = True
                 break
             except OSError:
-                old_pid = _read_lock_pid(lock_file)
-                if old_pid and old_pid != my_pid:
-                    _terminate_old_dispatcher(old_pid)
-                else:
-                    time.sleep(0.25)
+                time.sleep(0.25)
         if not acquired:
             try:
                 guard.close()
@@ -2180,9 +2339,15 @@ def acquire_singleton_lock() -> None:
             )
         _SINGLETON_LOCK_HANDLE = guard
     else:
-        # Windows/без fcntl: прежняя PID-проверка.
+        # Without flock, fail closed when a recorded sender PID is still alive.
         old_pid = _read_lock_pid(lock_file)
-        _terminate_old_dispatcher(old_pid)
+        if old_pid and old_pid != my_pid:
+            try:
+                os.kill(old_pid, 0)
+            except OSError:
+                pass
+            else:
+                raise RuntimeError("Another auto_sender process is already running.")
 
     lock_file.write_text(str(my_pid))
 

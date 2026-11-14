@@ -15,30 +15,31 @@ from pathlib import Path
 from auto_sender import AutoSender
 from core.autopilot import AutopilotEngine
 from core.database import get_connection, init_core_tables
+from core.dispatch_confirmation import (
+    ConfirmationCapability,
+    ConfirmationResult,
+    DispatchOutcome,
+    EvidenceType,
+    get_confirmation_validator,
+)
+from core.dispatch_identity import register_host_identity, reserve_host_for_dispatch
 from core.models import HostState
 
 TEST_TRIP_ID = "test_defect_trip_sapporo"
 
 
 class TestConsolidationDefectFixes(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.temp_dir = tempfile.TemporaryDirectory()
-        cls.db_path = Path(cls.temp_dir.name) / "test_defects.db"
-        init_core_tables(cls.db_path)
-
-        with get_connection(cls.db_path) as conn:
+    def setUp(self):
+        from unittest.mock import patch
+        self.temp_dir = tempfile.TemporaryDirectory(prefix="cs-consolidation-defects-test-")
+        self.db_path = Path(self.temp_dir.name) / "test_defects.db"
+        init_core_tables(self.db_path)
+        with get_connection(self.db_path) as conn:
             conn.execute("""
                 INSERT INTO core_trips (id, country, city, arrival_date, departure_date, url, is_active, created_at, updated_at)
                 VALUES (?, 'Japan', 'Sapporo', '2026-12-01', '2026-12-05', 'https://cs.com/trips/defects', 1, '2026-11-11', '2026-11-11');
             """, (TEST_TRIP_ID,))
 
-    @classmethod
-    def tearDownClass(cls):
-        cls.temp_dir.cleanup()
-
-    def setUp(self):
-        from unittest.mock import patch
         self.patcher_log_step = patch("auto_sender.log_step")
         self.mock_log_step = self.patcher_log_step.start()
 
@@ -56,26 +57,47 @@ class TestConsolidationDefectFixes(unittest.TestCase):
     def tearDown(self):
         if hasattr(self, "patcher_log_step"):
             self.patcher_log_step.stop()
+        if hasattr(self, "temp_dir"):
+            self.temp_dir.cleanup()
+
+    def _reserve_daiki_attempt(self):
+        register_host_identity("username", "daiki_tester", "un:daiki_tester", db_file=self.db_path)
+        return reserve_host_for_dispatch("username", "daiki_tester", TEST_TRIP_ID, db_file=self.db_path)
 
     # 1. ТЕСТ: Конструктор AutoSender с trip_id и без него
     def test_autosender_init_with_and_without_trip_id(self):
         # А) Инициализация с явно переданным trip_id
-        sender_custom = AutoSender(trip_id="custom_trip_manual", test_mode=True)
+        sender_custom = AutoSender(trip_id="custom_trip_manual", test_mode=True, db_file=self.db_path)
         self.assertEqual(sender_custom.trip_id, "custom_trip_manual")
         self.assertIsNotNone(sender_custom.autopilot_engine)
         self.assertEqual(sender_custom.autopilot_engine.trip_id, "custom_trip_manual")
 
         # Б) Инициализация без trip_id (разрешается через get_active_trip)
-        sender_auto = AutoSender(trip_id=None, test_mode=True)
+        sender_auto = AutoSender(trip_id=None, test_mode=True, db_file=self.db_path)
         # Должен подхватить активную поездку из базы данных без AttributeError
         self.assertTrue(hasattr(sender_auto, "trip_id"))
 
     # 2. ТЕСТ: Атомарность и идемпотентность mark_as_sent
     def test_mark_as_sent_atomic_and_idempotent(self):
         engine = AutopilotEngine(trip_id=TEST_TRIP_ID, db_file=self.db_path)
+        validator = get_confirmation_validator(db_file=self.db_path)
+        reservation = self._reserve_daiki_attempt()
+
+        # Создаём capability для теста
+        capability = validator.issue_capability(
+            attempt_id=reservation["attempt_id"],
+            canonical_host_key=reservation["canonical_key"],
+        )
+        self.assertIsNotNone(capability)
 
         # Первая фиксация отправки
-        success = engine.mark_as_sent("daiki_tester", http_status=200, notes="Verified in test")
+        success = engine.mark_as_sent(
+            "daiki_tester",
+            http_status=200,
+            capability=capability,
+            notes="Verified in test",
+            attempt_id=reservation["attempt_id"],
+        )
         self.assertTrue(success)
 
         with get_connection(self.db_path) as conn:
@@ -94,9 +116,15 @@ class TestConsolidationDefectFixes(unittest.TestCase):
             cur.execute("SELECT COUNT(*) FROM core_audit_logs WHERE host_id = 'h_defect_1' AND event = 'REQUEST_SENT_VERIFIED';")
             self.assertEqual(cur.fetchone()[0], 1)
 
-        # Повторная фиксация (идемпотентность): должна вернуть True и не дублировать записи
-        success_repeat = engine.mark_as_sent("daiki_tester", http_status=200, notes="Repeated dispatch")
-        self.assertTrue(success_repeat)
+        # A one-use capability cannot be replayed; replay must not duplicate history.
+        success_repeat = engine.mark_as_sent(
+            "daiki_tester",
+            http_status=200,
+            capability=capability,
+            notes="Repeated dispatch",
+            attempt_id=reservation["attempt_id"],
+        )
+        self.assertFalse(success_repeat)
 
         with get_connection(self.db_path) as conn:
             cur = conn.cursor()
@@ -129,9 +157,22 @@ class TestConsolidationDefectFixes(unittest.TestCase):
     # 4. ТЕСТ: Необратимость статуса sent (защита от понижения в uncertain / skipped)
     def test_sent_status_cannot_be_downgraded_by_error_or_queue_update(self):
         engine = AutopilotEngine(trip_id=TEST_TRIP_ID, db_file=self.db_path)
+        validator = get_confirmation_validator(db_file=self.db_path)
+        reservation = self._reserve_daiki_attempt()
+
+        # Создаём capability для теста
+        capability = validator.issue_capability(
+            attempt_id=reservation["attempt_id"],
+            canonical_host_key=reservation["canonical_key"],
+        )
 
         # Фиксируем успешную отправку
-        self.assertTrue(engine.mark_as_sent("daiki_tester", http_status=200))
+        self.assertTrue(engine.mark_as_sent(
+            "daiki_tester",
+            http_status=200,
+            capability=capability,
+            attempt_id=reservation["attempt_id"],
+        ))
 
         # Попытка пометить как uncertain через AutopilotEngine
         res_uncertain = engine.mark_as_uncertain("daiki_tester", error_details="Late network error")
@@ -143,7 +184,7 @@ class TestConsolidationDefectFixes(unittest.TestCase):
 
         # Попытка обновления через AutoSender.update_queue_status()
         from unittest.mock import patch
-        sender = AutoSender(trip_id=TEST_TRIP_ID, test_mode=True)
+        sender = AutoSender(trip_id=TEST_TRIP_ID, test_mode=True, db_file=self.db_path)
         with patch("database.db_session", side_effect=lambda: get_connection(self.db_path)):
             sender.update_queue_status("daiki_tester", "Uncertain", notes="Simulated timeout")
             sender.update_queue_status("daiki_tester", "Skipped", notes="User skip")
@@ -157,9 +198,24 @@ class TestConsolidationDefectFixes(unittest.TestCase):
     # 5. ТЕСТ: Подтверждённая отправка: сбой mark_as_sent() переводит в UNCERTAIN и не ставит Sent
     def test_handle_submission_result_mark_as_sent_failure_transitions_to_uncertain(self):
         from unittest.mock import MagicMock, patch
-        sender = AutoSender(trip_id=TEST_TRIP_ID, test_mode=True)
+        sender = AutoSender(trip_id=TEST_TRIP_ID, test_mode=True, db_file=self.db_path)
         sender.autopilot_engine = MagicMock()
         sender.autopilot_engine.mark_as_sent.return_value = False  # Сбой фиксации!
+
+        validator = get_confirmation_validator(db_file=self.db_path)
+        capability = validator.issue_capability(
+            attempt_id="test_attempt_failure",
+            canonical_host_key="un:daiki_tester",
+        )
+
+        confirmation = ConfirmationResult(
+            outcome=DispatchOutcome.CONFIRMED_SENT,
+            capability=capability,
+            evidence_type=EvidenceType.CONFIRMED_ACCEPTANCE,
+            reason="Test confirmed acceptance",
+            attributable_to_stay_request=True,
+            http_status=200,
+        )
 
         with patch.object(sender, "update_queue_status") as mock_update_queue, \
              patch.object(sender, "append_sent_log") as mock_append_log:
@@ -173,6 +229,7 @@ class TestConsolidationDefectFixes(unittest.TestCase):
                 message="Hello Daiki",
                 submission_confirmed=True,
                 http_status=200,
+                confirmation=confirmation,
             )
 
             # 1. Результат отправки не должен считаться успешным
@@ -183,7 +240,7 @@ class TestConsolidationDefectFixes(unittest.TestCase):
             self.assertEqual(len(sent_calls), 0)
 
             # 3. Фиксация в UNCERTAIN во избежание дублирования отправки
-            sender.autopilot_engine.mark_as_uncertain.assert_called_once()
+            sender.autopilot_engine.mark_as_unknown.assert_called_once()
             mock_update_queue.assert_called_with("daiki_tester", "Uncertain", notes=mock_update_queue.call_args[1].get("notes") or mock_update_queue.call_args[0][2], increment_attempts=True, sync_db=False)
             mock_append_log.assert_called_once()
             self.assertEqual(mock_append_log.call_args[0][0]["status"], "UNCERTAIN")
@@ -191,8 +248,23 @@ class TestConsolidationDefectFixes(unittest.TestCase):
     # 6. ТЕСТ: Отсутствие AutopilotEngine не позволяет зафиксировать Sent и переводит в UNCERTAIN
     def test_handle_submission_result_missing_autopilot_engine(self):
         from unittest.mock import patch
-        sender = AutoSender(trip_id=TEST_TRIP_ID, test_mode=True)
+        sender = AutoSender(trip_id=TEST_TRIP_ID, test_mode=True, db_file=self.db_path)
         sender.autopilot_engine = None  # Движок отсутствует!
+
+        validator = get_confirmation_validator(db_file=self.db_path)
+        capability = validator.issue_capability(
+            attempt_id="test_attempt_no_engine",
+            canonical_host_key="un:daiki_tester",
+        )
+
+        confirmation = ConfirmationResult(
+            outcome=DispatchOutcome.CONFIRMED_SENT,
+            capability=capability,
+            evidence_type=EvidenceType.CONFIRMED_ACCEPTANCE,
+            reason="Test confirmed acceptance",
+            attributable_to_stay_request=True,
+            http_status=200,
+        )
 
         with patch.object(sender, "update_queue_status") as mock_update_queue, \
              patch.object(sender, "append_sent_log") as mock_append_log:
@@ -206,6 +278,7 @@ class TestConsolidationDefectFixes(unittest.TestCase):
                 message="Hello Daiki",
                 submission_confirmed=True,
                 http_status=200,
+                confirmation=confirmation,
             )
 
             self.assertFalse(result)
@@ -221,9 +294,24 @@ class TestConsolidationDefectFixes(unittest.TestCase):
     # 7. ТЕСТ: Успешная фиксация обновляет JSON-очередь с sync_db=False
     def test_handle_submission_result_success_updates_queue_with_sync_db_false(self):
         from unittest.mock import MagicMock, patch
-        sender = AutoSender(trip_id=TEST_TRIP_ID, test_mode=True)
+        sender = AutoSender(trip_id=TEST_TRIP_ID, test_mode=True, db_file=self.db_path)
         sender.autopilot_engine = MagicMock()
         sender.autopilot_engine.mark_as_sent.return_value = True  # Успешная фиксация
+
+        validator = get_confirmation_validator(db_file=self.db_path)
+        capability = validator.issue_capability(
+            attempt_id="test_attempt_success",
+            canonical_host_key="un:daiki_tester",
+        )
+
+        confirmation = ConfirmationResult(
+            outcome=DispatchOutcome.CONFIRMED_SENT,
+            capability=capability,
+            evidence_type=EvidenceType.CONFIRMED_ACCEPTANCE,
+            reason="Test confirmed acceptance",
+            attributable_to_stay_request=True,
+            http_status=200,
+        )
 
         with patch.object(sender, "update_queue_status") as mock_update_queue, \
              patch.object(sender, "append_sent_log") as mock_append_log:
@@ -237,6 +325,7 @@ class TestConsolidationDefectFixes(unittest.TestCase):
                 message="Hello Daiki",
                 submission_confirmed=True,
                 http_status=200,
+                confirmation=confirmation,
             )
 
             self.assertTrue(result)
@@ -252,11 +341,15 @@ class TestConsolidationDefectFixes(unittest.TestCase):
         from fastapi.testclient import TestClient
         from app import app
         from core.models import Trip
+        from core.repositories.host_queue_repository import HostQueueRepository
+        from app import queue_manager
 
-        client = TestClient(app)
+        from app import create_app
+        client = TestClient(create_app(self.db_path))
         mock_trip = Trip(id=TEST_TRIP_ID, url="", city="Sapporo", country="Japan", arrival_date="2026-12-01", departure_date="2026-12-05")
 
-        with patch("app.db_session", side_effect=lambda: get_connection(self.db_path)), \
+        with client, patch.object(queue_manager, "host_repository", HostQueueRepository(self.db_path)), \
+             patch("app.db_session", side_effect=lambda: get_connection(self.db_path)), \
              patch("database.db_session", side_effect=lambda: get_connection(self.db_path)), \
              patch("core.queue.db_session", side_effect=lambda: get_connection(self.db_path)), \
              patch("core.database.get_active_trip", return_value=mock_trip):
@@ -282,7 +375,8 @@ class TestConsolidationDefectFixes(unittest.TestCase):
         from app import app
         from core.models import Trip
 
-        client = TestClient(app)
+        from app import create_app
+        client = TestClient(create_app(self.db_path))
         mock_trip = Trip(id=TEST_TRIP_ID, url="", city="Sapporo", country="Japan", arrival_date="2026-12-01", departure_date="2026-12-05")
 
         with get_connection(self.db_path) as conn:
@@ -312,7 +406,7 @@ class TestConsolidationDefectFixes(unittest.TestCase):
                 VALUES ('confirmed_host_3', 'confirmed_user', 'SENT_SUCCESS', 200, 'live', 'Sent verified', '2026-11-10 15:00:00');
             """)
 
-        with patch("app.db_session", side_effect=lambda: get_connection(self.db_path)), \
+        with client, patch("app.db_session", side_effect=lambda: get_connection(self.db_path)), \
              patch("database.db_session", side_effect=lambda: get_connection(self.db_path)), \
              patch("core.queue.db_session", side_effect=lambda: get_connection(self.db_path)), \
              patch("core.database.get_active_trip", return_value=mock_trip):
@@ -359,7 +453,7 @@ class TestConsolidationDefectFixes(unittest.TestCase):
         import asyncio
         from process_manager import ProcessManager
 
-        pm = ProcessManager()
+        pm = ProcessManager(db_file=self.db_path)
         pm.logs_buffer = ["Log entry from Autopilot 1", "Log entry from Autopilot 2"]
 
         # Запуск задачи через pm.start_job не должен стирать предыдущие логи

@@ -23,7 +23,7 @@ import sys
 import time
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote
 
 import pandas as pd
@@ -34,6 +34,8 @@ from social_extractor import extract_instagram
 from data_cleaner import sanitize_host_name, sanitize_host_clean_name, sanitize_host_location
 from hosting_guard import get_hosting_guard
 from database import get_sent_usernames
+from core.host_activity import RECENT, activity_evidence, parse_activity
+from core.host_policy import evaluate_hosting_exclusion
 
 if sys.platform == "win32":
     try:
@@ -400,6 +402,7 @@ class CouchsurfingScraper:
         self.departure_date = departure_date
         self.trip_id = trip_id
         self.collected_hosts: Dict[str, Dict[str, Any]] = {}
+        self._profile_enriched_usernames: Set[str] = set()
         self.gender_classifier = get_gender_classifier()
         self.hosting_guard = get_hosting_guard()
 
@@ -792,16 +795,22 @@ class CouchsurfingScraper:
             or 0
         )
 
-        is_active = item.get("isRecentlyActive")
-        if is_active is None:
-            is_active = True
-        last_login_raw = "Recently Active" if is_active else "Active recently"
+        activity = activity_evidence(
+            is_recently_active=item.get("isRecentlyActive"),
+            raw_value=item.get("lastLogin") or item.get("last_login") or item.get("lastActive") or item.get("last_active"),
+            checked_at=datetime.now().isoformat(),
+            source="couchsurfing_api" if any(k in item for k in ("isRecentlyActive", "lastLogin", "last_login", "lastActive", "last_active")) else "search_card",
+        ).as_dict()
+        last_login_raw = activity["raw"]
+        references = item.get("references") or item.get("reviews") or []
 
         # Кэш классификации пола на уровне текущей поисковой сессии
         if u_key in self._session_gender_cache:
             est_gender, host_type, gender_reason = self._session_gender_cache[u_key]
         else:
-            est_gender, host_type, gender_reason = self.gender_classifier.classify(name, about_me, username)
+            est_gender, host_type, gender_reason = self.gender_classifier.classify(
+                name, about_me, username, references=references
+            )
             self._session_gender_cache[u_key] = (est_gender, host_type, gender_reason)
             print(f"[GENDER] '{name}' -> {est_gender.lower()} ({gender_reason})")
 
@@ -815,13 +824,19 @@ class CouchsurfingScraper:
                 matched_text, _ = guard_hit
                 print(f"[GUARD] Отсеян {username} ({name}): '{matched_text}'")
 
-        if guard_hit:
-            self._rejected_usernames.add(u_key)
-            return
-
         if self.no_couples and host_type == "couple":
             self._rejected_usernames.add(u_key)
             return
+
+        from core.host_policy import evaluate_host_eligibility
+        eligibility = evaluate_host_eligibility(
+            item,
+            arrival_date=self.arrival_date,
+            departure_date=self.departure_date,
+            guest_gender="male",
+            target_city=self.city,
+        )
+        exclusion = eligibility.get("reason") or ((guard_hit[0]) if guard_hit else None)
 
         insta_url, insta_handle = extract_instagram(about_me)
 
@@ -875,7 +890,14 @@ class CouchsurfingScraper:
         residence_country = dom.get("country") if isinstance(dom, dict) else None
 
         # 7. Verified статус
-        is_verified = bool(item.get("isIdentificationVerified"))
+        verify_raw = item.get("isIdentificationVerified")
+        is_verified = verify_raw is True or str(verify_raw).strip().lower() in {"true", "1", "yes", "verified"}
+        if verify_raw is None:
+            verification_status = "UNKNOWN"
+        elif is_verified:
+            verification_status = "VERIFIED"
+        else:
+            verification_status = "NOT_VERIFIED"
 
         # 8. Возраст
         host_age = item.get("age")
@@ -932,13 +954,26 @@ class CouchsurfingScraper:
             "response_rate_pct": float(item.get("responseRate") or 90.0),
             "response_rate_raw": "High",
             "response_time": item.get("responseTime") or "within a few hours",
-            "last_login_days": 1 if is_active else 3,
+            "last_login_days": activity["days"],
             "last_login_raw": last_login_raw,
+            "recently_active_status": activity["status"],
+            "last_active_at": activity["at"],
+            "isRecentlyActive": item.get("isRecentlyActive"),
+            "activity_checked_at": activity["checked_at"],
+            "activity_source": activity["source"],
+            "is_recently_active": activity["status"] == RECENT,
             "references_count": int(refs),
-            "about_me": " ".join(about_me.split())[:1500],
+            "about_me": " ".join(about_me.split()),
+            "references": references,
+            "badges": item.get("badges") or item.get("achievements") or [],
+            "shared_information": item.get("sharedInformation") or item.get("shared_information"),
+            "why_on_couchsurfing": item.get("whyOnCouchsurfing") or item.get("why_on_couchsurfing") or item.get("why_i_am_on_couchsurfing"),
+            "personal_description": item.get("personalDescription") or item.get("personal_description"),
+            "profile_api_data": item,
             "profile_url": f"https://www.couchsurfing.com/c/users/{username}",
             "avatar_url": item.get("avatarUrl") or (item.get("avatarImage", {}).get("medium", {}).get("url") if isinstance(item.get("avatarImage"), dict) else None),
             "is_verified": is_verified,
+            "verification_status": verification_status,
             "birth_country": birth_country,
             "residence_country": residence_country,
             "languages": parsed_langs,
@@ -946,6 +981,8 @@ class CouchsurfingScraper:
             "countries_visited": visited_countries,
             "countries_lived": lived_countries,
             "is_hosting": is_hosting,
+            "eligibility_reason": exclusion,
+            "eligibility_evidence": {"source": "api_profile", "excerpt": (eligibility.get("excerpt") or exclusion or "")[:220]} if exclusion else None,
             "household": household,
             "special_notes": "; ".join(notes) if notes else None,
             "target_city": self.city,
@@ -953,6 +990,11 @@ class CouchsurfingScraper:
             "departure_date": self.departure_date,
             "source": "network_api",
         }
+        from core.collector import calculate_match_score
+        score, reasons = calculate_match_score(self.collected_hosts[username])
+        self.collected_hosts[username]["score_stars"] = score
+        self.collected_hosts[username]["score_reasons"] = reasons
+        self.collected_hosts[username]["priority"] = 1000 if activity["status"] == RECENT else 10
 
     def _handle_search_response(self, response) -> None:
         """
@@ -1087,6 +1129,7 @@ class CouchsurfingScraper:
                     continue
 
                 parent_text = ""
+                card_badges: List[str] = []
                 # Пробуем несколько стратегий поиска контейнера карточки
                 card_strategies = [
                     "el => el.closest('[class*=card], [data-testid], article, li, div[class*=\"host\"], div[class*=\"user\"], div[class*=\"profile\"]')",
@@ -1102,6 +1145,13 @@ class CouchsurfingScraper:
                                 t = el.inner_text()
                                 if t and len(t.strip()) > len(parent_text.strip()):
                                     parent_text = t
+                                    try:
+                                        card_badges = el.evaluate("""root => [...root.querySelectorAll('[data-testid*=badge], [class*=badge], [class*=verified], [aria-label*=verified]')]
+                                            .map(n => [n.innerText, n.getAttribute('aria-label'), n.getAttribute('title')]
+                                                .filter(Boolean).join(' ').trim())
+                                            .filter(Boolean)""") or []
+                                    except Exception:
+                                        card_badges = []
                     except Exception:
                         continue
 
@@ -1135,11 +1185,18 @@ class CouchsurfingScraper:
                 raw_loc = loc_match.group(1).strip() if loc_match else self.city
                 location = sanitize_host_location(raw_loc, self.city)
 
-                # Проверка активности — ищем маркеры активности в любом месте текста
-                is_recently_active = any("Recently Active" in l or "Active" in l for l in lines) or any(
-                    k in parent_text.lower() for k in ("recently active", "active recently", "active")
-                )
-                last_login_raw = "Recently Active" if is_recently_active else "Active recently"
+                # Не считаем любое слово "Active" признаком недавней активности.
+                activity = activity_evidence(
+                    raw_value=parent_text,
+                    checked_at=datetime.now().isoformat(),
+                    source="dom_search_card",
+                ).as_dict()
+                last_login_raw = activity["raw"]
+                verification_status = "UNKNOWN"
+                if re.search(r"\bnot\s+verified\b|не\s+верифицирован", parent_text, re.I):
+                    verification_status = "NOT_VERIFIED"
+                elif re.search(r"\bverified\b|верифицирован", parent_text, re.I):
+                    verification_status = "VERIFIED"
 
                 # Кэш классификации пола на уровне текущей поисковой сессии
                 if u_key in self._session_gender_cache:
@@ -1159,9 +1216,15 @@ class CouchsurfingScraper:
                         matched_text, _ = guard_hit
                         print(f"[GUARD] Отсеян {username} ({name}): '{matched_text}'")
 
-                if guard_hit:
-                    self._rejected_usernames.add(u_key)
-                    continue
+                from core.host_policy import evaluate_host_eligibility
+                eligibility = evaluate_host_eligibility(
+                    {"profile_card_text": parent_text},
+                    arrival_date=self.arrival_date,
+                    departure_date=self.departure_date,
+                    guest_gender="male",
+                    target_city=self.city,
+                )
+                exclusion = eligibility.get("reason") or ((guard_hit[0]) if guard_hit else None)
 
                 if self.no_couples and host_type == "couple":
                     self._rejected_usernames.add(u_key)
@@ -1184,16 +1247,32 @@ class CouchsurfingScraper:
                     "response_rate_pct": 90.0,
                     "response_rate_raw": "High",
                     "response_time": "within a few hours",
-                    "last_login_days": 1 if is_recently_active else 3,
+                    "last_login_days": activity["days"],
                     "last_login_raw": last_login_raw,
+                    "recently_active_status": activity["status"],
+                    "is_recently_active": activity["status"] == RECENT,
+                    "last_active_at": activity["at"],
+                    "activity_checked_at": activity["checked_at"],
+                    "activity_source": activity["source"],
+                    "verification_status": verification_status,
+                    "is_verified": verification_status == "VERIFIED",
                     "references_count": references_count,
-                    "about_me": " ".join(about_me.split())[:1500],
+                    "about_me": " ".join(about_me.split()),
+                    "profile_card_text": parent_text,
+                    "badges": card_badges,
                     "profile_url": f"https://www.couchsurfing.com/c/users/{username}",
                     "target_city": self.city,
                     "arrival_date": self.arrival_date,
                     "departure_date": self.departure_date,
                     "source": "dom_search_card",
+                    "eligibility_reason": exclusion,
+                    "eligibility_evidence": {"source": "profile_card", "excerpt": (eligibility.get("excerpt") or exclusion or "")[:220]} if exclusion else None,
                 }
+                from core.collector import calculate_match_score
+                score, reasons = calculate_match_score(self.collected_hosts[username])
+                self.collected_hosts[username]["score_stars"] = score
+                self.collected_hosts[username]["score_reasons"] = reasons
+                self.collected_hosts[username]["priority"] = 1000 if activity["status"] == RECENT else 10
             except Exception:
                 pass
 
@@ -1482,7 +1561,7 @@ class CouchsurfingScraper:
                 self._extract_cards_from_page(page)
                 print(f"[*] Шаг #{page_idx}/{self.max_scroll_pages} | Найдено хостов (API + DOM): {len(self.collected_hosts)}")
                 # Сохраняем live-промежуток для отображения в UI в реальном времени
-                self._save_live_hosts()
+                self._save_live_hosts(page, context)
 
                 if page_idx == self.max_scroll_pages:
                     break
@@ -1529,7 +1608,7 @@ class CouchsurfingScraper:
 
         return self._filter_and_save()
 
-    def _save_live_hosts(self) -> None:
+    def _save_live_hosts(self, search_page=None, browser_context=None) -> None:
         """Сохраняет текущих собранных хостов в live-файл и SQLite в реальном времени."""
         try:
             OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1540,12 +1619,12 @@ class CouchsurfingScraper:
                 json.dump(all_hosts, f, ensure_ascii=False, indent=2)
 
             # Сохранение в SQLite по мере обнаружения
-            self._upsert_hosts_to_db(all_hosts)
+            self._upsert_hosts_to_db(all_hosts, browser_context=browser_context)
         except Exception as e:
             print(f"[!] Не удалось сохранить live-хосты: {e}")
             raise
 
-    def _upsert_hosts_to_db(self, hosts_to_save: List[Dict[str, Any]]) -> None:
+    def _upsert_hosts_to_db(self, hosts_to_save: List[Dict[str, Any]], browser_context=None) -> None:
         """Атомарное сохранение списка хостов в SQLite hosts, profile_analyses и trip_hosts."""
         if not hosts_to_save:
             return
@@ -1573,11 +1652,264 @@ class CouchsurfingScraper:
             if target_trip:
                 collector = CollectorEngine(trip_id=target_trip)
                 collector.ingest_batch(hosts_to_save)
+
+                # Persist structured profile evidence (verification, activity,
+                # badges, sections, references, gender clues) from the captured
+                # profile API payload. Missing fields remain UNKNOWN/NOT_PRESENT.
+                from core.profile_intelligence import ProfileIntelligenceEngine
+                intelligence = ProfileIntelligenceEngine()
+                for host in hosts_to_save:
+                    username = str(host.get("username") or "")
+                    if username.lower() in self._profile_enriched_usernames:
+                        continue
+                    api_data = host.get("profile_api_data")
+                    api_data = dict(api_data) if isinstance(api_data, dict) else {}
+                    api_data.setdefault("aboutMe", host.get("about_me") or "")
+                    api_data.setdefault("badges", host.get("badges") or [])
+                    api_data.setdefault("totalReferencesCount", host.get("references_count") or 0)
+                    if host.get("recently_active_status") in {"RECENTLY_ACTIVE", "NOT_RECENTLY_ACTIVE"}:
+                        api_data.setdefault("isRecentlyActive", host["recently_active_status"] == "RECENTLY_ACTIVE")
+                    if host.get("verification_status") in {"VERIFIED", "NOT_VERIFIED"}:
+                        api_data.setdefault("isIdentificationVerified", host["verification_status"] == "VERIFIED")
+
+                    html_content = None
+                    profile_page = None
+                    page_status = "NOT_ATTEMPTED"
+                    if browser_context is not None:
+                        profile_page, html_content, api_data, page_status = self._open_and_collect_profile(
+                            browser_context, host, api_data,
+                        )
+                    try:
+                        collected_profile = intelligence.collect_host_profile(
+                            host_id=str(host.get("id") or host.get("username")),
+                            username=username,
+                            profile_url=host.get("profile_url"),
+                            html_content=html_content,
+                            page=profile_page,
+                            api_data=api_data,
+                            profile_page_status=page_status,
+                        )
+                        self._apply_profile_collection(host, api_data, collected_profile)
+                        self._persist_enriched_host_snapshot(target_trip, host)
+                        self._profile_enriched_usernames.add(username.lower())
+                    except Exception as profile_error:
+                        print(f"[!] Profile evidence not fully collected for @{host.get('username')}: {profile_error}")
+                    finally:
+                        if profile_page is not None:
+                            try:
+                                profile_page.close()
+                            except Exception:
+                                pass
         except Exception as e:
-            print(f"[!] Предупреждение DDD: не удалось сохранить в core_hosts: {e}")
-        except Exception as e:
-            print(f"[!] Ошибка сохранения хостов в SQLite: {e}")
+            print(f"[!] Ошибка сохранения профилей в SQLite: {e}")
             raise
+
+    def _open_and_collect_profile(self, browser_context, host, api_data):
+        """Open each discovered host in an isolated tab and collect all rendered/API evidence."""
+        profile_page = browser_context.new_page()
+        payloads = []
+
+        def capture_response(response):
+            try:
+                if response.status < 400 and any(word in response.url.lower() for word in ("profile", "user", "reference", "badge", "graphql", "api")):
+                    payloads.append(response.json())
+            except Exception:
+                pass
+
+        profile_page.on("response", capture_response)
+        url = host.get("profile_url") or f"https://www.couchsurfing.com/c/users/{host.get('username')}"
+        try:
+            response = profile_page.goto(url, timeout=30000, wait_until="domcontentloaded")
+            profile_page.wait_for_timeout(900)
+            if "/users/sign_in" in (profile_page.url or "") or "/login" in (profile_page.url or ""):
+                return profile_page, None, self._merge_profile_payloads(api_data, payloads, host.get("username")), "FAILED"
+
+            html_pages = [profile_page.content()]
+            profile_references = self._extract_profile_reference_cards(profile_page)
+            # References are paginated on some profile layouts. Continue until
+            # no next/load-more control exists or advancing no longer changes content.
+            next_selectors = (
+                'a[rel="next"]', 'button[aria-label*="next" i]',
+                'a[aria-label*="next" i]', 'button:has-text("More references")',
+                'button:has-text("Show more")', 'button:has-text("Load more")',
+            )
+            for _ in range(200):
+                next_control = None
+                for selector in next_selectors:
+                    try:
+                        candidate = profile_page.locator(selector).first
+                        if candidate.count() and candidate.is_visible() and candidate.is_enabled():
+                            next_control = candidate
+                            break
+                    except Exception:
+                        continue
+                if next_control is None:
+                    break
+                before = profile_page.locator("body").inner_text()
+                try:
+                    next_control.click(timeout=2500)
+                    profile_page.wait_for_timeout(450)
+                    after = profile_page.locator("body").inner_text()
+                    if after == before:
+                        break
+                    html_pages.append(profile_page.content())
+                    profile_references.extend(self._extract_profile_reference_cards(profile_page))
+                except Exception:
+                    break
+
+            merged_api = self._merge_profile_payloads(api_data, payloads, host.get("username"))
+            if profile_references:
+                refs = list(merged_api.get("references") or [])
+                seen = {str(r.get("text") or r.get("body") or "").strip() for r in refs if isinstance(r, dict)}
+                for reference in profile_references:
+                    if reference["text"] not in seen:
+                        refs.append({**reference, "_collection_source": "profile_dom"})
+                        seen.add(reference["text"])
+                merged_api["references"] = refs
+            return profile_page, "\n".join(html_pages), merged_api, "SUCCESS" if response is None or response.status < 400 else "FAILED"
+        except Exception as exc:
+            print(f"[PROFILE] Не удалось открыть профиль @{host.get('username')}: {exc}")
+            return profile_page, None, self._merge_profile_payloads(api_data, payloads, host.get("username")), "FAILED"
+
+    @staticmethod
+    def _extract_profile_reference_cards(page):
+        references = []
+        seen = set()
+        selectors = (
+            '[data-testid*="reference"]', '[class*="reference-card"]',
+            '[class*="reference"]', '[data-testid*="review"]', '[class*="review-card"]',
+        )
+        for selector in selectors:
+            try:
+                elements = page.locator(selector).all()
+            except Exception:
+                continue
+            for element in elements:
+                try:
+                    text = " ".join((element.inner_text() or "").split())
+                    if len(text) < 20 or text in seen:
+                        continue
+                    seen.add(text)
+                    link = element.locator('a[href*="/c/users/"],a[href*="/people/"]').first
+                    author_url = link.get_attribute("href") if link.count() else None
+                    author = None
+                    if author_url:
+                        match = re.search(r"/(?:c/users|people)/([^/?#]+)", author_url)
+                        author = match.group(1) if match else None
+                    date_value = element.locator("time").first.get_attribute("datetime") if element.locator("time").count() else None
+                    references.append({
+                        "text": text[:4000], "author": author,
+                        "authorProfileUrl": author_url, "date": date_value,
+                        "type": None, "direction": None,
+                    })
+                except Exception:
+                    continue
+        return references
+
+    @staticmethod
+    def _merge_profile_payloads(base, payloads, username):
+        merged = dict(base or {})
+        profile_keys = {
+            "aboutMe", "about_me", "about", "personalDescription", "personal_description",
+            "sharedInformation", "shared_information", "whyOnCouchsurfing", "why_on_couchsurfing",
+            "houseRules", "house_rules", "myHome", "badges", "achievements", "references", "reviews",
+            "isIdentificationVerified", "isRecentlyActive", "lastLogin", "totalReferencesCount",
+            "languages", "interests", "education", "occupation", "livingSituation", "additionalInformation",
+        }
+        references = list(merged.get("references") or merged.get("reviews") or [])
+        badges = list(merged.get("badges") or merged.get("achievements") or [])
+        seen_refs = {str(r.get("id") or r.get("referenceId")) for r in references if isinstance(r, dict)}
+        seen_badges = {json.dumps(b, sort_keys=True, ensure_ascii=False) for b in badges}
+
+        def visit(value):
+            if isinstance(value, dict):
+                identity = value.get("handle") or value.get("username") or value.get("slug")
+                matches = identity is None or str(identity).casefold() == str(username or "").casefold()
+                if matches:
+                    for key in profile_keys:
+                        if key in value and value[key] not in (None, "", [], {}):
+                            if key in ("references", "reviews") and isinstance(value[key], list):
+                                for ref in value[key]:
+                                    if isinstance(ref, dict):
+                                        ref_key = str(ref.get("id") or ref.get("referenceId") or json.dumps(ref, sort_keys=True, ensure_ascii=False))
+                                        if ref_key not in seen_refs:
+                                            references.append(ref)
+                                            seen_refs.add(ref_key)
+                            elif key in ("badges", "achievements") and isinstance(value[key], list):
+                                for badge in value[key]:
+                                    badge_key = json.dumps(badge, sort_keys=True, ensure_ascii=False)
+                                    if badge_key not in seen_badges:
+                                        badges.append(badge)
+                                        seen_badges.add(badge_key)
+                            else:
+                                merged[key] = value[key]
+                for child in value.values():
+                    visit(child)
+            elif isinstance(value, list):
+                for child in value:
+                    visit(child)
+
+        for payload in payloads:
+            visit(payload)
+        if references:
+            merged["references"] = references
+        if badges:
+            merged["badges"] = badges
+        return merged
+
+    @staticmethod
+    def _apply_profile_collection(host, api_data, result):
+        host["profile_api_data"] = api_data
+        sections = result.get("sections", {})
+        profile_sections = sections.get("profile_sections", {}).get("sections", {})
+        for key in ("about", "house_rules", "personal_description", "shared_information", "why_on_couchsurfing", "additional_information"):
+            item = profile_sections.get(key) or sections.get(key) or {}
+            text = item.get("section_text")
+            if text:
+                host[key] = text
+        host["shared_information"] = (sections.get("shared_information", {}).get("section_text")
+                                      or host.get("shared_information"))
+        host["why_on_couchsurfing"] = (sections.get("why_on_couchsurfing", {}).get("section_text")
+                                       or host.get("why_on_couchsurfing"))
+        host["references"] = api_data.get("references") or api_data.get("reviews") or host.get("references") or []
+        host["badges"] = sections.get("badges", {}).get("badges") or api_data.get("badges") or host.get("badges") or []
+        host["profile_collection"] = {
+            "collected_at": result.get("collected_at"),
+            "overall_status": result.get("overall_status"),
+            "sections": sections,
+        }
+
+    def _persist_enriched_host_snapshot(self, trip_id, host):
+        from core.database import get_connection
+        from core.host_policy import evaluate_host_eligibility
+        host_id = str(host.get("id") or host.get("username"))
+        eligibility = evaluate_host_eligibility(
+            host,
+            arrival_date=self.arrival_date,
+            departure_date=self.departure_date,
+            guest_gender="male",
+            target_city=self.city,
+        )
+        host["eligibility_check"] = eligibility
+        reason = eligibility.get("reason") or ("Host marked as not accepting guests" if host.get("is_hosting") == "not_accepting" else None)
+        with get_connection() as conn:
+            conn.execute(
+                """INSERT INTO core_host_snapshots(host_id,trip_id,raw_data_json,captured_at)
+                   VALUES(?,?,?,?) ON CONFLICT(trip_id,host_id) DO UPDATE SET
+                   raw_data_json=excluded.raw_data_json,captured_at=excluded.captured_at""",
+                (host_id, trip_id, json.dumps(host, ensure_ascii=False, default=str), datetime.now().isoformat()),
+            )
+            conn.execute(
+                """UPDATE core_hosts SET eligibility_reason=?, eligibility_evidence_json=?,
+                          eligibility_checked_at=?,
+                          state=CASE WHEN ? IS NOT NULL AND state IN ('discovered','selected','drafted','approved') THEN 'skipped' ELSE state END,
+                          qc_notes=CASE WHEN ? IS NOT NULL THEN ? ELSE qc_notes END,
+                          updated_at=?
+                   WHERE trip_id=? AND host_id=?""",
+                (reason, json.dumps(eligibility, ensure_ascii=False), datetime.now().isoformat(),
+                 reason, reason, f"Eligibility exclusion after profile collection: {reason}" if reason else None,
+                 datetime.now().isoformat(), trip_id, host_id),
+            )
 
     def _filter_and_save(self) -> List[Dict[str, Any]]:
         """Фильтрация и экспорт в CSV и JSON."""
@@ -1601,7 +1933,7 @@ class CouchsurfingScraper:
                 self.hosting_guard.record_rejected(host, "Explicitly not accepting guests in bio")
                 continue
 
-            days = host.get("last_login_days", 1)
+            days = host.get("last_login_days")
             rate = host.get("response_rate_pct", 90.0)
 
             is_active = (days is None or days <= self.max_days_inactive)
@@ -1614,6 +1946,14 @@ class CouchsurfingScraper:
 
             if is_active and is_responsive and gender_match:
                 filtered_hosts.append(host)
+
+        # Explicitly recently active profiles are always presented first;
+        # UNKNOWN is retained as unknown and never receives this priority.
+        filtered_hosts.sort(key=lambda host: (
+            0 if host.get("recently_active_status") in {RECENT, "ACTIVE"} else 1,
+            host.get("last_login_days") if host.get("last_login_days") is not None else 10**6,
+            -int(host.get("references_count") or 0),
+        ))
 
         print(f"[*] Хостов после фильтрации: {len(filtered_hosts)}")
 

@@ -4223,9 +4223,9 @@
     <!-- 2. TAB: MESSAGE QUEUE (SCREEN 2) -->
     <div class="tab-view" id="tab-queue">
       <!-- 6-Column Metrics Bar -->
-      <div class="metrics-bar" style="grid-template-columns: repeat(6, 1fr);">
+      <div class="metrics-bar" style="grid-template-columns: repeat(8, 1fr);">
         <div class="metric-cell">
-          <p class="metric-label">TOTAL QUEUED</p>
+          <p class="metric-label" title="Selected, drafted, and host-approved records in this trip. Dispatch permission is counted separately under Ready to Send.">ACTIVE QUEUE</p>
           <p class="metric-num" id="metric-total">0</p>
         </div>
         <div class="metric-cell">
@@ -4233,7 +4233,7 @@
           <p class="metric-num" id="metric-needs-regen" style="color: var(--amber-400);">0</p>
         </div>
         <div class="metric-cell">
-          <p class="metric-label" style="color: var(--rose-400);">NAME REVIEW</p>
+          <p class="metric-label" title="Discovered hosts not yet triaged; these are outside the active sending queue." style="color: var(--rose-400);">UNREVIEWED</p>
           <p class="metric-num" id="metric-name-review" style="color: var(--rose-400);">0</p>
         </div>
         <div class="metric-cell">
@@ -4241,8 +4241,16 @@
           <p class="metric-num" id="metric-drafts" style="color: var(--cyan-400);">0</p>
         </div>
         <div class="metric-cell">
-          <p class="metric-label">APPROVED</p>
-          <p class="metric-num" id="metric-approved" style="color: var(--emerald-400);">0</p>
+          <p class="metric-label" title="Host state is approved, but the exact current message still needs explicit user authorization.">APPROVAL REQUIRED</p>
+          <p class="metric-num" id="metric-approval-required" style="color: var(--amber-400);">0</p>
+        </div>
+        <div class="metric-cell">
+          <p class="metric-label" title="Exact message authorization is valid and the host is dispatchable.">READY TO SEND</p>
+          <p class="metric-num" id="metric-ready-to-send" style="color: var(--emerald-400);">0</p>
+        </div>
+        <div class="metric-cell">
+          <p class="metric-label" title="The platform may have received a request, but its outcome needs manual verification.">OUTCOME UNCERTAIN</p>
+          <p class="metric-num" id="metric-uncertain" style="color: var(--rose-400);">0</p>
         </div>
         <div class="metric-cell">
           <p class="metric-label">SENT TODAY</p>
@@ -4307,10 +4315,10 @@
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
               <span>Approve (<span id="approve-selected-count">0</span>)</span>
             </button>
-            <!-- Approve All Drafts button -->
-            <button type="button" class="btn btn-success btn-sm" id="btn-approve-all" onclick="approveAllDrafts()" title="Approve all draft messages and make them ready for Autopilot dispatch">
+            <!-- Approve all discovered hosts -->
+            <button type="button" class="btn btn-success btn-sm" id="btn-approve-all" onclick="approveAllFound()" title="Generate, validate, and approve requests for all discovered hosts in this trip">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
-              <span>Approve All Drafts</span>
+              <span>Approve All Found</span>
             </button>
           </div>
         </div>
@@ -4320,7 +4328,7 @@
         <!-- 20 Hosts Pagination Footer Bar -->
         <div class="queue-pagination-bar" id="queue-pagination" style="display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; background: var(--ink-900); border: 1px solid var(--ink-700); border-radius: 8px; margin-top: auto; width: 100%; box-sizing: border-box;">
           <div style="font-size: 12px; color: var(--ink-400);">
-            Showing <span id="queue-page-range" style="color: var(--ink-100); font-weight: 600;">1–20</span> of <span id="queue-page-total" style="color: var(--ink-100); font-weight: 600;">0</span> hosts
+            Showing <span id="queue-page-range" style="color: var(--ink-100); font-weight: 600;">1–20</span> of <span id="queue-page-total" style="color: var(--ink-100); font-weight: 600;">0</span> queue records (all statuses)
           </div>
           <div style="display: flex; gap: 8px; align-items: center;">
             <button type="button" class="btn btn-secondary btn-sm" id="btn-queue-prev-page" onclick="changeQueuePage(-1)" disabled>‹ Prev</button>
@@ -4347,12 +4355,14 @@
                 </span>
                 <!-- Mobile-only Progress Count in top header line -->
                 <div class="mobile-only ap-mobile-progress-badge" style="display: none;">
-                  <span class="tabular-nums" style="font-weight: 600; color: var(--ink-200); font-size: 13px;" id="ap-progress-text-mobile">0/100 sent</span>
+                  <span class="tabular-nums" style="font-weight: 600; color: var(--ink-200); font-size: 13px;" id="ap-progress-text-mobile">Daily send count unavailable</span>
                 </div>
               </div>
               <div class="ap-hud-progress-info desk-only">
-                <span class="tabular-nums" id="ap-progress-text">0 / 100 messages sent today</span>
+                <span class="tabular-nums" id="ap-progress-text">Daily send count unavailable</span>
               </div>
+              <div id="ap-runtime-detail" style="font-size:10px;color:var(--ink-400);margin-top:3px;">Web application online · Sender status unknown</div>
+              <div id="ap-send-outcome-detail" style="font-size:10px;color:var(--ink-400);margin-top:2px;">Unknown outcomes · Dry runs · Failed attempts</div>
               <div class="progress-track ap-hud-progress-track desk-only">
                 <div class="progress-fill" id="ap-progress-fill" style="width: 0%;"></div>
               </div>
@@ -4429,22 +4439,23 @@
           </div>
         </div>
 
-        <!-- Split Grid (50% / 50%): Ready Candidates vs Sent Requests -->
+        <!-- Trip host collection vs confirmed sent history -->
         <div class="autopilot-split-grid">
-          <!-- Left Column (50%): APPROVED CANDIDATES READY FOR DISPATCH -->
+          <!-- Left Column: all hosts belonging to the selected trip -->
           <div class="ap-column-card">
             <div class="ap-column-header">
               <div style="display: flex; align-items: center; gap: 8px;">
                 <span class="live-dot" style="background: var(--amber-400); box-shadow: 0 0 6px rgba(245, 158, 11, 0.5);"></span>
-                <p class="sidebar-section-title" style="margin: 0;"><span class="desk-only">APPROVED </span>CANDIDATES<span class="desk-only"> READY FOR DISPATCH</span><span id="ap-ready-trip-label" style="font-weight: 600; color: var(--amber-400); margin-left: 6px;"></span></p>
+                <p class="sidebar-section-title" style="margin: 0;">TRIP HOSTS<span id="ap-ready-trip-label" style="font-weight: 600; color: var(--amber-400); margin-left: 6px;"></span></p>
               </div>
               <div style="display: flex; align-items: center; gap: 8px;">
                 <button type="button" id="btn-refresh-queue" class="btn-refresh-sm" onclick="syncAndRefreshQueue(this)" title="Синхронизировать и очистить отправленные">↻ Refresh</button>
                 <span class="badge badge-amber" id="ap-ready-count">0</span>
               </div>
             </div>
+            <div id="ap-host-collection-summary" aria-live="polite" style="display:flex;flex-wrap:wrap;gap:6px;padding:8px 12px;border-bottom:1px solid var(--ink-700);font-size:10px;color:var(--ink-300);"></div>
             <div id="ap-candidates-list" class="ap-items-scroll">
-              <p style="color: var(--ink-400); font-size: 13px; text-align: center; padding: 24px 0;">No approved candidates ready for dispatch.</p>
+              <p style="color: var(--ink-400); font-size: 13px; text-align: center; padding: 24px 0;">No hosts found for the selected trip.</p>
             </div>
           </div>
 
@@ -4989,6 +5000,8 @@
             </div>
           </div>
         </div>
+
+        <div id="hdm-profile-evidence" class="host-detail-section" style="margin-top: 10px; font-size: 12px; color: var(--ink-200); line-height: 1.5;"></div>
 
         <div class="host-detail-section" style="display: flex; flex-direction: column; gap: 8px;">
           <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
@@ -5741,14 +5754,8 @@
         const rawData = await res.json();
         let data = Array.isArray(rawData) ? rawData : [];
         
-        // Обновляем hostsData списком хостов, еще не добавленных в очередь
-        if (queuedUsernames.size > 0) {
-          data = data.filter(h => {
-            const u = String(h.username || h.id || '').trim().toLowerCase();
-            const id = String(h.id || '').trim().toLowerCase();
-            return !queuedUsernames.has(u) && !queuedUsernames.has(id);
-          });
-        }
+        // The Search API already returns only canonical `discovered` aggregate
+        // entries. Do not re-filter them against the queue ID set in the browser.
         hostsData = data;
         saveHostsToLocalStorage();
 
@@ -5990,7 +5997,16 @@
         const newShade = isNew ? ' ' + newHosts.get(username) : '';
         const visibleTags = tags.slice(0, 4);
         const hiddenTagsCount = tags.length - visibleTags.length;
-        const isVer = !!(host.is_verified || host.isIdentificationVerified);
+        const verificationStatus = String(host.verification_status || ((host.is_verified || host.isIdentificationVerified) ? 'VERIFIED' : 'UNKNOWN')).toUpperCase();
+        const activityStatus = String(host.recently_active_status || 'UNKNOWN').toUpperCase();
+        const verificationBadge = verificationStatus === 'VERIFIED'
+          ? `<span class="badge" style="background:rgba(16,185,129,.15);color:#10B981;border:1px solid rgba(16,185,129,.35);font-size:11px;padding:2px 7px;border-radius:4px;font-weight:600;">✓ VERIFIED</span>`
+          : verificationStatus === 'NOT_VERIFIED'
+            ? `<span class="badge" style="background:rgba(239,68,68,.12);color:#F87171;border:1px solid rgba(239,68,68,.3);font-size:11px;padding:2px 7px;border-radius:4px;">NOT VERIFIED</span>`
+            : `<span class="badge" style="background:rgba(100,116,139,.15);color:#94A3B8;border:1px solid rgba(100,116,139,.3);font-size:11px;padding:2px 7px;border-radius:4px;">NOT CHECKED</span>`;
+        const activityBadge = activityStatus === 'RECENTLY_ACTIVE' || activityStatus === 'ACTIVE'
+          ? `<span class="badge" style="background:rgba(16,185,129,.15);color:#10B981;border:1px solid rgba(16,185,129,.35);font-size:10px;padding:2px 6px;border-radius:4px;">RECENTLY ACTIVE</span>`
+          : `<span class="badge" style="background:rgba(100,116,139,.12);color:#94A3B8;border:1px solid rgba(100,116,139,.25);font-size:10px;padding:2px 6px;border-radius:4px;">${escapeHtml(activityStatus.replaceAll('_', ' '))}</span>`;
         return `
           <tr data-username="${escapeHtml(uKey)}" class="${isSelected ? 'row-selected ' : ''}host-new${newShade}" onclick="handleRowClick(event, '${escapeJs(uKey)}')">
             <!-- 0. CHECKBOX -->
@@ -6021,10 +6037,7 @@
 
             <!-- 4. ACCOUNT (Verified / Not Verified badge) -->
             <td style="text-align: center;">
-              ${isVer
-                ? `<span class="badge" style="background: rgba(16, 185, 129, 0.15); color: #10B981; border: 1px solid rgba(16, 185, 129, 0.35); font-size: 11px; padding: 2px 7px; border-radius: 4px; font-weight: 600;">✓ Verified</span>`
-                : `<span class="badge" style="background: rgba(100, 116, 139, 0.15); color: #94A3B8; border: 1px solid rgba(100, 116, 139, 0.3); font-size: 11px; padding: 2px 7px; border-radius: 4px;">Not Verified</span>`
-              }
+              <div style="display:flex; flex-direction:column; align-items:center; gap:4px;">${verificationBadge}${activityBadge}</div>
             </td>
 
             <!-- 5. HOSTING STATUS (center) -->
@@ -7103,15 +7116,23 @@
       const total = s.total !== undefined ? s.total : 0;
       const needsRegen = s.needs_regeneration !== undefined ? s.needs_regeneration : 0;
       const nameReview = s.name_review !== undefined ? s.name_review : 0;
-      const approved = s.approved !== undefined ? s.approved : 0;
+      const approvalRequired = s.approval_required !== undefined ? s.approval_required : 0;
+      const readyToSend = s.dispatch_ready !== undefined ? s.dispatch_ready : (s.approved !== undefined ? s.approved : 0);
+      const uncertain = s.uncertain !== undefined ? s.uncertain : 0;
       const drafts = s.draft !== undefined ? s.draft : 0;
-      const sentToday = (s.sent_today !== undefined) ? s.sent_today : (autopilotData.sent_today || 0);
-      const limit = s.daily_limit || autopilotData.daily_limit || 100;
+      const dailyCountAvailable = s.daily_count_available === true
+        || (s.daily_count_available === undefined && autopilotData.daily_count_available === true);
+      const sentToday = dailyCountAvailable
+        ? ((s.sent_today !== undefined && s.sent_today !== null) ? s.sent_today : autopilotData.sent_today)
+        : null;
+      const limit = Number(s.daily_limit || autopilotData.daily_limit) > 0 ? Number(s.daily_limit || autopilotData.daily_limit) : null;
 
       const totalEl = document.getElementById('metric-total');
       const needsRegenEl = document.getElementById('metric-needs-regen');
       const nameReviewEl = document.getElementById('metric-name-review');
-      const approvedEl = document.getElementById('metric-approved');
+      const approvalRequiredEl = document.getElementById('metric-approval-required');
+      const readyToSendEl = document.getElementById('metric-ready-to-send');
+      const uncertainEl = document.getElementById('metric-uncertain');
       const draftsEl = document.getElementById('metric-drafts');
       const sentEl = document.getElementById('metric-sent');
       const navBadge = document.getElementById('nav-queue-count');
@@ -7120,9 +7141,12 @@
       if (totalEl) totalEl.textContent = total;
       if (needsRegenEl) needsRegenEl.textContent = needsRegen;
       if (nameReviewEl) nameReviewEl.textContent = nameReview;
-      if (approvedEl) approvedEl.textContent = approved;
+      if (approvalRequiredEl) approvalRequiredEl.textContent = approvalRequired;
+      if (readyToSendEl) readyToSendEl.textContent = readyToSend;
+      if (uncertainEl) uncertainEl.textContent = uncertain;
       if (draftsEl) draftsEl.textContent = drafts;
-      if (sentEl) sentEl.textContent = `${sentToday}/${limit}`;
+      if (sentEl) sentEl.textContent = sentToday === null || sentToday === undefined
+        ? 'Unavailable' : `${sentToday}/${limit ?? '—'}`;
       if (navBadge) navBadge.textContent = total;
       if (mNavBadge) {
         if (total > 0) {
@@ -7198,19 +7222,22 @@
 
       const cardsHtml = list.map((item, idx) => {
         const username = item.username || item.id || `host_${idx}`;
+        if (item.approval_valid === true) approvalRevocationPending.delete(username);
         const name = item.clean_name || item.name || username;
         const initials = getInitials(name);
         const defaultCity = (selectedTripContext && selectedTripContext.city) ? selectedTripContext.city : 'Kyoto';
         const location = item.location || defaultCity;
         const status = (item.status || 'Draft').toLowerCase();
-        const isApproved = status === 'approved';
+        const isApproved = status === 'approved' && item.approval_valid === true;
         const isSent = status.startsWith('sent');
+        const isUncertain = status === 'uncertain';
         const isSkipped = status === 'skipped';
         const isNeedsRegen = status === 'needs_regeneration';
         const isNameReview = status === 'name_review_required';
         const isQCReview = status === 'qc_review_required';
         const isDraft = status === 'draft' || status === 'generated';
         const msg = item.generated_message || item.message || '';
+        const approvalNeeded = !isUncertain && Boolean(msg) && item.approval_valid !== true;
         const words = msg.trim() ? msg.trim().split(/\s+/).length : 0;
         const qcPassed = !isQCReview && !isNeedsRegen && (item.qc_passed !== undefined ? Boolean(item.qc_passed) : (words >= 60 && words <= 95));
 
@@ -7272,9 +7299,11 @@
               </div>
               <div style="display: flex; gap: 6px; align-items: center;" onclick="event.stopPropagation()">
                 ${isSent ? '<span class="badge badge-success">✓ Sent</span>' : ''}
+                ${isUncertain ? '<span class="badge badge-danger" title="A request may have been sent, but the outcome was not confirmed. Verify manually before retrying.">Outcome uncertain</span>' : ''}
                 ${isSkipped ? '<span class="badge" style="background: rgba(239, 68, 68, 0.2); color: #EF4444; border: 1px solid rgba(239, 68, 68, 0.3);">Skipped</span>' : ''}
                 ${isApproved ? '<span class="badge badge-success">Approved</span>' : ''}
-                ${isNameReview ? '<span class="badge badge-danger">Name Review</span>' : ''}
+                ${approvalNeeded ? `<span class="badge badge-amber" title="This exact message version has not been approved for this host and trip.">Approval required</span>` : ''}
+                ${isNameReview ? '<span class="badge badge-danger" title="Discovered host not yet triaged">Unreviewed</span>' : ''}
                 ${isQCReview ? '<span class="badge badge-amber" style="background: rgba(245, 158, 11, 0.2); color: #F59E0B; border: 1px solid rgba(245, 158, 11, 0.4);">QC Review</span>' : ''}
                 ${isNeedsRegen ? '<span class="badge badge-amber">Needs Regen</span>' : ''}
                 ${isDraft ? '<span class="badge badge-info">Draft</span>' : ''}
@@ -7294,10 +7323,17 @@
               </div>
             </div>
 
+            <div class="queue-ranking-reasons" style="display:flex;gap:8px;flex-wrap:wrap;font-size:11px;color:var(--ink-400);margin:8px 0 12px" title="Transparent priority signals used by Queue and Autopilot">
+              <strong>Queue #${Number(item.ranking_position || 0) || '—'}</strong>
+              <span>${escapeHtml((item.ranking_reasons || []).join(' · '))}</span>
+              <span>${item.review_count === null || item.review_count === undefined ? 'Reviews unknown' : `${Number(item.review_count)} reviews`}</span>
+            </div>
+
             <div class="message-box-wrap">
               <div class="message-box-header">
                 <span class="msg-label">MESSAGE</span>
                 <span class="qc-badge">
+                  ${approvalNeeded ? `<span class="badge badge-amber" id="approval-${escapeHtml(username)}">Approval required</span><span style="color: var(--ink-600);">•</span>` : `<span id="approval-${escapeHtml(username)}">Approved v${Number(item.message_version || 1)}</span><span style="color: var(--ink-600);">•</span>`}
                   <span id="words-${escapeHtml(username)}">${words} words</span>
                   <span style="color: var(--ink-600);">•</span>
                   <span class="${qcPassed ? 'qc-pass' : ''}" id="qc-${escapeHtml(username)}">${qcPassed ? 'QC Passed' : 'Needs Review'}</span>
@@ -7383,6 +7419,13 @@
         if (item) {
           item.generated_message = newText;
           item.message = newText;
+          if (data && data.item) {
+            item.status = data.item.status;
+            item.approval_valid = data.item.approval_valid === true;
+            item.message_version = data.item.message_version || item.message_version;
+          } else {
+            item.approval_valid = false;
+          }
         }
         if (data && data.stats) updateQueueMetrics(data.stats);
         if (btn) {
@@ -7403,6 +7446,7 @@
 
     // Debounced Edit Autosave
     let saveTimeouts = {};
+    const approvalRevocationPending = new Set();
     function onMessageEdited(username, newText) {
       const wordsEl = document.getElementById('words-' + username);
       const qcEl = document.getElementById('qc-' + username);
@@ -7414,22 +7458,59 @@
         qcEl.textContent = qcPassed ? 'QC Passed' : (words < 55 ? 'Too Short' : 'Too Long');
         qcEl.className = qcPassed ? 'qc-pass' : '';
       }
+      const approvalEl = document.getElementById('approval-' + username);
+      if (approvalEl) {
+        approvalEl.textContent = 'Approval required — message edited';
+        approvalEl.className = 'badge badge-amber';
+      }
 
       const item = queueData.find(q => (q.username || '').toLowerCase() === username.toLowerCase());
       if (item) {
         item.generated_message = newText;
         item.message = newText;
+        item.approval_valid = false;
+        item.status = 'Draft';
+      }
+      const card = document.getElementById('card-' + username);
+      if (card) card.classList.remove('approved');
+      const approveButton = document.getElementById('btn-approve-' + username);
+      if (approveButton) {
+        approveButton.className = 'btn btn-secondary btn-sm';
+        approveButton.innerHTML = '<span>Approve</span>';
+      }
+
+      // Revoke immediately; the message autosave below is intentionally delayed.
+      if (!approvalRevocationPending.has(username)) {
+        approvalRevocationPending.add(username);
+        const activeTripId = (selectedTripContext && selectedTripContext.trip_id) ? selectedTripContext.trip_id : null;
+        fetch('/api/requests/revoke-approval', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: username, trip_id: activeTripId })
+        }).then(response => {
+          if (!response.ok) throw new Error('Could not revoke previous message approval');
+        }).catch(error => {
+          approvalRevocationPending.delete(username);
+          showToast(error.message, 'error');
+        });
       }
 
       clearTimeout(saveTimeouts[username]);
       saveTimeouts[username] = setTimeout(async () => {
         try {
           const activeTripId = (selectedTripContext && selectedTripContext.trip_id) ? selectedTripContext.trip_id : null;
-          await fetch('/api/requests/save', {
+          const response = await fetch('/api/requests/save', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ username: username, message: newText, trip_id: activeTripId })
           });
+          if (!response.ok) throw new Error('Save failed');
+          const data = await response.json();
+          const current = queueData.find(q => (q.username || '').toLowerCase() === username.toLowerCase());
+          if (current) {
+            current.approval_valid = false;
+            if (data && data.item) current.status = data.item.status;
+          }
         } catch (e) {
           console.error("Autosave error:", e);
         }
@@ -7441,18 +7522,23 @@
       const item = queueData.find(q => (q.username || '').toLowerCase() === username.toLowerCase());
       if (!item) return;
       const current = (item.status || 'Draft').toLowerCase();
-      const nextStatus = current === 'approved' ? 'Draft' : 'Approved';
+      const isCurrentlyApproved = current === 'approved' && item.approval_valid === true;
+      const nextStatus = isCurrentlyApproved ? 'Draft' : 'Approved';
       const activeTripId = (selectedTripContext && selectedTripContext.trip_id) ? selectedTripContext.trip_id : null;
+      const message = !isCurrentlyApproved ? (document.getElementById('textarea-' + username)?.value ?? item.generated_message ?? '') : undefined;
 
       try {
         const res = await fetch('/api/requests/save', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username: username, status: nextStatus, trip_id: activeTripId })
+          body: JSON.stringify({ username: username, status: nextStatus, ...(message !== undefined ? { message } : {}), trip_id: activeTripId })
         });
         if (res.ok) {
           const data = await res.json();
           item.status = nextStatus;
+          item.approval_valid = isCurrentlyApproved ? false : Boolean(data?.item?.approval_valid);
+          if (item.approval_valid) approvalRevocationPending.delete(username);
+          if (data?.item?.message_version) item.message_version = data.item.message_version;
           const isApproved = nextStatus === 'Approved';
           const card = document.getElementById('card-' + username);
           if (card) {
@@ -7670,23 +7756,14 @@
       }
     }
 
-    // Approve All Drafts (Approves all draft messages for current trip into sending queue)
-    async function approveAllDrafts() {
-      const draftCount = queueData.filter(q => (q.status || '').toLowerCase() === 'draft').length;
-      if (draftCount === 0) {
-        alert("All messages in the queue are already approved!");
-        return;
-      }
-      if (!confirm(`Approve all ${draftCount} draft messages and add them to the sending queue?`)) {
-        return;
-      }
-
+    // Prepare and approve every found host for the selected trip, independent of pagination.
+    async function approveAllFound() {
       const activeTripId = (selectedTripContext && selectedTripContext.trip_id) ? selectedTripContext.trip_id : null;
       const btn = document.getElementById('btn-approve-all');
       const originalHtml = btn ? btn.innerHTML : '';
       if (btn) {
         btn.disabled = true;
-        btn.innerHTML = `<span style="display:inline-block;width:12px;height:12px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin 0.6s linear infinite;margin-right:4px;"></span><span>Approving...</span>`;
+        btn.innerHTML = `<span style="display:inline-block;width:12px;height:12px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin 0.6s linear infinite;margin-right:4px;"></span><span>Preparing all...</span>`;
       }
 
       try {
@@ -7697,35 +7774,19 @@
         });
         const data = await res.json();
         if (res.ok) {
-          if (data && Array.isArray(data.queue) && data.queue.length > 0) {
-            queueData = data.queue;
-          } else {
-            queueData.forEach(q => {
-              if ((q.status || '').toLowerCase() === 'draft') {
-                q.status = 'Approved';
-              }
-            });
-          }
           if (data && data.stats) updateQueueMetrics(data.stats);
-          renderQueueCards();
-
-          if (btn) {
-            btn.innerHTML = `<span style="color: var(--emerald-400);">✓ ${data.approved_count || draftCount} Approved!</span>`;
-            setTimeout(() => {
-              btn.innerHTML = originalHtml;
-              btn.disabled = false;
-            }, 1800);
-          }
-          showToast(`All ${data.approved_count || draftCount} drafts approved!`);
+          await loadQueue(false);
+          const approvedCount = Number(data.approved_count || 0);
+          const failedCount = Number(data.failed_count || 0);
+          const neutralCount = Number(data.neutral_greeting_count || 0);
+          const alreadyApprovedCount = Number(data.already_approved_count || 0);
+          showToast(`${approvedCount} hosts prepared and approved; ${alreadyApprovedCount} already authorized; ${neutralCount} use neutral greetings; ${failedCount} need review.`);
         } else {
-          alert("Error approving drafts: " + (data.detail || data.error));
-          if (btn) {
-            btn.innerHTML = originalHtml;
-            btn.disabled = false;
-          }
+          alert("Error preparing hosts: " + (data.detail || data.error));
         }
       } catch (e) {
-        alert("Network error approving drafts: " + e.message);
+        alert("Network error preparing hosts: " + e.message);
+      } finally {
         if (btn) {
           btn.innerHTML = originalHtml;
           btn.disabled = false;
@@ -8150,6 +8211,7 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             request_ids: targetUsernames,
+            trip_id: (selectedTripContext && selectedTripContext.trip_id) ? selectedTripContext.trip_id : null,
             new_arrival: inVal,
             new_departure: outVal,
             city: cityVal
@@ -8196,6 +8258,33 @@
     // SCREEN 3: AUTOPILOT DISPATCHER
     // ----------------------------------------------------
     let autopilotLoadInFlight = false;
+    let autopilotHostCollection = { hosts: [], pagination: { page: 1, page_size: 50, total_hosts: 0, total_pages: 0 }, stats: {} };
+    let autopilotHostPage = 1;
+    let autopilotHostTripId = null;
+    let autopilotHostSearch = '';
+
+    async function loadAutopilotHosts(page = autopilotHostPage) {
+      autopilotHostPage = Math.max(1, Number(page) || 1);
+      const tripId = autopilotData && autopilotData.active_trip_id;
+      if (!tripId) {
+        autopilotHostCollection = { hosts: [], pagination: { page: 1, page_size: 50, total_hosts: 0, total_pages: 0 }, stats: {} };
+        renderAutopilot();
+        return;
+      }
+      try {
+        const params = new URLSearchParams({ trip_id: tripId, page: String(autopilotHostPage), page_size: '50' });
+        if (autopilotHostSearch) params.set('search', autopilotHostSearch);
+        const response = await fetch('/api/autopilot/hosts?' + params.toString());
+        if (!response.ok) throw new Error('Host collection unavailable (' + response.status + ')');
+        autopilotHostCollection = await response.json();
+        autopilotHostTripId = tripId;
+      } catch (e) {
+        console.error('Autopilot host collection error:', e);
+        autopilotHostCollection = { hosts: [], pagination: { page: autopilotHostPage, page_size: 50, total_hosts: 0, total_pages: 0 }, stats: {}, error: e.message };
+      }
+      renderAutopilot();
+    }
+
     async function loadAutopilot() {
       // Защита от наложения запросов поллинга: старый ответ не должен перезаписывать новый.
       if (autopilotLoadInFlight) return;
@@ -8205,6 +8294,16 @@
         const res = await fetch('/api/autopilot/status' + tripQ);
         if (!res.ok) return;
         autopilotData = await res.json();
+        const tripId = autopilotData.active_trip_id || null;
+        if (tripId !== autopilotHostTripId) autopilotHostPage = 1;
+        const hostParams = new URLSearchParams({ page: String(autopilotHostPage), page_size: '50' });
+        if (tripId) hostParams.set('trip_id', tripId);
+        if (autopilotHostSearch) hostParams.set('search', autopilotHostSearch);
+        const hostsResponse = await fetch('/api/autopilot/hosts?' + hostParams.toString());
+        autopilotHostCollection = hostsResponse.ok
+          ? await hostsResponse.json()
+          : { hosts: [], pagination: { page: autopilotHostPage, page_size: 50, total_hosts: 0, total_pages: 0 }, stats: {}, error: 'Trip host collection unavailable' };
+        autopilotHostTripId = tripId;
         renderAutopilot();
       } catch (e) {
         console.error("Autopilot status error:", e);
@@ -8384,8 +8483,11 @@
 
       const isRunning = !!autopilotData.is_running;
       const isPaused = !!autopilotData.is_paused;
-      const sentToday = autopilotData.sent_today || 0;
-      const limit = autopilotData.daily_limit || 100;
+      const runtimeUnknown = autopilotData.process_status === 'unknown';
+      const runtimeUnverified = isRunning && autopilotData.process_identity_verified === false;
+      const sentToday = autopilotData.daily_count_available === true && Number.isFinite(Number(autopilotData.sent_today))
+        ? Number(autopilotData.sent_today) : null;
+      const limit = Number(autopilotData.daily_limit) > 0 ? Number(autopilotData.daily_limit) : null;
       const currentHost = (isRunning && !isPaused) ? (autopilotData.current_host || null) : null;
       currentInFlightHost = currentHost;
 
@@ -8434,19 +8536,43 @@
 
       updateCountdownDisplay();
 
-      if (metricSent) metricSent.textContent = `${sentToday}/${limit}`;
-      if (progressText) progressText.textContent = `${sentToday} / ${limit} messages sent today`;
+      if (metricSent) metricSent.textContent = sentToday === null ? 'Unavailable' : `${sentToday}/${limit ?? '—'}`;
+      if (progressText) progressText.textContent = sentToday === null
+        ? 'Daily send count unavailable'
+        : `Confirmed live sends today: ${sentToday}${limit !== null ? ` / ${limit} daily limit · ${autopilotData.remaining_capacity ?? Math.max(limit - sentToday, 0)} remaining (last sender configuration)` : ''}`;
       const mobileProgressText = document.getElementById('ap-progress-text-mobile');
-      if (mobileProgressText) mobileProgressText.textContent = `${sentToday}/${limit} sent`;
+      if (mobileProgressText) mobileProgressText.textContent = sentToday === null
+        ? 'Daily send count unavailable' : `${sentToday}${limit !== null ? `/${limit}` : ''} confirmed live`;
 
-      const pct = Math.min(100, Math.round((sentToday / limit) * 100));
+      const runtimeDetail = document.getElementById('ap-runtime-detail');
+      if (runtimeDetail) {
+        const senderLabel = runtimeUnknown ? 'Sender status unknown'
+          : (runtimeUnverified ? 'Sender running · identity unverified'
+            : (isRunning ? 'Sender running' : 'Sender stopped'));
+        runtimeDetail.textContent = `Web application online · ${senderLabel}`;
+      }
+      const outcomes = autopilotData.daily_send_summary || {};
+      const outcomeDetail = document.getElementById('ap-send-outcome-detail');
+      if (outcomeDetail) {
+        outcomeDetail.textContent = `Today · unknown outcomes: ${outcomes.unknown_outcomes ?? 'unavailable'} · dry-run successes: ${outcomes.dry_run_successes ?? 'unavailable'} · failed: ${outcomes.failed_attempts ?? 'unavailable'}${outcomes.available === false ? ' · live count needs reconciliation' : ''}`;
+      }
+
+      const pct = sentToday !== null && limit !== null ? Math.min(100, Math.round((sentToday / limit) * 100)) : 0;
       if (progressFill) progressFill.style.width = `${pct}%`;
       const mobileProgressFill = document.getElementById('ap-progress-fill-mobile');
       if (mobileProgressFill) mobileProgressFill.style.width = `${pct}%`;
 
       // Dispatcher Status Pill
       if (stateBadge && stateText && stateDot) {
-        if (isRunning && !isPaused) {
+        if (runtimeUnknown) {
+          stateBadge.className = "status-pill-badge paused";
+          stateDot.className = "live-dot warn";
+          stateText.textContent = "STATUS UNKNOWN";
+        } else if (runtimeUnverified) {
+          stateBadge.className = "status-pill-badge paused";
+          stateDot.className = "live-dot warn";
+          stateText.textContent = "VERIFY SENDER";
+        } else if (isRunning && !isPaused) {
           stateBadge.className = "status-pill-badge active";
           stateDot.className = "live-dot";
           stateText.textContent = "ACTIVE";
@@ -8457,7 +8583,7 @@
         } else {
           stateBadge.className = "status-pill-badge stopped";
           stateDot.className = "live-dot off";
-          stateText.textContent = "STOPPED";
+          stateText.textContent = autopilotData.pid_reused ? "STOPPED · PID REUSED" : (autopilotData.stale_status_file ? "STOPPED · STALE FILE" : "STOPPED");
         }
       }
 
@@ -8471,7 +8597,12 @@
       const btnPauseText = document.getElementById('btn-ap-pause-text');
       const btnStop = document.getElementById('btn-ap-stop');
 
-      if (isRunning && !isPaused) {
+      if (runtimeUnknown || runtimeUnverified) {
+        [btnStart, btnPause, btnStop].forEach(btn => {
+          if (btn) { btn.disabled = true; btn.style.opacity = '0.4'; btn.style.pointerEvents = 'none'; btn.style.cursor = 'not-allowed'; }
+        });
+        if (btnStartText) btnStartText.textContent = runtimeUnknown ? "Status unknown" : "Verify sender";
+      } else if (isRunning && !isPaused) {
         if (btnStart) {
           btnStart.disabled = true;
           btnStart.style.opacity = '0.4';
@@ -8546,22 +8677,42 @@
       }
 
       // -----------------------------------------------------------------
-      // Split Lists: Approved Candidates (50%) vs Sent Requests (50%)
+      // Independent read models: visible trip hosts and confirmed sent history.
       // -----------------------------------------------------------------
-      const readyList = Array.isArray(autopilotData.ready_candidates) ? autopilotData.ready_candidates : [];
+      const readyList = Array.isArray(autopilotHostCollection.hosts) ? autopilotHostCollection.hosts : [];
       const sentHistory = Array.isArray(autopilotData.sent_history) ? autopilotData.sent_history : [];
+      const approvalRequiredCount = Number(autopilotHostCollection.stats?.approval_required || 0);
+      const collectionStats = autopilotHostCollection.stats || {};
+      const dispatchReadyCount = Array.isArray(autopilotData.ready_candidates) ? autopilotData.ready_candidates.length : 0;
+      const collectionSummary = document.getElementById('ap-host-collection-summary');
+      if (collectionSummary) {
+        const summaryItems = [
+          ['TOTAL HOSTS', autopilotHostCollection.pagination?.total_hosts ?? readyList.length],
+          ['DRAFTS NEED APPROVAL', collectionStats.approval_required ?? 0],
+          ['VALID APPROVALS', collectionStats.approved ?? 0],
+          ['READY TO DISPATCH', dispatchReadyCount],
+          ['UNKNOWN OUTCOME', collectionStats.uncertain ?? 0],
+          ['SENT', collectionStats.sent ?? 0],
+          ['SKIPPED', collectionStats.skipped ?? 0]
+        ];
+        collectionSummary.innerHTML = summaryItems.map(([label, value]) =>
+          `<span class="badge" title="${escapeHtml(label)}" style="padding:3px 6px;border:1px solid var(--ink-700);border-radius:4px;">${escapeHtml(label)}: ${escapeHtml(value)}</span>`
+        ).join('');
+      }
 
       window.apCurrentReadyList = readyList;
+      window.apCurrentHostCollection = readyList;
       window.apCurrentSentList = sentHistory;
 
       const readyCountEl = document.getElementById('ap-ready-count');
       const sentCountEl = document.getElementById('ap-sent-count');
-      if (readyCountEl) readyCountEl.textContent = readyList.length;
+      if (readyCountEl) readyCountEl.textContent = autopilotHostCollection.pagination?.total_hosts ?? readyList.length;
       if (sentCountEl) sentCountEl.textContent = sentHistory.length;
 
       const apTripLabel = document.getElementById('ap-ready-trip-label');
       if (apTripLabel) {
-        apTripLabel.textContent = selectedTripContext ? ` (${selectedTripContext.city || ''})` : '';
+        const collectionCity = autopilotHostCollection.trip?.city || (selectedTripContext ? selectedTripContext.city : '');
+        apTripLabel.textContent = collectionCity ? ` (${collectionCity})` : '';
       }
 
       const readyContainer = document.getElementById('ap-candidates-list');
@@ -8583,39 +8734,26 @@
       // Real-time automatic cleanup of sent cards from Message Queue
       handleRealtimeSentRemoval(sentHistory, sentToday);
 
-      // 1) Animate newly sent items disappearing from Left Column
-      if (newlySent.length > 0) {
-        newlySent.forEach(s => {
-          const uKey = (s.username || '').toLowerCase();
-          const rowEl = document.getElementById('ready-row-' + s.username) || document.querySelector(`[data-ready-username="${uKey}"]`);
-          if (rowEl && !fadingOutUsernames.has(uKey)) {
-            fadingOutUsernames.add(uKey);
-            const badgeEl = rowEl.querySelector('.ap-badge-slot');
-            if (badgeEl) {
-              badgeEl.innerHTML = '<span class="badge-ap-sent-flash">✓ SENT</span>';
-            }
-            rowEl.classList.add('fade-out-item');
-            setTimeout(() => {
-              if (rowEl.parentNode) rowEl.parentNode.removeChild(rowEl);
-              fadingOutUsernames.delete(uKey);
-            }, 550);
-          }
-        });
-      }
-
-      // 2) Render/Update Left Column (Ready Candidates)
+      // Render the trip's host collection; dispatch candidates remain separate.
       if (readyContainer) {
         if (readyList.length === 0) {
-          readyContainer.innerHTML = '<p style="color: var(--ink-400); font-size: 13px; text-align: center; padding: 32px 0;">No approved candidates ready for dispatch.<br><span style="font-size: 11.5px; color: var(--ink-500);">Select the active trip card (Kyoto) above to view its approved queue.</span></p>';
+          const emptyMessage = approvalRequiredCount > 0
+            ? `${approvalRequiredCount} hosts need message approval before dispatch.`
+            : (autopilotHostCollection.error || 'No hosts found for the selected trip.');
+          readyContainer.innerHTML = `<p style="color: var(--ink-400); font-size: 13px; text-align: center; padding: 32px 18px;">${escapeHtml(emptyMessage)}</p>`;
         } else {
           const rowsHtml = readyList.map((c, i) => {
             const uKey = (c.username || '').toLowerCase();
-            if (fadingOutUsernames.has(uKey)) return ''; // Skip currently fading out elements
-
+            const rawState = String(c.state || '').toLowerCase();
             const isSending = currentHost && currentHost.toLowerCase() === uKey;
-            const badgeHtml = isSending
-              ? `<button type="button" class="badge-ap-btn badge-ap-sending" onclick="openApMessageModal(window.apCurrentReadyList[${i}], 'ready')" title="View generated message for @${escapeHtml(c.username)}"><span class="sending-pulse-dot"></span>SENDING 👁️</button>`
-              : `<button type="button" class="badge-ap-btn badge-ap-queued" onclick="openApMessageModal(window.apCurrentReadyList[${i}], 'ready')" title="View generated message for @${escapeHtml(c.username)}">QUEUED 👁️</button>`;
+            const hasDraft = Boolean(String(c.message_draft || '').trim());
+            const approvalStatus = c.approval_valid ? 'MESSAGE APPROVED' : (hasDraft ? 'APPROVAL REQUIRED' : 'NO MESSAGE DRAFT');
+            const reconciliationRequired = Array.isArray(autopilotData.reconciliation?.unconfirmed_hosts)
+              && autopilotData.reconciliation.unconfirmed_hosts.some(h => String(h.username || '').toLowerCase() === uKey);
+            const statusLabels = { discovered: 'FOUND', selected: 'SELECTED', drafted: 'DRAFT', approved: c.approval_valid ? 'MESSAGE APPROVED' : 'APPROVAL REQUIRED', uncertain: 'UNKNOWN OUTCOME', sending: 'SENDING', sent: 'SENT', skipped: 'SKIPPED' };
+            const cardStatus = reconciliationRequired ? 'RECONCILIATION REQUIRED' : (isSending ? 'SENDING' : (statusLabels[rawState] || 'FOUND'));
+            const badgeClass = rawState === 'sent' ? 'badge-ap-was-sent' : (rawState === 'uncertain' ? 'badge-ap-sending' : 'badge-ap-queued');
+            const badgeHtml = `<button type="button" class="badge-ap-btn ${badgeClass}" onclick="openApMessageModal(window.apCurrentHostCollection[${i}], 'collection')" title="${escapeHtml(cardStatus)} — @${escapeHtml(c.username)}">${escapeHtml(cardStatus)} 👁️</button>`;
 
             // Gender format: single character M, F, C, n/a
             let genderCode = 'n/a';
@@ -8643,21 +8781,26 @@
                   </a>
                   <span style="color: var(--ink-300); font-size: 11px; flex-shrink: 0;">📍 ${cityShort}</span>
                   <span style="color: #F59E0B; font-weight: 700; font-size: 11px; font-family: var(--font-mono); flex-shrink: 0;">★${c.score_stars || 4}</span>
+                  <span class="ap-card-message-status" title="${escapeHtml(approvalStatus)}" style="font-size:9px;color:${c.approval_valid ? 'var(--emerald-400)' : 'var(--amber-400)'};">${escapeHtml(approvalStatus)}</span>
                   ${genderBadge}
                   ${verifiedBadge}
                 </div>
                 <div class="ap-badge-slot">
                   ${badgeHtml}
-                  <button type="button" class="badge-ap-skip-btn" onclick="event.stopPropagation(); skipAutopilotHost('${escapeHtml(c.username)}')" title="Исключить хоста из очереди (SKIPPED)">✕</button>
+                  ${['sent','uncertain','skipped','sending'].includes(rawState) ? '' : `<button type="button" class="badge-ap-skip-btn" onclick="event.stopPropagation(); skipAutopilotHost('${escapeHtml(c.username)}')" title="Исключить хоста из очереди (SKIPPED)">✕</button>`}
                 </div>
               </div>
             `;
           }).filter(Boolean).join('');
-
-          // Preserve any actively fading-out DOM elements
-          const fadingElements = Array.from(readyContainer.querySelectorAll('.fade-out-item'));
-          readyContainer.innerHTML = rowsHtml;
-          fadingElements.forEach(el => readyContainer.prepend(el));
+          const pagination = autopilotHostCollection.pagination || {};
+          const page = Number(pagination.page || 1);
+          const totalPages = Number(pagination.total_pages || 1);
+          const pagerHtml = `<div class="ap-host-pager" style="display:flex;align-items:center;justify-content:center;gap:12px;padding:12px;color:var(--ink-300);font-size:12px;">
+            <button type="button" class="btn btn-secondary btn-sm" ${page <= 1 ? 'disabled' : ''} onclick="loadAutopilotHosts(${page - 1})">Previous</button>
+            <span>Page ${page} / ${totalPages} · ${Number(pagination.total_hosts || 0)} hosts</span>
+            <button type="button" class="btn btn-secondary btn-sm" ${page >= totalPages ? 'disabled' : ''} onclick="loadAutopilotHosts(${page + 1})">Next</button>
+          </div>`;
+          readyContainer.innerHTML = rowsHtml + pagerHtml;
         }
       }
 
@@ -8722,7 +8865,10 @@
         const res = await fetch(`/api/autopilot/skip/${encodeURIComponent(username)}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ reason: "Исключен вручную из очереди автопилота" })
+          body: JSON.stringify({
+            reason: "Исключен вручную из очереди автопилота",
+            trip_id: (selectedTripContext && selectedTripContext.trip_id) ? selectedTripContext.trip_id : null
+          })
         });
         const data = await res.json();
         if (res.ok && data.status === 'ok') {
@@ -10357,6 +10503,28 @@
         const gender = h.estimated_gender || 'Unknown';
         homeEl.innerHTML = `<div><strong>Sleeping:</strong> ${escapeHtml(sleep)} • <strong>Gender:</strong> ${escapeHtml(gender)}</div><div style="margin-top:4px; color:var(--ink-400);">${escapeHtml(rules)}</div>`;
       }
+      const evidenceEl = document.getElementById('hdm-profile-evidence');
+      if (evidenceEl) {
+        const pi = h.profile_intelligence || {};
+        const verification = String(pi.verification_status || h.verification_status || (h.is_verified ? 'VERIFIED' : 'UNKNOWN')).replaceAll('_', ' ');
+        const activity = pi.recently_active_raw || h.last_active_raw || pi.recently_active_status || h.recently_active_status || 'UNKNOWN';
+        const badges = pi.badges || h.badges || [];
+        const sections = pi.sections || [];
+        const references = pi.references || [];
+        const refStats = pi.reference_stats || {};
+        const genderEvidence = pi.gender_evidence || [];
+        const sectionNames = {
+          about: 'About', personal_description: 'Personal description', shared_information: 'Shared Information',
+          why_on_couchsurfing: "Why I'm on Couchsurfing", interests: 'Interests', languages: 'Languages',
+          occupation: 'Occupation', education: 'Education', location: 'Location', living_situation: 'Living situation',
+          additional_information: 'Additional information'
+        };
+        const sectionHtml = sections.map(s => `<div style="margin-top:7px;"><strong>${escapeHtml(sectionNames[s.section_name] || s.section_name)} · ${escapeHtml(s.extraction_status || 'UNKNOWN')}:</strong> ${escapeHtml(s.section_text || 'No text returned')}</div>`).join('');
+        const badgeHtml = badges.length ? badges.map(b => `<span class="badge" style="display:inline-block; margin:3px 4px 0 0;">${escapeHtml(b.badge_name || b.badge_text || 'Badge')}</span>`).join('') : '<span>Badges: not returned by source</span>';
+        const refsHtml = references.length ? references.map(r => `<div style="margin-top:7px; padding-top:6px; border-top:1px solid var(--ink-800);"><strong>${escapeHtml(r.author_username || 'Reference')} · ${escapeHtml(r.reference_date || 'date unknown')}</strong><div>${escapeHtml(r.reference_text || '')}</div></div>`).join('') : '<div style="margin-top:5px;">Reference texts were not returned; count from card: ' + escapeHtml(String(refs)) + '</div>';
+        const genderHtml = genderEvidence.length ? genderEvidence.map(e => `<div style="margin-top:4px;">${escapeHtml(e.inferred_gender)} · ${escapeHtml(e.evidence_type)} · ${escapeHtml(e.evidence_source)}: ${escapeHtml(e.evidence_fragment)}</div>`).join('') : '<div>Gender evidence: no explicit clues collected</div>';
+        evidenceEl.innerHTML = `<div><strong>Verification:</strong> ${escapeHtml(verification)} <span style="color:var(--ink-400);">${escapeHtml(pi.verification_evidence || '')}</span> · <strong>Last active:</strong> ${escapeHtml(String(activity))}</div><div style="margin-top:8px;"><strong>Badges</strong><br>${badgeHtml}</div>${sectionHtml}<div style="margin-top:10px;"><strong>References</strong> · ${escapeHtml(String(refStats.total_references ?? refs))} total, ${escapeHtml(String(refStats.positive_references ?? '—'))} positive, ${escapeHtml(String(refStats.negative_references ?? '—'))} negative${refsHtml}</div><div style="margin-top:10px;"><strong>Gender evidence</strong>${genderHtml}</div>`;
+      }
       if (hooksEl) {
         const ph = h.primary_hook || {};
         const hookDetail = h.host_fact_used || ph.hook_detail || (h.conversation_hooks && h.conversation_hooks[0]) || 'Openness to hosting travelers';
@@ -10408,9 +10576,9 @@
       const name = candidate.name || candidate.clean_name || candidate.username || 'Host';
       const username = (candidate.username || '').replace(/^@/, '');
       const initials = name.split(' ').map(n => n[0]).filter(Boolean).slice(0, 2).join('').toUpperCase() || 'CS';
-      const message = candidate.message || candidate.generated_message || candidate.message_text || '';
+      const message = candidate.message || candidate.generated_message || candidate.message_text || candidate.message_draft || '';
       const words = message ? message.trim().split(/\s+/).length : 0;
-      const status = candidate.status || (type === 'sent' ? 'WAS SENT' : 'QUEUED');
+      const status = candidate.status || (candidate.state ? String(candidate.state).replaceAll('_', ' ').toUpperCase() : (type === 'sent' ? 'WAS SENT' : 'QUEUED'));
 
       if (nameEl) nameEl.textContent = name;
       if (userEl) userEl.textContent = '@' + username;

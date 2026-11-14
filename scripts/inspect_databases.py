@@ -6,7 +6,7 @@ scripts/inspect_databases.py
 1. Проверка PRAGMA (journal_mode, foreign_keys, busy_timeout, integrity_check).
 2. Анализ таблиц и подсчет записей (как доменных core_*, так и legacy).
 3. Поиск дубликатов, некорректных связей и записей-сирот (orphaned records).
-4. Сверка дисковых JSON-файлов (sent_log.json, requests_queue.json) с таблицами БД.
+4. Сверка журнала отправок с таблицами БД.
 5. Вывод форматированного отчета в консоль и в JSON.
 """
 
@@ -20,7 +20,7 @@ from typing import Any, Dict, List
 
 # Подключаем каноническое ядро
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from core.database import get_db_path, get_connection, OUTPUT_DIR
+from core.database import get_db_path, get_connection, get_production_db_path, OUTPUT_DIR
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DBInspect")
@@ -125,7 +125,7 @@ def main():
     parser.add_argument("--json", action="store_true", help="Output raw JSON")
     args = parser.parse_args()
 
-    db_path = Path(args.db_path) if args.db_path else get_db_path()
+    db_path = get_db_path(args.db_path) if args.db_path else get_production_db_path()
     try:
         report = inspect_database(db_path)
     except Exception as e:

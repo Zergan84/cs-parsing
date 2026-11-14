@@ -15,38 +15,35 @@ tests/test_architectural_invariants.py
 import ast
 import os
 import unittest
+import tempfile
 from pathlib import Path
 
 from core.autopilot import AutopilotEngine
 from core.collector import CollectorEngine
 from core.database import get_connection, init_db
+from core.dispatch_confirmation import (
+    ConfirmationCapability,
+    ConfirmationResult,
+    DispatchOutcome,
+    EvidenceType,
+    get_confirmation_validator,
+)
+from core.dispatch_identity import register_host_identity, reserve_host_for_dispatch
 from core.models import HostState
 from core.queue import QueueEngine
 from core.selector import SelectorEngine
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-TEST_DB_PATH = REPO_ROOT / "output" / "test_architectural_invariants.db"
+TEST_DB_PATH = Path(tempfile.mkdtemp(prefix="cs-architecture-invariants-")) / "test.db"
 TRIP_A_ID = "test_trip_a_invariants"
 TRIP_B_ID = "test_trip_b_invariants"
 
 
 class TestArchitecturalInvariants(unittest.TestCase):
-
-    @classmethod
-    def setUpClass(cls):
-        if TEST_DB_PATH.exists():
-            TEST_DB_PATH.unlink()
-        init_db(TEST_DB_PATH)
-
-    @classmethod
-    def tearDownClass(cls):
-        if TEST_DB_PATH.exists():
-            try:
-                TEST_DB_PATH.unlink()
-            except Exception:
-                pass
-
     def setUp(self):
+        global TEST_DB_PATH
+        TEST_DB_PATH = Path(tempfile.mkdtemp(prefix="cs-architecture-invariants-test-")) / "test.db"
+        init_db(TEST_DB_PATH)
         with get_connection(TEST_DB_PATH) as conn:
             conn.execute("DELETE FROM core_audit_logs;")
             conn.execute("DELETE FROM core_hosts;")
@@ -63,6 +60,10 @@ class TestArchitecturalInvariants(unittest.TestCase):
                 """,
                 (TRIP_A_ID, TRIP_B_ID),
             )
+
+    def tearDown(self):
+        for suffix in ("", "-wal", "-shm"):
+            Path(f"{TEST_DB_PATH}{suffix}").unlink(missing_ok=True)
 
     # 1. ТЕСТ: ПОЛИТИКА ЕДИНОГО СОЕДИНЕНИЯ (AST SCANNING)
     def test_single_connection_policy(self):
@@ -143,11 +144,41 @@ class TestArchitecturalInvariants(unittest.TestCase):
         collector.ingest_raw_host({"id": "h_inv_sent", "username": "sent_user", "name": "Ken"})
         selector.decide("h_inv_sent", "like")
         queue.generate_draft("h_inv_sent")
-        queue.approve("h_inv_sent")
-        autopilot.mark_as_sent("h_inv_sent", http_status=200)
+        queue.approve("h_inv_sent", created_by="user:test")
+        # Создаём capability для mark_as_sent
+        register_host_identity("username", "sent_user", "un:sent_user", db_file=TEST_DB_PATH)
+        reservation = reserve_host_for_dispatch("username", "sent_user", TRIP_A_ID, db_file=TEST_DB_PATH)
+        validator = get_confirmation_validator(db_file=TEST_DB_PATH)
+        capability = validator.issue_capability(
+            attempt_id=reservation["attempt_id"],
+            canonical_host_key=reservation["canonical_key"],
+        )
+        confirmation = ConfirmationResult(
+            outcome=DispatchOutcome.CONFIRMED_SENT,
+            capability=capability,
+            evidence_type=EvidenceType.CONFIRMED_ACCEPTANCE,
+            attributable_to_stay_request=True,
+            http_status=200,
+        )
+        from auto_sender import AutoSender
+        sender = AutoSender(trip_id=TRIP_A_ID, test_mode=True)
+        sender.autopilot_engine = autopilot
+        sender._current_attempt_id = reservation["attempt_id"]
+        result = sender.handle_submission_result(
+            username="sent_user",
+            host_name="Ken",
+            target_city="Kyoto",
+            arrival_date="2026-11-19",
+            departure_date="2026-11-21",
+            message="Hello",
+            submission_confirmed=True,
+            http_status=200,
+            confirmation=confirmation,
+        )
+        self.assertTrue(result)
 
         # Попытка approve после sent
-        self.assertFalse(queue.approve("h_inv_sent"))
+        self.assertFalse(queue.approve("h_inv_sent", created_by="user:test"))
 
         # Попытка skip после sent
         self.assertFalse(queue.skip("h_inv_sent"))
@@ -181,7 +212,7 @@ class TestArchitecturalInvariants(unittest.TestCase):
         self.assertEqual(len(ready), 0)
 
         # Утверждаем h_drafted
-        queue.approve("h_drafted")
+        queue.approve("h_drafted", created_by="user:test")
         ready_after = autopilot.get_ready_candidates()
         self.assertEqual(len(ready_after), 1)
         self.assertEqual(ready_after[0]["host_id"], "h_drafted")

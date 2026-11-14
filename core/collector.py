@@ -15,9 +15,27 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from core.context import GUEST, get_personal_context_manager
 from core.database import db_session, get_connection, log_audit
+from core.host_activity import RECENT, parse_activity
+from core.host_policy import evaluate_host_eligibility
 from core.models import HostCard, HostState
 
 logger = logging.getLogger("Collector")
+
+
+def _activity_from_host(host_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Prefer normalized scraper evidence; only parse source API fields when needed."""
+    status = str(host_data.get("recently_active_status") or "").upper()
+    if status in {"RECENTLY_ACTIVE", "ACTIVE", "NOT_RECENTLY_ACTIVE", "UNKNOWN"}:
+        return {
+            "status": status,
+            "raw": host_data.get("last_login_raw") or host_data.get("last_active_raw") or host_data.get("activity_raw"),
+            "days": host_data.get("last_login_days"),
+            "at": host_data.get("last_active_at"),
+        }
+    return parse_activity(
+        is_recently_active=host_data.get("isRecentlyActive"),
+        raw_value=host_data.get("last_login_raw") or host_data.get("last_active_raw") or host_data.get("lastLogin") or host_data.get("last_login"),
+    )
 
 
 # =====================================================================
@@ -40,7 +58,20 @@ def calculate_match_score(host_data: Dict[str, Any]) -> Tuple[int, List[str]]:
     languages = [str(x).lower() for x in (host_data.get("languages") or [])]
     countries = [str(x).lower() for x in (host_data.get("countries_visited") or [])]
 
-    full_text = " ".join([about] + interests + countries)
+    reference_data = host_data.get("reference_text") or host_data.get("references") or host_data.get("reviews") or []
+    if isinstance(reference_data, list):
+        reference_text = " ".join(
+            str(item.get("text") or item.get("body") or item.get("content") or "")
+            if isinstance(item, dict) else str(item)
+            for item in reference_data
+        )
+    else:
+        reference_text = str(reference_data or "")
+    supplemental = " ".join(str(host_data.get(key) or "") for key in (
+        "shared_information", "why_on_couchsurfing", "personal_description",
+        "additional_information", "reference_text",
+    )).lower() + " " + reference_text.lower()
+    full_text = " ".join([about, supplemental] + interests + countries)
 
     # Горы / Лыжи / Outdoor
     outdoor_matches = [k for k in GUEST.interests["outdoors"] if k in full_text]
@@ -68,6 +99,10 @@ def calculate_match_score(host_data: Dict[str, Any]) -> Tuple[int, List[str]]:
             reasons.append("Владеет французским языком")
 
     # Проверка наполненности анкеты
+    activity = _activity_from_host(host_data)
+    if activity["status"] == RECENT:
+        return 5, ["RECENTLY ACTIVE — top priority (5★)"] + reasons
+
     has_meaningful_data = bool(interests or languages or (about and len(about.split()) >= 5))
     if not has_meaningful_data:
         return 1, ["НЕТ ДАННЫХ (анкета не заполнена или отсутствует информация)"]
@@ -112,17 +147,60 @@ class CollectorEngine:
             )
             existing = cur.fetchone()
             if existing:
+                refreshed = _activity_from_host(raw_host)
+                if refreshed["status"] != "UNKNOWN":
+                    checked_at = raw_host.get("activity_checked_at") or now_iso
+                    source = raw_host.get("activity_source") or "couchsurfing_api"
+                    cur.execute(
+                        """UPDATE core_hosts SET recently_active_status=?, last_active_raw=?, last_login_days=?,
+                                  last_active_at=?, activity_checked_at=?, activity_source=?,
+                                  priority=CASE WHEN ?='RECENTLY_ACTIVE' THEN MAX(COALESCE(priority,10),1000) ELSE priority END,
+                                  score_stars=CASE WHEN ?='RECENTLY_ACTIVE' THEN 5 ELSE score_stars END,
+                                  updated_at=? WHERE trip_id=? AND (host_id=? OR username=?) AND state!='sent'""",
+                        (refreshed["status"], refreshed["raw"], refreshed["days"], refreshed["at"],
+                         checked_at, source, refreshed["status"], refreshed["status"], now_iso,
+                         self.trip_id, host_id, username),
+                    )
+                    conn.execute(
+                        """INSERT INTO core_host_snapshots(host_id,trip_id,raw_data_json,captured_at) VALUES(?,?,?,?)
+                           ON CONFLICT(trip_id,host_id) DO UPDATE SET raw_data_json=excluded.raw_data_json,
+                             captured_at=excluded.captured_at""",
+                        (host_id, self.trip_id, json.dumps(raw_host, ensure_ascii=False), now_iso),
+                    )
                 return None
 
+        activity = _activity_from_host(raw_host)
         score_stars, score_reasons = calculate_match_score(raw_host)
 
         name = (raw_host.get("name") or raw_host.get("first_name") or username).strip()
         location = (raw_host.get("location") or raw_host.get("city") or "").strip()
 
+        profile_api = raw_host.get("profile_api_data") if isinstance(raw_host.get("profile_api_data"), dict) else {}
+        policy_host = {**profile_api, **raw_host}
+        eligibility = evaluate_host_eligibility(
+            policy_host,
+            arrival_date=raw_host.get("arrival_date") or raw_host.get("trip_arrival"),
+            departure_date=raw_host.get("departure_date") or raw_host.get("trip_departure"),
+            target_city=raw_host.get("target_city") or raw_host.get("city"),
+            guest_gender=raw_host.get("guest_gender") or "male",
+        )
+        exclusion_reason = raw_host.get("eligibility_reason") or eligibility.get("reason")
         init_state = HostState.DISCOVERED
-        if raw_host.get("is_hosting") == "not_accepting":
+        if raw_host.get("is_hosting") == "not_accepting" or exclusion_reason:
             init_state = HostState.SKIPPED
-            score_reasons.append("Не принимает гостей / в поездке")
+            score_reasons.append(exclusion_reason or "Не принимает гостей / в поездке")
+
+        verified_value = raw_host.get("is_verified")
+        if verified_value is None:
+            verified_value = raw_host.get("isIdentificationVerified")
+        verified_text = str(verified_value).strip().lower()
+        if verified_value is True or verified_text in {"true", "1", "yes", "verified"}:
+            verification_status = "VERIFIED"
+        elif verified_value is False or verified_text in {"false", "0", "no", "not verified", "not_verified", "unverified"}:
+            verification_status = "NOT_VERIFIED"
+        else:
+            verification_status = "UNKNOWN"
+        is_verified = verification_status == "VERIFIED"
 
         card = HostCard(
             host_id=host_id,
@@ -140,7 +218,12 @@ class CollectorEngine:
             countries_lived=raw_host.get("countries_lived") or [],
             profile_url=raw_host.get("profile_url") or f"https://www.couchsurfing.com/c/users/{username}",
             avatar_url=raw_host.get("avatar_url") or raw_host.get("profile_photo_url"),
-            is_verified=bool(raw_host.get("is_verified") or raw_host.get("isIdentificationVerified")),
+            is_verified=is_verified,
+            verification_status=verification_status,
+            recently_active_status=activity["status"],
+            last_active_raw=activity["raw"],
+            last_login_days=activity["days"],
+            last_active_at=activity["at"],
             birth_country=raw_host.get("birth_country"),
             residence_country=raw_host.get("residence_country"),
             is_hosting=raw_host.get("is_hosting", "unknown"),
@@ -169,10 +252,13 @@ class CollectorEngine:
                 INSERT INTO core_hosts (
                     host_id, trip_id, username, name, location, gender, age, occupation,
                     about, interests_json, languages_json, countries_json, profile_url,
-                    avatar_url, is_verified, birth_country, residence_country, is_hosting,
+                    avatar_url, is_verified, verification_status, recently_active_status, last_active_raw,
+                    last_login_days, last_active_at, activity_checked_at, activity_source,
+                    eligibility_reason, eligibility_evidence_json, eligibility_checked_at,
+                    birth_country, residence_country, is_hosting,
                     household, special_notes, countries_lived_json,
-                    score_stars, score_reasons_json, state, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    score_stars, score_reasons_json, state, priority, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
                 (
                     card.host_id, card.trip_id, card.username, card.name, card.location,
@@ -181,11 +267,20 @@ class CollectorEngine:
                     json.dumps(card.languages, ensure_ascii=False),
                     json.dumps(card.countries_visited, ensure_ascii=False),
                     card.profile_url, card.avatar_url, 1 if card.is_verified else 0,
+                    card.verification_status,
+                    card.recently_active_status, card.last_active_raw,
+                    card.last_login_days, card.last_active_at,
+                    raw_host.get("activity_checked_at") or now_iso,
+                    raw_host.get("activity_source") or ("couchsurfing_api" if "isRecentlyActive" in raw_host or "lastLogin" in raw_host else "normalized_profile"),
+                    exclusion_reason,
+                    json.dumps(raw_host.get("eligibility_evidence") or ({"source": eligibility.get("source"), "excerpt": eligibility.get("excerpt")} if exclusion_reason else {}), ensure_ascii=False),
+                    now_iso,
                     card.birth_country, card.residence_country, card.is_hosting,
                     card.household, card.special_notes,
                     json.dumps(card.countries_lived, ensure_ascii=False),
                     card.score_stars, json.dumps(card.score_reasons, ensure_ascii=False),
-                    card.state.value, card.created_at, card.updated_at,
+                    card.state.value, 1000 if activity["status"] == RECENT else 10,
+                    card.created_at, card.updated_at,
                 ),
             )
 

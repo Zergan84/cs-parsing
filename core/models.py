@@ -30,6 +30,22 @@ class HostState(str, Enum):
     SKIPPED = "skipped"        # Пропущен
     UNCERTAIN = "uncertain"    # Неизвестный/неподтвержденный исход отправки (требует ручной проверки)
 
+    def can_transition_to(self, target: "HostState") -> bool:
+        """Domain transition policy shared by application use cases."""
+        allowed = {
+            HostState.DISCOVERED: {HostState.SELECTED, HostState.DRAFTED, HostState.APPROVED, HostState.REJECTED, HostState.SKIPPED},
+            HostState.SELECTED: {HostState.DRAFTED, HostState.APPROVED, HostState.REJECTED, HostState.SKIPPED},
+            HostState.DRAFTED: {HostState.APPROVED, HostState.SELECTED, HostState.REJECTED, HostState.SKIPPED},
+            HostState.APPROVED: {HostState.SENDING, HostState.SKIPPED, HostState.DRAFTED, HostState.DISCOVERED},
+            HostState.SENDING: {HostState.SENT, HostState.UNCERTAIN, HostState.APPROVED},
+            HostState.UNCERTAIN: set(),
+            HostState.SENT: {HostState.INBOX},
+            HostState.SKIPPED: {HostState.SELECTED, HostState.DRAFTED},
+            HostState.REJECTED: {HostState.DISCOVERED},
+            HostState.INBOX: set(),
+        }
+        return target in allowed.get(self, set())
+
 
 class QueueStatus(str, Enum):
     DRAFT = "Draft"
@@ -94,6 +110,11 @@ class HostCard(BaseModel):
 
     # Расширенные показатели профиля хоста (ТЗ)
     is_verified: bool = False
+    verification_status: str = "UNKNOWN"
+    recently_active_status: str = "UNKNOWN"
+    last_active_raw: Optional[str] = None
+    last_login_days: Optional[int] = None
+    last_active_at: Optional[str] = None
     birth_country: Optional[str] = None
     residence_country: Optional[str] = None
     is_hosting: Optional[str] = "unknown"  # "accepting", "maybe", "not_accepting", "unknown"

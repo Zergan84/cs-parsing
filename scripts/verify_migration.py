@@ -31,14 +31,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from core.database import OUTPUT_DIR, get_db_path
+from core.database import OUTPUT_DIR, get_db_path, get_production_db_path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("VerifyMigration")
 
 
 def verify_migration(db_path: Path, sent_log_path: Optional[Path] = None) -> Dict[str, Any]:
-    db_file = Path(db_path).resolve()
+    db_file = get_db_path(db_path)
     if not db_file.exists():
         raise FileNotFoundError(f"Database not found: {db_file}")
 
@@ -46,7 +46,7 @@ def verify_migration(db_path: Path, sent_log_path: Optional[Path] = None) -> Dic
         local_candidate = db_file.parent / "sent_log.json"
         if local_candidate.exists():
             effective_sent_log = local_candidate
-        elif (OUTPUT_DIR / "sent_log.json").exists() and db_file == get_db_path().resolve():
+        elif (OUTPUT_DIR / "sent_log.json").exists() and db_file == get_production_db_path():
             effective_sent_log = OUTPUT_DIR / "sent_log.json"
         else:
             effective_sent_log = None
@@ -466,7 +466,7 @@ def main():
     parser.add_argument("--sent-log", type=str, default=None, help="Path to sent_log.json")
     args = parser.parse_args()
 
-    db_path = Path(args.db_path) if args.db_path else get_db_path()
+    db_path = get_db_path(args.db_path) if args.db_path else get_production_db_path()
     sent_log_path = Path(args.sent_log) if args.sent_log else None
     try:
         report = verify_migration(db_path, sent_log_path=sent_log_path)

@@ -13,10 +13,13 @@ tests/test_migration_and_lifecycle.py
 import json
 import unittest
 from pathlib import Path
+import tempfile
 
 from core.autopilot import AutopilotEngine
 from core.collector import CollectorEngine
 from core.database import get_connection, init_db
+from core.dispatch_confirmation import get_confirmation_validator
+from core.dispatch_identity import register_host_identity, reserve_host_for_dispatch
 from core.inbox import InboxEngine
 from core.models import HostState
 from core.queue import QueueEngine
@@ -25,27 +28,15 @@ from scripts.migrate_legacy_database import run_migration
 from scripts.verify_migration import verify_migration
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-TEST_DB_PATH = REPO_ROOT / "output" / "test_migration_lifecycle.db"
+TEST_DB_PATH = Path(tempfile.mkdtemp(prefix="cs-migration-lifecycle-")) / "test.db"
 LIFECYCLE_TRIP_ID = "trip_lifecycle_sapporo"
 
 
 class TestMigrationAndLifecycle(unittest.TestCase):
-
-    @classmethod
-    def setUpClass(cls):
-        if TEST_DB_PATH.exists():
-            TEST_DB_PATH.unlink()
-        init_db(TEST_DB_PATH)
-
-    @classmethod
-    def tearDownClass(cls):
-        if TEST_DB_PATH.exists():
-            try:
-                TEST_DB_PATH.unlink()
-            except Exception:
-                pass
-
     def setUp(self):
+        global TEST_DB_PATH
+        TEST_DB_PATH = Path(tempfile.mkdtemp(prefix="cs-migration-lifecycle-test-")) / "test.db"
+        init_db(TEST_DB_PATH)
         with get_connection(TEST_DB_PATH) as conn:
             conn.execute("DELETE FROM core_audit_logs;")
             conn.execute("DELETE FROM core_hosts;")
@@ -56,6 +47,10 @@ class TestMigrationAndLifecycle(unittest.TestCase):
             conn.execute("DELETE FROM hosts;")
             conn.execute("DELETE FROM core_trips;")
             conn.execute("DELETE FROM user_trips;")
+
+    def tearDown(self):
+        for suffix in ("", "-wal", "-shm"):
+            Path(f"{TEST_DB_PATH}{suffix}").unlink(missing_ok=True)
 
     # 1. ТЕСТ: ИДЕМПОТЕНТНОСТЬ МИГРАЦИИ НА ТЕСТОВОЙ БД
     def test_migration_idempotency(self):
@@ -159,7 +154,7 @@ class TestMigrationAndLifecycle(unittest.TestCase):
         self.assertTrue(50 <= wc <= 95, f"Word count was {wc}")
 
         # 5. Ручной Approve
-        self.assertTrue(queue.approve("h_sapporo_snow"))
+        self.assertTrue(queue.approve("h_sapporo_snow", created_by="user:test"))
         with get_connection(TEST_DB_PATH) as conn:
             cur = conn.cursor()
             cur.execute("SELECT state FROM core_hosts WHERE trip_id = ? AND host_id = 'h_sapporo_snow';", (LIFECYCLE_TRIP_ID,))
@@ -173,7 +168,20 @@ class TestMigrationAndLifecycle(unittest.TestCase):
         jitter = autopilot.calculate_jitter_seconds()
         self.assertTrue(300 <= jitter <= 600)
 
-        self.assertTrue(autopilot.mark_as_sent("h_sapporo_snow", http_status=200))
+        # Создаём capability для mark_as_sent
+        register_host_identity("username", "snow_guide_daiki", "un:snow_guide_daiki", db_file=TEST_DB_PATH)
+        reservation = reserve_host_for_dispatch("username", "snow_guide_daiki", LIFECYCLE_TRIP_ID, db_file=TEST_DB_PATH)
+        validator = get_confirmation_validator(db_file=TEST_DB_PATH)
+        capability = validator.issue_capability(
+            attempt_id=reservation["attempt_id"],
+            canonical_host_key=reservation["canonical_key"],
+        )
+        self.assertTrue(autopilot.mark_as_sent(
+            "h_sapporo_snow",
+            http_status=200,
+            capability=capability,
+            attempt_id=reservation["attempt_id"],
+        ))
         self.assertEqual(autopilot.get_sent_today_count(), 1)
         self.assertEqual(len(autopilot.get_ready_candidates()), 0)
 

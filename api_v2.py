@@ -106,6 +106,10 @@ class BatchApprovePayload(BaseModel):
     host_ids: List[str]
 
 
+class RevokeApprovalPayload(BaseModel):
+    host_id: str
+
+
 @router.get("/queue")
 async def get_queue_items(state: Optional[str] = Query(None)):
     """Возвращает список хостов в очереди (selected, drafted, approved)."""
@@ -132,10 +136,16 @@ async def post_approve_draft(payload: ApproveDraftPayload):
     trip_id = get_active_trip_id()
     engine = QueueEngine(trip_id=trip_id)
     try:
-        ok = engine.approve(payload.host_id, edited_text=payload.edited_text)
+        ok = engine.approve(payload.host_id, edited_text=payload.edited_text, created_by="user:api_v2_queue_approve")
         if not ok:
             raise HTTPException(status_code=404, detail="Host not found")
-        return {"status": "ok", "host_id": payload.host_id, "state": "approved"}
+        host = engine.repository.get_host_context(trip_id, payload.host_id)
+        from core.approval_service import ApprovalService
+        approval = ApprovalService().get_approval_status(
+            trip_id=trip_id, host_id=host["host_id"], username=host["username"],
+            message_text=host.get("message_draft") or "", message_version=host.get("message_version"),
+        )
+        return {"status": "ok", "host_id": payload.host_id, "state": "approved", "approval": approval.as_dict()}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -145,8 +155,28 @@ async def post_batch_approve(payload: BatchApprovePayload):
     """Пакетное утверждение писем."""
     trip_id = get_active_trip_id()
     engine = QueueEngine(trip_id=trip_id)
-    approved_count = engine.batch_approve(payload.host_ids)
+    approved_count = engine.batch_approve(payload.host_ids, created_by="user:api_v2_batch_approve")
     return {"status": "ok", "approved_count": approved_count}
+
+
+@router.post("/queue/revoke")
+async def post_revoke_approval(payload: RevokeApprovalPayload):
+    """Revoke the explicit user approval for one host in the active trip."""
+    from core.approval_service import ApprovalService
+    trip_id = get_active_trip_id()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT host_id FROM core_hosts WHERE trip_id=? AND (host_id=? OR LOWER(username)=LOWER(?))",
+            (trip_id, payload.host_id, payload.host_id),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Host not found in active trip")
+    result = ApprovalService().revoke_approval(
+        trip_id=trip_id, host_id=row["host_id"], reason="revoked by user through API",
+    )
+    if result.code == "APPROVAL_NOT_FOUND":
+        raise HTTPException(status_code=404, detail=result.detail)
+    return {"status": result.code, "approval": result.as_dict()}
 
 
 class SkipQueuePayload(BaseModel):

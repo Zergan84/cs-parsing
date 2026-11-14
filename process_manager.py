@@ -21,7 +21,7 @@ from database import db_session
 
 logger = logging.getLogger("ProcessManager")
 BASE_DIR = Path(__file__).parent
-OUTPUT_DIR = BASE_DIR / "output"
+OUTPUT_DIR = Path(os.environ.get("CS_OUTPUT_DIR", str(BASE_DIR / "output"))).resolve()
 OPERATIONS_LOG_FILE = OUTPUT_DIR / "operations.log"
 AUTO_SENDER_LOG_FILE = OUTPUT_DIR / "auto_sender.log"
 
@@ -29,7 +29,8 @@ AUTO_SENDER_LOG_FILE = OUTPUT_DIR / "auto_sender.log"
 class ProcessManager:
     """Централизованный контроллер фоновых задач с поддержкой единого сквозного логирования."""
 
-    def __init__(self):
+    def __init__(self, db_file: Optional[Path | str] = None):
+        self.db_file = Path(db_file).expanduser().resolve() if db_file is not None else None
         self.lock = asyncio.Lock()
         self.active_proc: Optional[asyncio.subprocess.Process] = None
         self.active_task_name: str = "None"
@@ -149,7 +150,7 @@ class ProcessManager:
             self._is_running = True
 
             # Запись задачи в SQLite
-            with db_session() as conn:
+            with db_session(self.db_file) as conn:
                 cur = conn.cursor()
                 cur.execute(
                     """
@@ -218,7 +219,7 @@ class ProcessManager:
 
     def _update_job_in_db(self, job_id: str, status: str, message: str = "") -> None:
         try:
-            with db_session() as conn:
+            with db_session(self.db_file) as conn:
                 cur = conn.cursor()
                 cur.execute(
                     """

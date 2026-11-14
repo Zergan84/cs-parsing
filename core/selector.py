@@ -37,11 +37,20 @@ class SelectorEngine:
                 SELECT host_id, username, name, location, gender, age, occupation,
                        about, interests_json, languages_json, countries_json,
                        profile_url, avatar_url, score_stars, score_reasons_json, state,
-                       is_verified, birth_country, residence_country, is_hosting,
-                       household, special_notes, countries_lived_json
+                       is_verified, verification_status, recently_active_status,
+                       last_active_raw, last_login_days, last_active_at, priority,
+                       references_count, birth_country, residence_country, is_hosting,
+                       household, special_notes, countries_lived_json,
+                       (SELECT raw_data_json FROM core_host_snapshots s
+                        WHERE s.trip_id=core_hosts.trip_id AND s.host_id=core_hosts.host_id
+                        ORDER BY s.captured_at DESC LIMIT 1) AS profile_snapshot_json
                 FROM core_hosts
                 WHERE trip_id = ? AND state = 'discovered' AND score_stars >= ?
-                ORDER BY score_stars DESC, created_at DESC
+                ORDER BY CASE WHEN recently_active_status='ACTIVE' THEN 0
+                              WHEN recently_active_status='RECENTLY_ACTIVE'
+                               AND activity_checked_at >= datetime('now','-30 days') THEN 1 ELSE 2 END,
+                         CASE WHEN last_login_days IS NULL THEN 2147483647 ELSE last_login_days END,
+                         priority DESC, score_stars DESC, created_at DESC
                 LIMIT ? OFFSET ?;
                 """,
                 (self.trip_id, min_stars, limit, offset),
@@ -51,8 +60,15 @@ class SelectorEngine:
             results = []
             for r in rows:
                 r_keys = r.keys()
+                try:
+                    profile_snapshot = json.loads(r["profile_snapshot_json"] or "{}")
+                    if not isinstance(profile_snapshot, dict):
+                        profile_snapshot = {}
+                except (TypeError, ValueError):
+                    profile_snapshot = {}
                 results.append({
                     "host_id": r["host_id"],
+                    "id": r["host_id"],
                     "username": r["username"],
                     "name": r["name"],
                     "location": r["location"],
@@ -67,6 +83,14 @@ class SelectorEngine:
                     "profile_url": r["profile_url"],
                     "avatar_url": r["avatar_url"],
                     "is_verified": bool(r["is_verified"]) if "is_verified" in r_keys else False,
+                    "verification_status": r["verification_status"] if "verification_status" in r_keys else "UNKNOWN",
+                    "recently_active_status": r["recently_active_status"] if "recently_active_status" in r_keys else "UNKNOWN",
+                    "last_active_raw": r["last_active_raw"] if "last_active_raw" in r_keys else None,
+                    "last_login_days": r["last_login_days"] if "last_login_days" in r_keys else None,
+                    "last_active_at": r["last_active_at"] if "last_active_at" in r_keys else None,
+                    "priority": r["priority"] if "priority" in r_keys else 10,
+                    "references_count": r["references_count"] if "references_count" in r_keys else 0,
+                    "profile_snapshot": profile_snapshot,
                     "birth_country": r["birth_country"] if "birth_country" in r_keys else None,
                     "residence_country": r["residence_country"] if "residence_country" in r_keys else None,
                     "is_hosting": r["is_hosting"] if "is_hosting" in r_keys else "unknown",

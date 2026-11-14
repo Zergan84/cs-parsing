@@ -16,6 +16,7 @@ tests/test_tz_pipeline.py - Комплексный тест-сьют на соо
 import json
 import sqlite3
 import unittest
+import tempfile
 from pathlib import Path
 
 from core.database import init_core_tables, get_connection, set_active_trip, get_active_trip
@@ -25,28 +26,26 @@ from core.collector import CollectorEngine, calculate_match_score
 from core.selector import SelectorEngine
 from core.queue import QueueEngine, build_personalized_message
 from core.autopilot import AutopilotEngine
+from core.dispatch_confirmation import get_confirmation_validator
+from core.dispatch_identity import register_host_identity, reserve_host_for_dispatch
 from core.inbox import InboxEngine
 
-TEST_DB_PATH = Path("output/test_tz_pipeline.db")
+TEST_DB_PATH = Path(tempfile.mkdtemp(prefix="cs-tz-pipeline-")) / "test.db"
 TEST_TRIP_ID = "kyoto-trip-3lhdfema5epclndo82mclxklzfytp-3LhDfEmA5Epclndo82MclXkLzFy_tp"
 TEST_URL = f"https://www.couchsurfing.com/c/trips/{TEST_TRIP_ID}"
 
 
 class TestTZGlobalPipeline(unittest.TestCase):
-
-    @classmethod
-    def setUpClass(cls):
-        """Создает изолированную тестовую базу данных."""
-        cls._cleanup_db_files()
+    def setUp(self):
+        global TEST_DB_PATH
+        TEST_DB_PATH = Path(tempfile.mkdtemp(prefix="cs-tz-pipeline-test-")) / "test.db"
         init_core_tables(db_file=TEST_DB_PATH)
+        self._reset_test_data()
 
-    @classmethod
-    def tearDownClass(cls):
-        """Удаляет изолированную тестовую базу данных."""
-        cls._cleanup_db_files()
+    def tearDown(self):
+        self._cleanup_db_files()
 
-    @classmethod
-    def _cleanup_db_files(cls):
+    def _cleanup_db_files(self):
         for ext in ["", "-wal", "-shm"]:
             f = Path(f"{TEST_DB_PATH}{ext}")
             if f.exists():
@@ -55,7 +54,7 @@ class TestTZGlobalPipeline(unittest.TestCase):
                 except Exception:
                     pass
 
-    def setUp(self):
+    def _reset_test_data(self):
         """Очистка таблиц перед каждым тестом."""
         init_core_tables(db_file=TEST_DB_PATH)
         with get_connection(TEST_DB_PATH) as conn:
@@ -207,7 +206,7 @@ class TestTZGlobalPipeline(unittest.TestCase):
         self.assertIn("Kyoto", text)
 
         # Утверждение (Approve)
-        self.assertTrue(queue.approve("h_art"))
+        self.assertTrue(queue.approve("h_art", created_by="user:test"))
 
         # Проверяем, что хост перешел в 'approved'
         approved = queue.list_queue(state="approved")
@@ -226,7 +225,7 @@ class TestTZGlobalPipeline(unittest.TestCase):
         collector.ingest_raw_host({"id": "h_auto", "username": "auto_candidate", "name": "Yuki", "about": "travel and hiking"})
         selector.decide("h_auto", "like")
         queue.generate_draft("h_auto")
-        queue.approve("h_auto")
+        queue.approve("h_auto", created_by="user:test")
 
         ready = autopilot.get_ready_candidates()
         self.assertEqual(len(ready), 1)
@@ -237,7 +236,17 @@ class TestTZGlobalPipeline(unittest.TestCase):
         self.assertTrue(300 <= jitter <= 600)
 
         # Фиксация отправки
-        self.assertTrue(autopilot.mark_as_sent("h_auto", http_status=200))
+        register_host_identity("username", "auto_candidate", f"un:auto_candidate", db_file=TEST_DB_PATH)
+        reservation = reserve_host_for_dispatch("username", "auto_candidate", TEST_TRIP_ID, db_file=TEST_DB_PATH)
+        validator = get_confirmation_validator(db_file=TEST_DB_PATH)
+        capability = validator.issue_capability(
+            attempt_id=reservation["attempt_id"],
+            canonical_host_key=reservation["canonical_key"],
+        )
+        self.assertTrue(autopilot.mark_as_sent(
+            "h_auto", http_status=200, capability=capability,
+            attempt_id=reservation["attempt_id"],
+        ))
         self.assertEqual(len(autopilot.get_ready_candidates()), 0)
         self.assertEqual(autopilot.get_sent_today_count(), 1)
 

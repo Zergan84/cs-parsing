@@ -8,7 +8,6 @@ from core.queue import (
     DEFAULT_CHECK_IN,
     DEFAULT_CHECK_OUT,
     DEFAULT_CONTEXT,
-    QUEUE_FILE,
     RAW_FILE,
     SENT_HISTORY_FILE,
     SENT_LOG_FILE,
@@ -22,7 +21,6 @@ from core.queue import (
 
 __all__ = [
     "BLACKLIST_PHRASES",
-    "QUEUE_FILE",
     "CURATED_FILE",
     "RAW_FILE",
     "SENT_HISTORY_FILE",

@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional
+from contextvars import ContextVar
 
 from core.models import AuditEvent, HostCard, HostState, Trip
 
@@ -27,7 +28,54 @@ logger = logging.getLogger("CoreDatabase")
 BASE_DIR = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = Path(os.environ.get("CS_OUTPUT_DIR", str(BASE_DIR / "output"))).resolve()
 DEFAULT_DB_PATH = (OUTPUT_DIR / "couchsurfing_platform.db").resolve()
+PROTECTED_PRODUCTION_DB_PATH = (BASE_DIR / "output" / "couchsurfing_platform.db").resolve()
 DB_PATH = Path(os.environ.get("CS_DB_PATH", str(DEFAULT_DB_PATH))).resolve()
+_DATABASE_PATH_OVERRIDE: ContextVar[Optional[Path]] = ContextVar("cs_database_path", default=None)
+
+
+def _is_test_runtime() -> bool:
+    return os.environ.get("CS_ENV", "").strip().lower() in {"test", "testing"} or bool(os.environ.get("PYTEST_CURRENT_TEST"))
+
+
+def _assert_safe_test_path(path: Path) -> None:
+    """Fail closed if test code resolves any alias of the production database."""
+    if not _is_test_runtime():
+        return
+    resolved = path.expanduser().resolve()
+    production = PROTECTED_PRODUCTION_DB_PATH
+    env_path = os.environ.get("CS_DB_PATH", "").strip()
+    if env_path:
+        configured = Path(env_path).expanduser().resolve()
+        if configured == production:
+            raise RuntimeError(f"Test runtime cannot use production database via CS_DB_PATH: {configured}")
+    if resolved == production:
+        raise RuntimeError(f"Test runtime cannot use production database: {resolved}")
+    try:
+        resolved.relative_to((BASE_DIR / "output").resolve())
+    except ValueError:
+        pass
+    else:
+        raise RuntimeError(f"Test runtime requires a temporary database outside project output/: {resolved}")
+    # Existing hard links resolve to different paths, so compare file identity too.
+    try:
+        if production.exists() and resolved.exists():
+            prod_stat, candidate_stat = production.stat(), resolved.stat()
+            if (prod_stat.st_dev, prod_stat.st_ino) == (candidate_stat.st_dev, candidate_stat.st_ino):
+                raise RuntimeError(f"Test runtime cannot use a hard link to production database: {resolved}")
+    except FileNotFoundError:
+        pass
+
+
+@contextmanager
+def database_path_context(db_file: Path | str):
+    """Set an explicit database for work performed within an app/request context."""
+    target = Path(db_file).expanduser().resolve()
+    _assert_safe_test_path(target)
+    token = _DATABASE_PATH_OVERRIDE.set(target)
+    try:
+        yield target
+    finally:
+        _DATABASE_PATH_OVERRIDE.reset(token)
 
 
 def get_output_dir() -> Path:
@@ -35,23 +83,39 @@ def get_output_dir() -> Path:
     return Path(os.environ.get("CS_OUTPUT_DIR", str(OUTPUT_DIR))).resolve()
 
 
+def get_production_db_path() -> Path:
+    """Return the production location for an explicit production bootstrap only."""
+    return PROTECTED_PRODUCTION_DB_PATH
+
+
 def get_db_path(db_file: Optional[Path | str] = None) -> Path:
     """
     Возвращает канонический путь к файлу базы данных SQLite.
     Приоритет:
     1. Явно переданный аргумент `db_file`.
-    2. Если `DB_PATH` был переопределен в модуле (например, через monkeypatch в тестах).
-    3. Переменная окружения `CS_DB_PATH`.
-    4. Дефолтный путь `output/couchsurfing_platform.db`.
+    2. Явный путь приложения в текущем async/request контексте.
+    3. Переменная окружения, установленная bootstrap приложения или тестовой среды.
+    4. Явный override DB_PATH (в основном для тестовых адаптеров).
+
+    Универсальный database module намеренно не выбирает production default.
     """
     if db_file is not None:
-        return Path(db_file).resolve()
+        target = Path(db_file).expanduser().resolve()
+        _assert_safe_test_path(target)
+        return target
+    scoped = _DATABASE_PATH_OVERRIDE.get()
+    if scoped is not None:
+        _assert_safe_test_path(scoped)
+        return scoped
     env_db = os.environ.get("CS_DB_PATH")
-    if DB_PATH != DEFAULT_DB_PATH:
-        return Path(DB_PATH).resolve()
     if env_db:
-        return Path(env_db).resolve()
-    return Path(DB_PATH).resolve()
+        target = Path(env_db).expanduser().resolve()
+    elif DB_PATH != DEFAULT_DB_PATH:
+        target = Path(DB_PATH).expanduser().resolve()
+    else:
+        raise RuntimeError("Database path is not configured; pass db_file or configure it in the application bootstrap")
+    _assert_safe_test_path(target)
+    return target
 
 
 def get_db_connection(db_file: Optional[Path | str] = None) -> sqlite3.Connection:
@@ -65,6 +129,20 @@ def get_db_connection(db_file: Optional[Path | str] = None) -> sqlite3.Connectio
     conn.execute("PRAGMA foreign_keys=ON;")
     conn.execute("PRAGMA busy_timeout=15000;")
     return conn
+
+
+@contextmanager
+def get_read_only_connection(db_file: Optional[Path | str] = None) -> Generator[sqlite3.Connection, None, None]:
+    """Open an existing SQLite database read-only and forbid writes at SQLite level."""
+    target = get_db_path(db_file)
+    _assert_safe_test_path(target)
+    conn = sqlite3.connect(target.as_uri() + "?mode=ro", uri=True, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only=ON")
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 @contextmanager
@@ -82,6 +160,18 @@ def get_connection(db_file: Optional[Path | str] = None) -> Generator[sqlite3.Co
         conn.close()
 
 
+def verify_schema_read_only(db_file: Path | str, required_tables: set[str]) -> None:
+    """Verify an existing SQLite schema without creating, migrating, or writing."""
+    target = Path(db_file).expanduser().resolve()
+    uri = target.as_uri() + "?mode=ro"
+    with sqlite3.connect(uri, uri=True, timeout=5) as conn:
+        conn.execute("PRAGMA query_only=ON")
+        present = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    missing = sorted(set(required_tables) - present)
+    if missing:
+        raise RuntimeError(f"Database schema is incomplete; refusing startup without migration: {', '.join(missing)}")
+
+
 # Канонический алиас транзакционной сессии
 db_session = get_connection
 
@@ -94,12 +184,14 @@ def _ensure_column(cursor: sqlite3.Cursor, table: str, column: str, col_def: str
         cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def};")
 
 
-def init_core_tables(db_file: Optional[Path | str] = None) -> None:
+def init_core_tables(db_file: Path | str) -> None:
     """
     Инициализирует полную каноническую схему базы данных со всеми таблицами,
     внешними ключами, индексами и дефолтными настройками.
     Операция идемпотентна и безопасна для существующих данных.
     """
+    if db_file is None:
+        raise ValueError("init_db requires an explicit database path")
     with get_connection(db_file) as conn:
         cur = conn.cursor()
 
@@ -161,6 +253,11 @@ def init_core_tables(db_file: Optional[Path | str] = None) -> None:
             profile_url TEXT,
             avatar_url TEXT,
             is_verified INTEGER DEFAULT 0,
+            verification_status TEXT NOT NULL DEFAULT 'UNKNOWN',
+            recently_active_status TEXT NOT NULL DEFAULT 'UNKNOWN',
+            last_active_raw TEXT,
+            last_login_days INTEGER,
+            last_active_at TEXT,
             birth_country TEXT,
             residence_country TEXT,
             is_hosting TEXT DEFAULT 'unknown',
@@ -183,6 +280,16 @@ def init_core_tables(db_file: Optional[Path | str] = None) -> None:
         );
         """)
         _ensure_column(cur, "core_hosts", "is_verified", "INTEGER DEFAULT 0")
+        _ensure_column(cur, "core_hosts", "verification_status", "TEXT NOT NULL DEFAULT 'UNKNOWN'")
+        _ensure_column(cur, "core_hosts", "recently_active_status", "TEXT NOT NULL DEFAULT 'UNKNOWN'")
+        _ensure_column(cur, "core_hosts", "last_active_raw", "TEXT")
+        _ensure_column(cur, "core_hosts", "last_login_days", "INTEGER")
+        _ensure_column(cur, "core_hosts", "last_active_at", "TEXT")
+        _ensure_column(cur, "core_hosts", "activity_checked_at", "TEXT")
+        _ensure_column(cur, "core_hosts", "activity_source", "TEXT")
+        _ensure_column(cur, "core_hosts", "eligibility_reason", "TEXT")
+        _ensure_column(cur, "core_hosts", "eligibility_evidence_json", "TEXT")
+        _ensure_column(cur, "core_hosts", "eligibility_checked_at", "TEXT")
         _ensure_column(cur, "core_hosts", "birth_country", "TEXT")
         _ensure_column(cur, "core_hosts", "residence_country", "TEXT")
         _ensure_column(cur, "core_hosts", "is_hosting", "TEXT DEFAULT 'unknown'")
@@ -194,6 +301,22 @@ def init_core_tables(db_file: Optional[Path | str] = None) -> None:
         _ensure_column(cur, "core_hosts", "clean_name", "TEXT")
         _ensure_column(cur, "core_hosts", "references_count", "INTEGER DEFAULT 0")
         _ensure_column(cur, "core_hosts", "response_rate_pct", "REAL DEFAULT 90.0")
+        _ensure_column(cur, "core_hosts", "score_stars", "INTEGER DEFAULT 1")
+        _ensure_column(cur, "core_hosts", "qc_notes", "TEXT")
+        _ensure_column(cur, "core_hosts", "message_version", "INTEGER NOT NULL DEFAULT 1")
+
+        # Any persisted message edit advances the version, including legacy API
+        # writes that bypass application services. Approval hashes remain tied
+        # to the exact version that the user reviewed.
+        cur.execute("""
+        CREATE TRIGGER IF NOT EXISTS trg_core_hosts_message_version
+        AFTER UPDATE OF message_draft ON core_hosts
+        WHEN OLD.message_draft IS NOT NEW.message_draft
+        BEGIN
+            UPDATE core_hosts SET message_version = COALESCE(OLD.message_version, 1) + 1
+            WHERE trip_id = NEW.trip_id AND host_id = NEW.host_id;
+        END;
+        """)
 
         cur.execute("CREATE INDEX IF NOT EXISTS idx_core_hosts_state ON core_hosts(trip_id, state);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_core_hosts_stars ON core_hosts(trip_id, score_stars DESC);")
@@ -627,6 +750,354 @@ def init_core_tables(db_file: Optional[Path | str] = None) -> None:
                     (a_id, a_name, a_cat, a_kw, a_desc, a_prio, a_act, now_iso, now_iso),
                 )
 
+        # ------------------------------------------------------------------
+        # 10. ДИСПЕТЧЕР ОТПРАВОК: ПОПЫТКИ, БЛОКИРОВКИ, ИДЕНТИЧНОСТИ
+        # ------------------------------------------------------------------
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS sending_attempts (
+            id TEXT PRIMARY KEY,
+            trip_id TEXT REFERENCES core_trips(id) ON DELETE SET NULL,
+            original_trip_id TEXT NOT NULL,
+            host_id TEXT NOT NULL,
+            username TEXT NOT NULL,
+            host_id_norm TEXT NOT NULL,
+            username_norm TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'pending'
+                CHECK (state IN ('pending','sending','sent','failed','uncertain','already_contacted')),
+            send_intent_committed INTEGER NOT NULL DEFAULT 0
+                CHECK (send_intent_committed IN (0,1)),
+            send_initiated INTEGER NOT NULL DEFAULT 0
+                CHECK (send_initiated IN (0,1)),
+            http_status INTEGER,
+            evidence_type TEXT
+                CHECK (evidence_type IN ('none','navigation','form_submission','confirmed_acceptance','legacy','outside_stay_request','existing_conversation','manual_reconciliation')),
+            evidence_reference TEXT,
+            confirmation_url TEXT,
+            error_details TEXT,
+            proof_screenshot TEXT,
+            created_at TEXT NOT NULL,
+            sent_at TEXT,
+            updated_at TEXT NOT NULL,
+            expires_at TEXT
+        );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_sa_active_per_user ON sending_attempts(host_id_norm, username_norm) WHERE state IN ('sending','uncertain','sent');")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_sa_trip_state ON sending_attempts(trip_id, state);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_sa_unresolved ON sending_attempts(state) WHERE state IN ('sending','uncertain');")
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS host_dispatch_locks (
+            lock_id TEXT PRIMARY KEY,
+            canonical_key TEXT NOT NULL,
+            attempt_id TEXT NOT NULL REFERENCES sending_attempts(id) ON DELETE RESTRICT,
+            lock_state TEXT NOT NULL CHECK (lock_state IN ('reserved','sending','sent','uncertain','already_contacted','released','failed')),
+            trip_id TEXT REFERENCES core_trips(id) ON DELETE SET NULL,
+            original_trip_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            expires_at TEXT
+        );
+        """)
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_hdl_one_active_per_user ON host_dispatch_locks(canonical_key) WHERE lock_state IN ('reserved','sending','sent','uncertain','already_contacted');")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_hdl_one_active_per_attempt ON host_dispatch_locks(attempt_id) WHERE lock_state IN ('reserved','sending','sent','uncertain','already_contacted');")
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS host_identities (
+            identity_id TEXT PRIMARY KEY,
+            identity_type TEXT NOT NULL CHECK (identity_type IN ('cs_id','username')),
+            identity_value TEXT NOT NULL,
+            canonical_key TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        """)
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_hi_type_value ON host_identities(identity_type, identity_value);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_hi_canonical ON host_identities(canonical_key);")
+
+        # --- sending_history: добавить новые колонки (идемпотентно) ---
+        _ensure_column(cur, "sending_history", "attempt_id", "TEXT")
+        _ensure_column(cur, "sending_history", "trip_id", "TEXT")
+        _ensure_column(cur, "sending_history", "event_type", "TEXT")
+        _ensure_column(cur, "sending_history", "state_at_event", "TEXT")
+        _ensure_column(cur, "sending_history", "evidence_type", "TEXT")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_sh_attempt ON sending_history(attempt_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_sh_trip ON sending_history(trip_id);")
+        cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_sh_idempotent_event
+            ON sending_history(attempt_id, event_type)
+            WHERE attempt_id IS NOT NULL
+              AND event_type IN ('RESERVATION','SEND_INTENT','SENT','FAILED_PRE_SUBMIT','UNCERTAIN','RECOVERY_UNCERTAIN','MANUAL_SENT','MANUAL_NOT_SENT','EXISTING_CONVERSATION','OUTSIDE_STAY_REQUEST','LEGACY_CONTACTED');
+        """)
+        cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_sh_attempt_result
+            ON sending_history(attempt_id)
+            WHERE attempt_id IS NOT NULL AND event_type = 'ATTEMPT_RESULT';
+        """)
+
+        # --- sending_attempts: добавить dispatch_outcome (идемпотентно) ---
+        _ensure_column(cur, "sending_attempts", "dispatch_outcome", "TEXT")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_sa_dispatch_outcome ON sending_attempts(dispatch_outcome);")
+
+        # --- Таблица отслеживания версий схемы (schema_migrations) ---
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            migration_id TEXT PRIMARY KEY,
+            applied_at TEXT NOT NULL,
+            description TEXT
+        );
+        """)
+
+        # --- Таблица capability токенов подтверждения ---
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS confirmation_capabilities (
+            attempt_id TEXT PRIMARY KEY,
+            canonical_host_key TEXT NOT NULL,
+            nonce TEXT NOT NULL,
+            cap_token TEXT NOT NULL,
+            issued_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            used INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        """)
+
+        # Approval records bind a user action to one exact message revision,
+        # host identity, and trip. Binding columns are immutable; only status
+        # and revocation metadata can change.
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS message_approvals (
+            approval_id TEXT PRIMARY KEY,
+            canonical_host_key TEXT NOT NULL,
+            trip_id TEXT NOT NULL,
+            host_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            approved_message_hash TEXT NOT NULL,
+            message_version INTEGER NOT NULL,
+            approved_at TEXT NOT NULL,
+            approval_status TEXT NOT NULL CHECK (approval_status IN ('approved','revoked','stale')),
+            created_by TEXT NOT NULL,
+            revoked_at TEXT,
+            revoke_reason TEXT
+        );
+        """)
+        cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_message_approvals_one_active
+        ON message_approvals(trip_id, message_id) WHERE approval_status='approved';
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_message_approvals_host ON message_approvals(canonical_host_key, trip_id);")
+        cur.execute("""
+        CREATE TRIGGER IF NOT EXISTS trg_message_approvals_binding_immutable
+        BEFORE UPDATE OF approval_id, canonical_host_key, trip_id, host_id, message_id,
+                         approved_message_hash, message_version, approved_at, created_by
+        ON message_approvals
+        BEGIN
+            SELECT RAISE(ABORT, 'message approval binding is immutable');
+        END;
+        """)
+        cur.execute("""
+        CREATE TRIGGER IF NOT EXISTS trg_message_approvals_no_delete
+        BEFORE DELETE ON message_approvals
+        BEGIN
+            SELECT RAISE(ABORT, 'message approval records cannot be deleted');
+        END;
+        """)
+
+        # Регистрация применённых миграций
+        _ensure_column(cur, "sending_history", "attempt_id", "TEXT")
+        _ensure_column(cur, "sending_history", "trip_id", "TEXT")
+        _ensure_column(cur, "sending_history", "event_type", "TEXT")
+        _ensure_column(cur, "sending_history", "state_at_event", "TEXT")
+        _ensure_column(cur, "sending_history", "evidence_type", "TEXT")
+
+        # Добавить expires_at колонки (идемпотентно)
+        _ensure_column(cur, "host_dispatch_locks", "expires_at", "TEXT")
+        _ensure_column(cur, "sending_attempts", "expires_at", "TEXT")
+
+        # Записать миграции как применённые
+        for mig_id in (
+            "001_sending_attempts_host_dispatch_locks_host_identities",
+            "002_sending_history_columns",
+            "003_dispatch_outcome_column",
+            "004_confirmation_capabilities_table",
+            "005_expires_at_columns",
+            "006_immutable_message_approvals",
+        ):
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO schema_migrations (migration_id, applied_at, description)
+                VALUES (?, ?, ?);
+                """,
+                (mig_id, datetime.now().isoformat(), f"Migration {mig_id}"),
+            )
+
+
+        # ------------------------------------------------------------------
+        # 11. ПРОФИЛЬНАЯ ИНТЕЛЛЕКТУАЛЬНОСТЬ ХОСТОВ (HOST PROFILE INTELLIGENCE)
+        # ------------------------------------------------------------------
+        # Основная запись профиля хоста (каноническая, независимая от поездки)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS host_profiles (
+            host_id TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            canonical_host_key TEXT,
+            profile_url TEXT,
+            avatar_url TEXT,
+            name TEXT,
+            location TEXT,
+
+            verification_status TEXT NOT NULL DEFAULT 'UNKNOWN'
+                CHECK (verification_status IN ('VERIFIED','NOT_VERIFIED','UNKNOWN')),
+            verification_source TEXT,
+            verification_evidence TEXT,
+            verification_checked_at TEXT,
+
+            recently_active_status TEXT NOT NULL DEFAULT 'UNKNOWN'
+                CHECK (recently_active_status IN ('RECENTLY_ACTIVE','ACTIVE','NOT_RECENTLY_ACTIVE','UNKNOWN')),
+            recently_active_raw TEXT,
+            recently_active_normalized TEXT,
+            last_active_url TEXT,
+            recently_active_checked_at TEXT,
+            last_seen_update TEXT,
+
+            profile_completeness_pct REAL DEFAULT 0.0,
+            sections_collected TEXT,
+
+            first_collected_at TEXT NOT NULL,
+            last_successful_collection TEXT,
+            last_collection_attempt TEXT,
+            collection_version INTEGER DEFAULT 1,
+
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_hp_username ON host_profiles(username);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_hp_canonical_key ON host_profiles(canonical_host_key);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_hp_verification ON host_profiles(verification_status);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_hp_recently_active ON host_profiles(recently_active_status);")
+
+        # Снимки профиля (версионирование)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS host_profile_snapshots (
+            snapshot_id TEXT PRIMARY KEY,
+            host_id TEXT NOT NULL,
+            collection_timestamp TEXT NOT NULL,
+            raw_profile_json TEXT,
+            sections_json TEXT,
+            FOREIGN KEY (host_id) REFERENCES host_profiles(host_id) ON DELETE CASCADE
+        );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_hps_host ON host_profile_snapshots(host_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_hps_timestamp ON host_profile_snapshots(collection_timestamp);")
+
+        # Бейджи
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS host_badges (
+            badge_id TEXT PRIMARY KEY,
+            host_id TEXT NOT NULL,
+            badge_name TEXT NOT NULL,
+            badge_text TEXT,
+            badge_category TEXT,
+            badge_image_url TEXT,
+            source_html_attribute TEXT,
+            source_url TEXT,
+            collected_at TEXT NOT NULL,
+            FOREIGN KEY (host_id) REFERENCES host_profiles(host_id) ON DELETE CASCADE,
+            UNIQUE(host_id, badge_name, badge_text)
+        );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_hb_host ON host_badges(host_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_hb_category ON host_badges(badge_category);")
+
+        # Отзывы (References)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS host_references (
+            reference_id TEXT PRIMARY KEY,
+            host_id TEXT NOT NULL,
+            reference_text TEXT NOT NULL,
+            author_username TEXT,
+            author_profile_url TEXT,
+            reference_date TEXT,
+            reference_type TEXT,
+            relationship_direction TEXT,
+            source_url TEXT,
+            collected_at TEXT NOT NULL,
+            FOREIGN KEY (host_id) REFERENCES host_profiles(host_id) ON DELETE CASCADE
+        );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_hr_host ON host_references(host_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_hr_author ON host_references(author_username);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_hr_date ON host_references(reference_date);")
+        _ensure_column(cur, "host_references", "collection_source", "TEXT")
+
+        # Статистика отзывов
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS host_reference_stats (
+            host_id TEXT PRIMARY KEY,
+            total_references INTEGER DEFAULT 0,
+            positive_references INTEGER DEFAULT 0,
+            neutral_references INTEGER DEFAULT 0,
+            negative_references INTEGER DEFAULT 0,
+            other_categories TEXT,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (host_id) REFERENCES host_profiles(host_id) ON DELETE CASCADE
+        );
+        """)
+
+        # Доказательства для определения пола
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS host_gender_evidence (
+            evidence_id TEXT PRIMARY KEY,
+            host_id TEXT NOT NULL,
+            evidence_type TEXT NOT NULL
+                CHECK (evidence_type IN ('explicit_field','self_identification','pronoun','language_marker','reference')),
+            evidence_source TEXT NOT NULL,
+            evidence_fragment TEXT NOT NULL,
+            inferred_gender TEXT NOT NULL
+                CHECK (inferred_gender IN ('MALE','FEMALE','UNKNOWN')),
+            confidence REAL NOT NULL DEFAULT 0.5,
+            collected_at TEXT NOT NULL,
+            FOREIGN KEY (host_id) REFERENCES host_profiles(host_id) ON DELETE CASCADE
+        );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_hge_host ON host_gender_evidence(host_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_hge_type ON host_gender_evidence(evidence_type);")
+
+        # Индивидуальные разделы профиля
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS host_profile_sections (
+            section_id TEXT PRIMARY KEY,
+            host_id TEXT NOT NULL,
+            section_name TEXT NOT NULL,
+            section_text TEXT,
+            language TEXT,
+            extraction_status TEXT NOT NULL
+                CHECK (extraction_status IN ('VALUE','NOT_PRESENT','NOT_AVAILABLE','PARSE_FAILED','NOT_CHECKED')),
+            source_url TEXT,
+            collected_at TEXT NOT NULL,
+            FOREIGN KEY (host_id) REFERENCES host_profiles(host_id) ON DELETE CASCADE,
+            UNIQUE(host_id, section_name)
+        );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_hps_section ON host_profile_sections(host_id, section_name);")
+        _ensure_column(cur, "host_profile_sections", "extraction_source", "TEXT")
+        _ensure_column(cur, "host_profile_sections", "value_collected_at", "TEXT")
+
+        # Лог сбора профилей
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS host_profile_collection_log (
+            log_id TEXT PRIMARY KEY,
+            host_id TEXT NOT NULL,
+            section_name TEXT,
+            status TEXT NOT NULL
+                CHECK (status IN ('SUCCESS','PARTIAL','FAILED')),
+            error_details TEXT,
+            collected_at TEXT NOT NULL,
+            FOREIGN KEY (host_id) REFERENCES host_profiles(host_id) ON DELETE CASCADE
+        );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_hcl_host ON host_profile_collection_log(host_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_hcl_status ON host_profile_collection_log(status);")
+
 
 # Алиас инициализации БД
 init_db = init_core_tables
@@ -864,10 +1335,21 @@ def set_setting(key: str, value: str, db_file: Optional[Path | str] = None) -> N
 
 
 def get_sent_usernames(db_file: Optional[Path | str] = None) -> set:
+    """
+    Возвращает множество имён пользователей, которым этот вариант приложения
+    уже отправил Stay Request с подтверждённым принятием.
+
+    Исключает:
+    * ALREADY_SENT — хост уже был contacted внешним источником (не этим приложением).
+    * LEGACY записи без подтверждённого принятия.
+
+    Это предотвращает ложное подавление на основании внешних контактов.
+    """
     sent = set()
     try:
         with get_connection(db_file) as conn:
             cur = conn.cursor()
+            # Только core_hosts с state='sent' (установлено через mark_as_sent с capability)
             cur.execute("SELECT username, host_id FROM core_hosts WHERE state = 'sent';")
             for row in cur.fetchall():
                 if row["username"]:
@@ -875,11 +1357,19 @@ def get_sent_usernames(db_file: Optional[Path | str] = None) -> set:
                 if row["host_id"]:
                     sent.add(str(row["host_id"]).strip().lower())
 
+            # sending_history: только SENT_SUCCESS с confirmed_acceptance evidence
+            # ALREADY_SENT означает внешний контакт, не подтверждение этого приложения
             cur.execute(
-                "SELECT username, host_id, notes FROM sending_history WHERE UPPER(status) IN ('SENT_SUCCESS', 'SUCCESS', 'ALREADY_SENT');"
+                """
+                SELECT username, host_id, status, notes, evidence_type
+                FROM sending_history
+                WHERE UPPER(status) = 'SENT_SUCCESS'
+                  AND (evidence_type IS NULL OR evidence_type != 'legacy')
+                """
             )
             for row in cur.fetchall():
                 st_notes = str(row["notes"] or "").lower()
+                # Пропускаем записи, которые явно помечены как внешние контакты
                 false_skip = (
                     "detected as already sent" in st_notes
                     and "visible" not in st_notes
@@ -892,6 +1382,7 @@ def get_sent_usernames(db_file: Optional[Path | str] = None) -> set:
                 if row["host_id"]:
                     sent.add(str(row["host_id"]).strip().lower())
 
+            # sending_queue: только записи с подтверждённым sent_at
             cur.execute("""
                 SELECT sq.host_id, h.username, sq.sent_at, sq.notes
                 FROM sending_queue sq
@@ -904,6 +1395,7 @@ def get_sent_usernames(db_file: Optional[Path | str] = None) -> set:
                 is_visible_already = "already sent" in notes and "visible" in notes
                 is_dedup_inbox = "deduplicated" in notes and "inbox" in notes
                 is_confirmed = notes.startswith("sent (confirmed")
+                # Только реально подтверждённые отправки
                 if not (is_real or is_visible_already or is_dedup_inbox or is_confirmed):
                     continue
                 if row["username"]:
@@ -915,8 +1407,11 @@ def get_sent_usernames(db_file: Optional[Path | str] = None) -> set:
             for row in cur.fetchall():
                 if row["host_username"]:
                     sent.add(str(row["host_username"]).strip().lower())
-    except Exception as e:
-        logger.debug(f"Ошибка чтения отправленных из SQLite: {e}")
+    except Exception:
+        # Queue mutations must not continue with an incomplete/stale sent set.
+        # In particular, do not fall through to legacy JSON when SQLite fails.
+        logger.exception("Ошибка чтения подтверждённых отправок из SQLite")
+        raise
 
     out_dir = get_output_dir()
     sent_hist_path = out_dir / "sent_history.json"
@@ -1225,14 +1720,14 @@ def get_host_dossier_v2(host_id: str, db_file: Optional[Path | str] = None) -> O
 
 def backup_database(dest_path: Optional[Path | str] = None, source_db: Optional[Path | str] = None) -> Path:
     """Создает атомарный online-бэкап базы данных через sqlite3.Connection.backup()."""
-    src = Path(source_db) if source_db else get_db_path()
+    src = get_db_path(source_db) if source_db else get_db_path()
     if not dest_path:
         backup_dir = get_output_dir() / "backups"
         backup_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        dst = backup_dir / f"db_backup_{ts}.db"
+        dst = get_db_path(backup_dir / f"db_backup_{ts}.db")
     else:
-        dst = Path(dest_path)
+        dst = get_db_path(dest_path)
         dst.parent.mkdir(parents=True, exist_ok=True)
 
     with get_connection(src) as src_conn:
